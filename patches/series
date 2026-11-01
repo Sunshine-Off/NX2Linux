@@ -35,3 +35,4 @@
 0054-front-mac-start-with-the-pointer-hidden-when-the.patch
 0055-arm64-survey-a-read-only-survey-of-a-module-s-aa.patch
 0056-tests-arith-lifted-by-remill-and-compiled-to-x86.patch
+0057-tests-26-flag-instructions-lifted-by-remill-matc.patch

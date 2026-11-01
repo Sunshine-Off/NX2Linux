@@ -30,7 +30,8 @@ Le code propre à NX2Linux est seulement l'hôte (`remill_host.cpp`) : l'état i
 ## Ce que T2 ne prouve pas (honnêteté)
 
 - Un seul bloc sans branche, sans mémoire. T3 doit traiter branches, mémoire, appels.
-- Les intrinsèques de flags sont des « marqueurs » qui renvoient leur premier argument ; c'est ce que fait Remill, mais je n'ai vérifié que sur `adds`/`subs` 64 bits, pas sur les formes 32 bits ni `cmp`/`ccmp`/`adc`.
+- Les intrinsèques de flags et de comparaison (`__remill_flag_computation_*`, `__remill_compare_*`) sont des « marqueurs » qui renvoient leur premier argument. Vérifié (test_recompile_insn.py) sur 26 instructions en 32 et 64 bits : `adds`, `subs`, `cmp`, `cmn`, `sbc`, `sbcs`, `ands`, `tst`, `negs`, `ccmp` (registre et immédiat), `ccmn` (immédiat), `csel`, `csinc` — chacune sur 81 couples de valeurs limites × 16 états NZCV d'entrée, identique à Unicorn.
+- **Lacune de Remill (commit 56918a8) trouvée par ces tests** : aucune sémantique pour `adc` et `adcs` (32 et 64 bits), ni pour `ccmn` en forme registre. Le code lifté appelle alors `__remill_error`. Le test `test_unsupported_instruction_is_an_explicit_error` vérifie que l'outil s'arrête avec une `LiftError` (adresse, mot, raison). Pour la suite, deux voies : ajouter ces sémantiques à Remill (petit patch, à proposer en amont, licence Apache-2.0) ou faire passer ces instructions par le JIT de secours (T4). À décider avec Téo.
 - Performance non mesurée (état en mémoire, pas de registres allouées entre blocs).
 - Dynarmic (JIT, T4) non évalué : à faire au début de T4.
 - Licence de Remill : Apache-2.0 d'après le dépôt (à re-vérifier avant toute distribution).
