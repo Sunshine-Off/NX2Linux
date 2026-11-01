@@ -1,0 +1,16 @@
+# NX2Linux: assumptions about functions, builds and addresses
+
+Every assumption the recompilation work (ARM64 Switch modules → x86_64 Linux) relies on, with the date it was made and what would confirm or refute it. Newest last.
+
+## 2026-11-01 (T1: the synthetic fixture and `dm/tools/arm64_survey.py`)
+
+| # | Assumption | Why it is made | How to confirm |
+|---|---|---|---|
+| H1 | Inside a function the unwind data (`.eh_frame_hdr`) describes, every word is an instruction; a word that does not decode is an error, not data. | The fixture has no literal pools. `nso_code.data_blocks` only finds data between functions. | Run `arm64_survey.py` on a retail module you own, outside this repository: count the `SurveyError`s. A compiler can put a literal pool or a jump table inside a function, so expect some. |
+| H2 | A stretch of text no FDE covers is a data block, padding or an SDK wrapper `svc #n; ret`; nothing else is treated as code. | `nso_match.py` (`Image._callee`) makes the same assumption for the SDK's system call wrappers. | Compare the survey's gaps with `nso_code.data_blocks` and Ghidra's view (`nso2elf.py`) on a module you own. |
+| H3 | A direct branch that leaves its function and does not land on an FDE start is `unknown`, not an error. | A tail call or a jump into a function the unwind data lacks is possible; the survey only reports it. | The survey lists these targets on a module you own: each should be a function start in Ghidra. |
+| H4 | The hand-made encoders in `engine/dm/tools/tests/arm64_fixture.py` (`ADDS`, `SUBS`, `MUL`, `MOVZ`, `BL`, `BCOND`, `CBZ`, `SVC`…) encode what their names say. | They are written from the Arm Architecture Reference Manual. | `test_encodings_decode_as_intended` compares each with Capstone 5. A second decoder (Unicorn or qemu-aarch64 as the ARM64 reference, T2) would be an independent check. |
+| H5 | The reference ARM64 behaviour will come from Unicorn (instruction and flag tests) and `qemu-aarch64` (whole functions). Not decided yet. | Neither is installed on this machine (2026-11-01); the Mac Apple Silicon option is not available here. | Téo's choice; install one and run the fixture's `arith` function in it. |
+| H6 | Capstone 5 is the decoder (`patch_nso.py` refuses Capstone 6). | `patch_nso.py` header. | `pip install "capstone>=5,<6"`; `_md()` in `arm64_survey.py` checks the version. |
+
+Not assumed, only unknown: how the Switch's retail modules lay out their code (the survey has run on the fixture only), and which functions of a real game call `svc` outside the SDK wrappers.

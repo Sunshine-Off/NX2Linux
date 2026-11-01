@@ -1,0 +1,348 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 13:36:06 +0100
+Subject: [PATCH] arm64_survey: a read-only survey of a module's AArch64 code,
+ on a synthetic fixture
+
+Lists each unwind-described function's direct and indirect branches, calls, svc,
+tpidr/x18 uses and the SDK's `svc #n; ret` wrappers; a word that does not decode
+inside a function is an explicit SurveyError (address, word, function). The fixture
+(tests/arm64_fixture.py) assembles a tiny NSO word by word: no game data.
+
+Upstream-Status: pending
+Reason: first step of an AArch64 -> x86_64 recompilation (NX2Linux); tooling and tests only, nothing in the host or the shader chain changes
+
+Issue: none yet (NX2Linux, branch feat/teo-recompilation-arm64)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/arm64_survey.py            | 118 ++++++++++++++++++++++++++++
+ dm/tools/tests/arm64_fixture.py     |  94 ++++++++++++++++++++++
+ dm/tools/tests/test_arm64_survey.py |  92 ++++++++++++++++++++++
+ 3 files changed, 304 insertions(+)
+ create mode 100644 dm/tools/arm64_survey.py
+ create mode 100644 dm/tools/tests/arm64_fixture.py
+ create mode 100644 dm/tools/tests/test_arm64_survey.py
+
+diff --git a/dm/tools/arm64_survey.py b/dm/tools/arm64_survey.py
+new file mode 100644
+index 0000000..411dbdd
+--- /dev/null
++++ b/dm/tools/arm64_survey.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""Read-only survey of a Switch module's AArch64 code, the first step of recompiling it (NX2Linux T1): what a translator would have to handle, and what it could not.
++For each function the unwind data gives (nso_code.fde_ranges) it lists the instructions that matter: direct branches and calls (with where they land), indirect branches (br, blr, ret),
++svc, the system registers the rewriter (patch_nso.py) rewrites and the uses of x18. It also finds the SDK's `svc #n; ret` wrappers, which have no unwind entry (nso_match.py), and
++names every other stretch of text no function covers. A word inside a function that does not decode is a SurveyError naming the address, the word and the function: the survey
++never guesses past it (a literal pool inside a function would be one; none is expected in the fixture, see the hypotheses file).
++Usage: arm64_survey.py <module.nso> (needs capstone 5, as patch_nso.py does)"""
++import os, struct, sys
++from typing import NamedTuple
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import nso
++from nso_code import fde_ranges
++
++SYSREGS = ('tpidr_el0', 'tpidrro_el0', 'cntpct_el0')   # what patch_nso.py replaces (its header comment)
++DIRECT = {'b': 'branch', 'cbz': 'branch', 'cbnz': 'branch', 'tbz': 'branch', 'tbnz': 'branch', 'bl': 'call'}
++
++
++class SurveyError(ValueError):
++    pass
++
++
++class Insn(NamedTuple):
++    addr: int
++    word: int
++    text: str       # mnemonic and operands
++    kind: str       # 'branch', 'call' (direct); 'ibranch', 'icall', 'ret'; 'svc'; 'sysreg'; 'x18'; '' for anything else
++    target: int     # a direct branch's or call's destination, else -1
++    where: str      # of a direct target: 'inside' (this function), 'function:<name>' (another one's start), 'unknown'; else ''
++
++
++class Function(NamedTuple):
++    name: str
++    start: int
++    end: int
++    insns: tuple
++
++    def of(self, kind): return [i for i in self.insns if i.kind == kind]
++
++
++class Survey(NamedTuple):
++    functions: tuple    # Function, by address
++    svc_stubs: tuple    # ((address, svc number),) wrappers `svc #n; ret` that no unwind entry covers
++    gaps: tuple         # ((start, end),) text no function and no svc stub covers: data, padding or code the unwind data does not describe
++
++    def report(self):
++        lines = [f'{len(self.functions)} functions, {len(self.svc_stubs)} svc stubs, {len(self.gaps)} gaps']
++        for f in self.functions:
++            c = {k: len(f.of(k)) for k in ('branch', 'call', 'ibranch', 'icall', 'ret', 'svc', 'sysreg', 'x18')}
++            lines.append(f'{f.name} {f.start:#x}..{f.end:#x} {len(f.insns)} insns ' + ' '.join(f'{k}={n}' for k, n in c.items() if n))
++            for i in f.insns:
++                if i.kind and i.kind != 'ret': lines.append(f'  {i.addr:#x} {i.kind:7} {i.text}' + (f' -> {i.target:#x} ({i.where})' if i.target >= 0 else ''))
++        for a, n in self.svc_stubs: lines.append(f'svc stub {a:#x}: svc #{n:#x}')
++        for s, e in self.gaps: lines.append(f'gap {s:#x}..{e:#x} ({e - s} bytes)')
++        return '\n'.join(lines)
++
++
++def _md():
++    import capstone
++    if capstone.cs_version()[0] != 5: raise SurveyError(f'Capstone {capstone.__version__} is unsupported; the survey needs Capstone 5.x (as patch_nso.py does)')
++    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM); md.detail = True
++    return md
++
++
++def _classify(ins, start, end, starts):
++    m, ops = ins.mnemonic, ins.op_str
++    kind, target, where = '', -1, ''
++    if m in DIRECT or m.startswith('b.'):
++        kind = DIRECT.get(m, 'branch')
++        target = int(ops.rsplit('#', 1)[1], 0)   # capstone writes a direct branch's destination as an absolute #address
++        where = 'inside' if start <= target < end and kind == 'branch' else (f'function:{starts[target]}' if target in starts else 'unknown')
++    elif m == 'br': kind = 'ibranch'
++    elif m == 'blr': kind = 'icall'
++    elif m == 'ret': kind = 'ret'
++    elif m == 'svc': kind = 'svc'
++    elif m in ('mrs', 'msr') and any(r in ops for r in SYSREGS): kind = 'sysreg'
++    else:
++        read, written = ins.regs_access()   # x18 is the platform register Apple's kernel owns, which patch_nso.py moves to a thread slot
++        if any(ins.reg_name(r) in ('x18', 'w18') for r in list(read) + list(written)): kind = 'x18'
++    return kind, target, where
++
++
++def survey(module):
++    """Survey of an nso.Module (its image and text size); SurveyError when the unwind data cannot be read or a function holds a word that does not decode"""
++    md, img, text_end = _md(), module.image, module.text_end
++    try: ranges = [(s, e) for s, e in fde_ranges(img) if 0 <= s < e <= text_end]
++    except (AssertionError, ValueError, IndexError, struct.error) as e: raise SurveyError(f'cannot read the function boundaries from the unwind data: {e}') from e
++    starts = {s: f'sub_{s:x}' for s, _ in ranges}
++    functions = []
++    for s, e in ranges:
++        if s % 4 or e % 4: raise SurveyError(f'function {starts[s]} at {s:#x}..{e:#x} is not word aligned')
++        insns = []
++        for a in range(s, e, 4):
++            w = struct.unpack_from('<I', img, a)[0]
++            ins = next(md.disasm(bytes(img[a:a + 4]), a), None)
++            if ins is None: raise SurveyError(f'{a:#x}: word {w:#010x} does not decode as AArch64, inside {starts[s]} ({s:#x}..{e:#x})')
++            kind, target, where = _classify(ins, s, e, starts)
++            insns.append(Insn(a, w, f'{ins.mnemonic} {ins.op_str}'.strip(), kind, target, where))
++        functions.append(Function(starts[s], s, e, tuple(insns)))
++    def stub(a): return a + 8 <= text_end and struct.unpack_from('<I', img, a)[0] & 0xffe0001f == 0xd4000001 and struct.unpack_from('<I', img, a + 4)[0] == 0xd65f03c0
++    stubs, gaps, last = [], [], 0
++    for s, e in sorted(ranges) + [(text_end, text_end)]:
++        a, open_at = (last + 3) & ~3, None   # a gap: `svc #n; ret` stubs are recognised, every other stretch is reported
++        while a < s:
++            if stub(a) and a + 8 <= s:
++                if open_at is not None: gaps.append((open_at, a)); open_at = None
++                stubs.append((a, (struct.unpack_from('<I', img, a)[0] >> 5) & 0xffff)); a += 8
++            else:
++                if open_at is None: open_at = a
++                a += 4
++        if open_at is not None: gaps.append((open_at, s))
++        last = max(last, e)
++    return Survey(tuple(functions), tuple(stubs), tuple(gaps))
++
++
++if __name__ == '__main__':
++    if len(sys.argv) != 2: sys.exit(__doc__)
++    try: print(survey(nso.cli_read(sys.argv[1])).report())
++    except SurveyError as e: sys.exit(f'[RED] {e}')
+diff --git a/dm/tools/tests/arm64_fixture.py b/dm/tools/tests/arm64_fixture.py
+new file mode 100644
+index 0000000..6d5627d
+--- /dev/null
++++ b/dm/tools/tests/arm64_fixture.py
+@@ -0,0 +1,94 @@
++"""A synthetic, fully controlled AArch64 NSO for the recompilation work (T1): a handful of small functions assembled here word by word, a MOD0 header and an .eh_frame_hdr that
++describe them the way a retail module does. No game data: the bytes are made by this file. build() returns the NSO file, so tools and tests load it through nso.load like any module.
++
++Layout (the text segment starts at 0):
++  0x00 b _start; 0x04 the MOD0 offset (the module header every tool finds the unwind data by); 0x08..0x10 padding (nop)
++  then the functions below, back to back. svc_setheap has no FDE, as the SDK's system call wrappers have none (nso_match.py's `svc #n; ret` case)
++ro holds MOD0, the .eh_frame (one CIE, one FDE per function that has one) and the .eh_frame_hdr's binary search table."""
++import hashlib, os, struct, sys
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
++from nso_asm import B, ADDR, STP_PRE, LDP_POST, SUBI, BR, BLR, MRS_TPIDRRO, NOP
++
++PAGE = 0x1000
++RET = 0xD65F03C0
++def ADDS(d, n, m): return 0xAB000000 | (m << 16) | (n << 5) | d
++def SUBS(d, n, m): return 0xEB000000 | (m << 16) | (n << 5) | d
++def SUBSI(d, n, imm12): return 0xF1000000 | (imm12 << 10) | (n << 5) | d
++def MUL(d, n, m): return 0x9B007C00 | (m << 16) | (n << 5) | d
++def MOVZ(d, imm16): return 0xD2800000 | (imm16 << 5) | d
++def MOV(d, m): return 0xAA0003E0 | (m << 16) | d   # orr xd, xzr, xm
++def BL(frm, to):
++    off = to - frm; assert -(1 << 27) <= off < (1 << 27) and off % 4 == 0
++    return 0x94000000 | ((off >> 2) & 0x3FFFFFF)
++def BCOND(frm, to, cond):
++    off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
++    return 0x54000000 | (((off >> 2) & 0x7FFFF) << 5) | cond
++def CBZ(t, frm, to):
++    off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
++    return 0xB4000000 | (((off >> 2) & 0x7FFFF) << 5) | t
++def SVC(n): return 0xD4000001 | (n << 5)
++def MRS_TPIDR(t): return 0xD53BD040 | t
++EQ = 0
++
++
++# name -> (has FDE, function(at, me) → words); `at` maps names to their start, `me` is the function's own start. Order is the layout order
++def _arith(at, me): return [ADDR(2, 0, 1), ADDS(3, 2, 0), SUBS(4, 3, 1), MUL(0, 2, 4), RET]
++def _branch(at, me): return [SUBSI(31, 0, 0), BCOND(me + 4, me + 16, EQ), MOVZ(0, 1), RET, MOVZ(0, 2), RET]
++def _loop(at, me): return [CBZ(0, me, me + 12), SUBI(0, 0, 1), B(me + 8, me), RET]
++def _caller(at, me): return [STP_PRE(29, 30, 31, -16), BL(me + 4, at['arith']), BL(me + 8, at['branch']), LDP_POST(29, 30, 31, 16), RET]
++def _indirect(at, me): return [STP_PRE(29, 30, 31, -16), BLR(1), LDP_POST(29, 30, 31, 16), BR(2)]
++def _tls(at, me): return [MRS_TPIDR(0), MRS_TPIDRRO(3), MOV(1, 18), RET]
++def _svc(at, me): return [SVC(1), RET]
++FUNCTIONS = [('arith', True, _arith), ('branch', True, _branch), ('loop', True, _loop), ('caller', True, _caller),
++             ('indirect', True, _indirect), ('tls', True, _tls), ('svc_setheap', False, _svc)]
++START = 0x10
++
++
++def text_layout():
++    """(words of the text segment, {name: (start, end)}, {name: has FDE}): the text is assembled twice, the first time to learn the sizes the branches between functions need"""
++    sizes = {name: len(fn({n: 0 for n, _, _ in FUNCTIONS}, 0)) * 4 for name, _, fn in FUNCTIONS}
++    at, o = {}, START
++    for name, _, _ in FUNCTIONS: at[name] = o; o += sizes[name]
++    words = [B(0, START), 0, NOP, NOP]   # word 1 (MOD0 offset) is filled in by build()
++    for name, _, fn in FUNCTIONS: words += fn(at, at[name])
++    return words, {n: (at[n], at[n] + sizes[n]) for n, _, _ in FUNCTIONS}, {n: fde for n, fde, _ in FUNCTIONS}
++
++
++def _uleb_pad(b, to): return b + bytes(to - len(b))
++
++
++def build(words=None):
++    """The fixture NSO file (bytes, uncompressed, segment hash flags cleared as a modified main has them) and {name: (start, end)}. words replaces the text words (a test corrupts one)."""
++    text_words, ranges, has_fde = text_layout()
++    text_words = list(words) if words is not None else text_words
++    text = bytearray(struct.pack('<%dI' % len(text_words), *text_words))
++    ro_off = (len(text) + PAGE - 1) & ~(PAGE - 1)
++    mod0, cie_at = 0, 0x40   # ro: MOD0 at 0, the .eh_frame at 0x40
++    # .eh_frame: a CIE (zR, code align 4, data align -8, return register x30, FDE pointers pc-relative sdata4) and one FDE per function that has unwind data
++    eh = bytearray()
++    eh += struct.pack('<IIB', 20, 0, 1) + b'zR\0' + bytes([4, 0x78, 30, 1, 0x1b, 0x0c, 31, 0]); eh = bytearray(_uleb_pad(bytes(eh), 24))
++    table = []   # (function start, FDE offset) for the binary search table
++    for name, (s, e) in sorted(ranges.items(), key=lambda kv: kv[1]):
++        if not has_fde[name]: continue
++        fde = ro_off + cie_at + len(eh)
++        pos = fde + 8   # where pc_begin is stored; the encoding is relative to it
++        eh += _uleb_pad(struct.pack('<IIiiB', 20, (fde + 4) - (ro_off + cie_at), s - pos, e - s, 0), 24)
++        table.append((s, fde))
++    eh += bytes(4)   # terminator
++    hdr_at = (cie_at + len(eh) + 7) & ~7
++    ehs = ro_off + hdr_at
++    hdr = struct.pack('<BBBBi', 1, 0x1b, 0x03, 0x3b, (ro_off + cie_at) - (ehs + 4)) + struct.pack('<I', len(table))   # version, eh_frame_ptr pcrel sdata4, count udata4, table datarel sdata4
++    hdr += b''.join(struct.pack('<ii', s - ehs, f - ehs) for s, f in table)
++    ro = bytearray(hdr_at + len(hdr)); ro[cie_at:cie_at + len(eh)] = eh; ro[hdr_at:] = hdr
++    # MOD0: magic, dynamic (none: an empty one is at the end of ro), bss start/end, eh_frame_hdr start/end (relative to MOD0), library name offset
++    dyn_at = (len(ro) + 15) & ~15; ro += bytes(dyn_at + 16 - len(ro))
++    struct.pack_into('<4siiiiii', ro, 0, b'MOD0', dyn_at, 0, 0, hdr_at, hdr_at + len(hdr), 0)
++    if not struct.unpack_from('<I', text, 4)[0]: struct.pack_into('<I', text, 4, ro_off + mod0)   # a text that brings its own MOD0 pointer keeps it
++    data = bytes(8)
++    data_off = (ro_off + len(ro) + PAGE - 1) & ~(PAGE - 1)
++    hdr_nso = bytearray(0x100); hdr_nso[:4] = b'NSO0'; hdr_nso[0x40:0x60] = hashlib.sha256(b'nx2linux-arm64-fixture').digest()
++    body, fo = b'', 0x100
++    for i, (seg, mo) in enumerate(((bytes(text), 0), (bytes(ro), ro_off), (data, data_off))):
++        struct.pack_into('<III', hdr_nso, 0x10 + 0x10 * i, fo + len(body), mo, len(seg)); struct.pack_into('<I', hdr_nso, 0x60 + 4 * i, len(seg))
++        hdr_nso[0xa0 + 0x20 * i:0xc0 + 0x20 * i] = hashlib.sha256(seg).digest(); body += seg
++    return bytes(hdr_nso + body), ranges
+diff --git a/dm/tools/tests/test_arm64_survey.py b/dm/tools/tests/test_arm64_survey.py
+new file mode 100644
+index 0000000..c67ec59
+--- /dev/null
++++ b/dm/tools/tests/test_arm64_survey.py
+@@ -0,0 +1,92 @@
++"""dm/tools/arm64_survey.py on the synthetic AArch64 fixture (arm64_fixture.py): no game data, the module is assembled word by word. The expected counts follow from the fixture's functions."""
++from pathlib import Path
++import struct
++import sys
++import unittest
++
++REPO = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(REPO / 'dm/tools'))
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++import arm64_fixture as fx
++import arm64_survey
++import nso
++
++
++def load(words=None):
++    d, ranges = fx.build(words)
++    return nso.load(d, 'fixture'), ranges
++
++
++class Fixture(unittest.TestCase):
++    def test_encodings_decode_as_intended(self):
++        """Each hand-made encoder yields the instruction its name says, checked against Capstone"""
++        md = arm64_survey._md()
++        cases = {fx.ADDS(3, 2, 0): 'adds x3, x2, x0', fx.SUBS(4, 3, 1): 'subs x4, x3, x1', fx.MUL(0, 2, 4): 'mul x0, x2, x4', fx.MOVZ(0, 2): 'mov x0, #2',
++                 fx.MOV(1, 18): 'mov x1, x18', fx.SVC(1): 'svc #1', fx.RET: 'ret', fx.MRS_TPIDR(0): 'mrs x0, tpidr_el0', fx.SUBSI(31, 0, 0): 'cmp x0, #0'}
++        for w, want in cases.items():
++            i = next(md.disasm(struct.pack('<I', w), 0))
++            self.assertEqual(f'{i.mnemonic} {i.op_str}'.strip(), want, hex(w))
++
++    def test_loads_as_a_module(self):
++        m, ranges = load()
++        self.assertEqual(m.text_end, ranges['svc_setheap'][1])
++        self.assertEqual(len(arm64_survey.survey(m).functions), sum(1 for _, fde, _ in fx.FUNCTIONS if fde))
++
++
++class Survey(unittest.TestCase):
++    def setUp(self):
++        self.m, self.ranges = load()
++        self.s = arm64_survey.survey(self.m)
++        self.by = {f.start: f for f in self.s.functions}
++
++    def test_function_boundaries_come_from_the_unwind_data(self):
++        self.assertEqual([(f.start, f.end) for f in self.s.functions], [r for n, r in self.ranges.items() if n != 'svc_setheap'])
++
++    def test_direct_branches_stay_inside_or_name_their_target(self):
++        br = self.by[self.ranges['branch'][0]].of('branch')
++        self.assertEqual([(i.where, i.target) for i in br], [('inside', self.ranges['branch'][0] + 16)])
++        loop = self.by[self.ranges['loop'][0]].of('branch')
++        self.assertEqual({i.where for i in loop}, {'inside'})
++
++    def test_nested_calls_name_the_called_functions(self):
++        calls = self.by[self.ranges['caller'][0]].of('call')
++        self.assertEqual([(i.target, i.where) for i in calls],
++                         [(self.ranges['arith'][0], 'function:sub_%x' % self.ranges['arith'][0]), (self.ranges['branch'][0], 'function:sub_%x' % self.ranges['branch'][0])])
++
++    def test_indirect_branches_are_listed(self):
++        f = self.by[self.ranges['indirect'][0]]
++        self.assertEqual([i.text for i in f.of('icall')], ['blr x1']); self.assertEqual([i.text for i in f.of('ibranch')], ['br x2'])
++
++    def test_what_the_rewriter_touches_is_listed(self):
++        f = self.by[self.ranges['tls'][0]]
++        self.assertEqual([i.text for i in f.of('sysreg')], ['mrs x0, tpidr_el0', 'mrs x3, tpidrro_el0']); self.assertEqual([i.text for i in f.of('x18')], ['mov x1, x18'])
++
++    def test_svc_wrapper_without_unwind_data_is_found(self):
++        self.assertEqual(self.s.svc_stubs, ((self.ranges['svc_setheap'][0], 1),))
++
++    def test_the_header_words_are_a_gap_not_a_function(self):
++        self.assertEqual(self.s.gaps, ((0, fx.START),))
++
++    def test_deterministic(self):
++        self.assertEqual(self.s.report(), arm64_survey.survey(load()[0]).report())
++
++
++class Errors(unittest.TestCase):
++    def test_undecodable_word_names_address_word_and_function(self):
++        words, ranges, _ = fx.text_layout()
++        at = ranges['arith'][0]
++        words[at // 4 + 1] = 0xFFFFFFFF
++        m, _ = load(words)
++        with self.assertRaises(arm64_survey.SurveyError) as c: arm64_survey.survey(m)
++        msg = str(c.exception)
++        self.assertIn(f'{at + 4:#x}', msg); self.assertIn('0xffffffff', msg); self.assertIn(f'sub_{at:x}', msg)
++
++    def test_missing_mod0_is_an_error_not_an_empty_survey(self):
++        words, _, _ = fx.text_layout()
++        words[1] = 0x8000   # the MOD0 pointer leads to no MOD0
++        m, _ = load(words)
++        with self.assertRaises(arm64_survey.SurveyError): arm64_survey.survey(m)
++
++
++if __name__ == '__main__':
++    unittest.main()
