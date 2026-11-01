@@ -20,6 +20,7 @@ dm/games/*/cb_extent.tsv
 
 # Swift build products at the repository root (a stray build run)
 .build/
+/build/
 sync.log
 
 # PyInstaller output (frontend-qt)
