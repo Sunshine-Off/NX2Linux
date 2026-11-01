@@ -1,0 +1,55 @@
+From 98c42b10ffa5f874f9dd3dd38146d01e7f518e77 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 15:16:51 +0100
+Subject: [PATCH] AArch64: lift SVC (the trailing NEXT_PC operand the decoder
+ adds) and MRS TPIDRRO_EL0
+
+The decoder gives every asynchronous hyper call a NEXT_PC write operand, as it does a branch, but CallSupervisor took only the immediate: the lifter rejected SVC as a mismatched ISEL and the trace ended in __remill_error. CallSupervisor now takes the operand and moves PC to the next instruction. MRS TPIDRRO_EL0 had a decoder name but no semantics.
+---
+ lib/Arch/AArch64/Semantics/SYSTEM.cpp | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/lib/Arch/AArch64/Semantics/SYSTEM.cpp b/lib/Arch/AArch64/Semantics/SYSTEM.cpp
+index a5369dc..c4c5e23 100644
+--- a/lib/Arch/AArch64/Semantics/SYSTEM.cpp
++++ b/lib/Arch/AArch64/Semantics/SYSTEM.cpp
+@@ -16,9 +16,14 @@
+ 
+ namespace {
+ 
+-DEF_SEM(CallSupervisor, I32 imm) {
++// The decoder gives every async hyper call a trailing NEXT_PC operand, as it does a branch: without taking it here, the lifter rejected SVC as a mismatched ISEL.
++// Control comes back to the next instruction, which is where the trace lifter expects PC to be after the call.
++DEF_SEM(CallSupervisor, I32 imm, R64W pc_dst) {
+   HYPER_CALL = AsyncHyperCall::kAArch64SupervisorCall;
+   HYPER_CALL_VECTOR = Read(imm);
++  auto new_pc = UAdd(Read(REG_PC), 4_u64);
++  Write(REG_PC, new_pc);
++  Write(pc_dst, new_pc);
+   return memory;
+ }
+ 
+@@ -75,6 +80,12 @@ DEF_SEM(DoMRS_RS_SYSTEM_TPIDR_EL0, R64W dest) {
+   return memory;
+ }
+ 
++// TPIDRRO_EL0: where Horizon keeps the thread-local region pointer; EL0 only reads it
++DEF_SEM(DoMRS_RS_SYSTEM_TPIDRRO_EL0, R64W dest) {
++  WriteZExt(dest, Read(state.sr.tpidrro_el0));
++  return memory;
++}
++
+ DEF_SEM(DoMSR_SR_SYSTEM_TPIDR_EL0, R64 src) {
+   WriteZExt(state.sr.tpidr_el0.qword, Read(src));
+   return memory;
+@@ -107,6 +118,7 @@ DEF_ISEL(MSR_SR_SYSTEM_FPCR) = DoMSR_SR_SYSTEM_FPCR;
+ 
+ DEF_ISEL(MRS_RS_SYSTEM_TPIDR_EL0) = DoMRS_RS_SYSTEM_TPIDR_EL0;
+ DEF_ISEL(MSR_SR_SYSTEM_TPIDR_EL0) = DoMSR_SR_SYSTEM_TPIDR_EL0;
++DEF_ISEL(MRS_RS_SYSTEM_TPIDRRO_EL0) = DoMRS_RS_SYSTEM_TPIDRRO_EL0;
+ 
+ DEF_ISEL(DMB_BO_SYSTEM) = DataMemoryBarrier;
+ DEF_ISEL(ISB_BI_SYSTEM) = InstructionSynchronizationBarrier;
+-- 
+2.56.0
+
