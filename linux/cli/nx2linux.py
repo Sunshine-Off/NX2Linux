@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -60,6 +61,10 @@ def doctor_report() -> dict[str, dict[str, str | bool]]:
                       'detail': pkg_config('sdl3') or 'SDL3 development package unavailable'}
     checks['vulkan'] = {'ok': pkg_config('vulkan') is not None,
                         'detail': pkg_config('vulkan') or 'Vulkan development package unavailable'}
+    checks['egl'] = {'ok': pkg_config('egl') is not None,
+                     'detail': pkg_config('egl') or 'EGL development package unavailable (mesa-libEGL-devel)'}
+    checks['dotnet'] = {'ok': shutil.which('dotnet') is not None, 'required': False,
+                        'detail': tool_version(['dotnet', '--version']) or 'install dotnet-sdk-10.0 to extract a game'}
     checks['glslc'] = {'ok': shutil.which('glslc') is not None,
                       'detail': tool_version(['glslc', '--version']) or 'glslc unavailable'}
     vulkaninfo = shutil.which('vulkaninfo')
@@ -89,7 +94,7 @@ def print_doctor(report: dict[str, dict[str, str | bool]], as_json: bool) -> int
             else:
                 state = 'OPTIONAL'
             print(f'[{state:7}] {name}: {check["detail"]}')
-    required = ('python', 'cmake', 'pkg-config', 'sdl3', 'vulkan', 'glslc')
+    required = ('python', 'cmake', 'pkg-config', 'sdl3', 'vulkan', 'egl', 'glslc')
     return 0 if all(bool(report[name]['ok']) for name in required) else 1
 
 
@@ -146,7 +151,7 @@ def verify(args: argparse.Namespace) -> int:
             cases = {case.attrib['name']: case for case in ET.parse(report).iter('testcase')}
             required = ['nx2linux_sdl_host_smoke']
             if args.require_vulkan:
-                required.append('nx2linux_vulkan_triangle')
+                required += ['nx2linux_vulkan_triangle', 'nx2linux_gl_on_vulkan']
             for name in required:
                 case = cases.get(name)
                 if (case is None or case.find('skipped') is not None
@@ -157,6 +162,89 @@ def verify(args: argparse.Namespace) -> int:
             print(f'verify: {error}', file=sys.stderr)
             return 1
     return 0
+
+
+NX_EXTRACT = ROOT / 'engine' / 'dm' / 'tools' / 'nx_extract'
+TITLE_RE = re.compile(r'^title ([0-9a-f]{16})', re.MULTILINE)
+
+
+def inside_repository(path: Path) -> bool:
+    """Game data and keys never go into the checkout: extraction output must be elsewhere"""
+    try:
+        path.resolve().relative_to(ROOT)
+    except ValueError:
+        return False
+    return True
+
+
+def extract(args: argparse.Namespace) -> int:
+    """Extract a game's ExeFS and RomFS with the engine's nx_extract into the XDG cache (S7)"""
+    nsp, keys = Path(args.nsp), Path(args.keys)
+    if keys.is_dir():
+        keys = keys / 'prod.keys'
+    for label, path in (('game', nsp), ('keys', keys)):
+        if not path.is_file():
+            print(f'extract: {label} file not found: {path}', file=sys.stderr)
+            return 2
+    if not shutil.which('dotnet'):
+        print('extract: dotnet is missing (install dotnet-sdk-10.0)', file=sys.stderr)
+        return 2
+    if not (NX_EXTRACT / 'nx_extract.csproj').is_file():
+        print('extract: engine/ is not synced (python3 tools/engine.py sync)', file=sys.stderr)
+        return 2
+    out = Path(args.out) if args.out else xdg_dir('cache') / 'extract'
+    if inside_repository(out):
+        print(f'extract: refusing to write game data inside the repository: {out}', file=sys.stderr)
+        return 2
+    title = run(['dotnet', 'run', '-c', 'Release', '--project', str(NX_EXTRACT), '--', str(keys), '--title', str(nsp)],
+                capture=True)
+    found = TITLE_RE.search(title.stdout or '')
+    if title.returncode != 0 or not found:
+        print('extract: the package has no readable title ID', file=sys.stderr)
+        return title.returncode or 5
+    target = out / found.group(1)
+    target.mkdir(parents=True, exist_ok=True)
+    result = run(['dotnet', 'run', '-c', 'Release', '--project', str(NX_EXTRACT), '--', str(keys), str(nsp), '-',
+                  str(target), '--romfs-image'])
+    if result.returncode == 0:
+        print(f'extracted {found.group(1)} to {target}')
+    return result.returncode
+
+
+RED_RE = re.compile(r'\[RED\]')
+
+
+def smoke(args: argparse.Namespace) -> int:
+    """Start a game command several times and write a report (S7): every run must exit 0 and log no [RED] line
+
+    The command is the host that runs the recompiled game; it must print its GPU as `gpu: <name>` and the driver as
+    `driver: <name>` so the report can say where it ran. Nothing of the game is stored in the report."""
+    if not args.command_line:
+        print('smoke: give the host command after --', file=sys.stderr)
+        return 2
+    runs = []
+    for index in range(args.runs):
+        try:
+            done = subprocess.run(args.command_line, cwd=ROOT, text=True, capture_output=True, timeout=args.timeout)
+            code, text = done.returncode, (done.stdout or '') + (done.stderr or '')
+        except subprocess.TimeoutExpired as error:
+            code, text = 124, ((error.stdout or b'').decode(errors='replace') if isinstance(error.stdout, bytes) else (error.stdout or ''))
+        reds = [line for line in text.splitlines() if RED_RE.search(line)]
+        runs.append({'run': index + 1, 'exit': code, 'red': len(reds)})
+        if args.log_dir:
+            Path(args.log_dir).mkdir(parents=True, exist_ok=True)
+            (Path(args.log_dir) / f'run{index + 1}.log').write_text(text)
+    gpu = driver = ''
+    for line in text.splitlines():
+        if line.startswith('gpu:'):
+            gpu = line[4:].strip()
+        elif line.startswith('driver:'):
+            driver = line[7:].strip()
+    passed = all(r['exit'] == 0 and r['red'] == 0 for r in runs)
+    report = {'title_id': args.title_id, 'version': args.game_version, 'profile': args.profile, 'gpu': gpu,
+              'driver': driver, 'runs': runs, 'passed': passed}
+    print(json.dumps(report, indent=2))
+    return 0 if passed else 1
 
 
 def parser() -> argparse.ArgumentParser:
@@ -179,6 +267,20 @@ def parser() -> argparse.ArgumentParser:
     check = sub.add_parser('verify', parents=[common], help='run Linux host tests')
     check.add_argument('--build', action='store_true', help='build before testing')
     check.add_argument('--require-vulkan', action='store_true', help='fail if the Vulkan test is skipped')
+
+    ext = sub.add_parser('extract', help='extract a game package into the XDG cache (needs dotnet and your prod.keys)')
+    ext.add_argument('nsp', help='the .nsp of the game')
+    ext.add_argument('--keys', required=True, help='prod.keys, or the folder that holds it')
+    ext.add_argument('--out', help='output folder (default: the XDG cache), never inside the repository')
+
+    sm = sub.add_parser('smoke', help='run the host on a game several times and report exits and [RED] lines')
+    sm.add_argument('--runs', type=int, default=3)
+    sm.add_argument('--timeout', type=int, default=120, help='seconds per run')
+    sm.add_argument('--title-id', default='')
+    sm.add_argument('--game-version', default='')
+    sm.add_argument('--profile', default='')
+    sm.add_argument('--log-dir', help='keep each run log here (outside the repository)')
+    sm.add_argument('command_line', nargs=argparse.REMAINDER, help='-- <host command and arguments>')
     return ap
 
 
@@ -192,6 +294,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_demo(args)
     if args.command == 'verify':
         return verify(args)
+    if args.command == 'extract':
+        return extract(args)
+    if args.command == 'smoke':
+        args.command_line = [a for a in args.command_line if a != '--'] if args.command_line[:1] == ['--'] else args.command_line
+        return smoke(args)
     return 2
 
 

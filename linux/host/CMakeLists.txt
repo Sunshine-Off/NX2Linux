@@ -6,6 +6,7 @@ include(CTest)
 find_package(PkgConfig REQUIRED)
 find_package(Vulkan REQUIRED)
 pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
 find_program(GLSLC_EXECUTABLE glslc REQUIRED)
 
 set(NX2LINUX_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
@@ -56,6 +57,17 @@ target_include_directories(nx2linux_vulkan
 )
 target_link_libraries(nx2linux_vulkan PUBLIC nx2linux_host PkgConfig::SDL3 Vulkan::Vulkan)
 
+add_library(nx2linux_gl_vulkan STATIC
+    gl_vulkan.c
+)
+target_compile_features(nx2linux_gl_vulkan PUBLIC c_std_11)
+target_compile_options(nx2linux_gl_vulkan PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(nx2linux_gl_vulkan
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(nx2linux_gl_vulkan PUBLIC PkgConfig::EGL)
+
 if(BUILD_TESTING)
     add_executable(nx2linux_sdl_host_test tests/test_sdl_host.c)
     target_compile_features(nx2linux_sdl_host_test PRIVATE c_std_11)
@@ -84,4 +96,11 @@ if(BUILD_TESTING)
         NX2LINUX_SHADER_DIR="${NX2LINUX_SHADER_DIR}"
     )
     target_link_libraries(nx2linux_vulkan_demo PRIVATE nx2linux_vulkan)
+
+    add_executable(nx2linux_gl_vulkan_test tests/test_gl_vulkan.c)
+    target_compile_features(nx2linux_gl_vulkan_test PRIVATE c_std_11)
+    target_compile_options(nx2linux_gl_vulkan_test PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(nx2linux_gl_vulkan_test PRIVATE nx2linux_gl_vulkan)
+    add_test(NAME nx2linux_gl_on_vulkan COMMAND nx2linux_gl_vulkan_test)
+    set_tests_properties(nx2linux_gl_on_vulkan PROPERTIES SKIP_RETURN_CODE 77)
 endif()

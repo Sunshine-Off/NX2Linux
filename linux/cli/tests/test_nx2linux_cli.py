@@ -62,7 +62,14 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(self.verify_report('<testsuite>'
             '<testcase name="nx2linux_sdl_host_smoke" status="run"/>'
             '<testcase name="nx2linux_vulkan_triangle" status="run"/>'
+            '<testcase name="nx2linux_gl_on_vulkan" status="run"/>'
             '</testsuite>'), 0)
+
+    def test_gl_on_vulkan_skipped_is_not_a_pass_when_vulkan_is_required(self):
+        base = ('<testsuite><testcase name="nx2linux_sdl_host_smoke" status="run"/>'
+                '<testcase name="nx2linux_vulkan_triangle" status="run"/>')
+        self.assertNotEqual(self.verify_report(base + '<testcase name="nx2linux_gl_on_vulkan" status="run"><skipped/></testcase></testsuite>'), 0)
+        self.assertNotEqual(self.verify_report(base + '</testsuite>'), 0)
 
     def test_empty_missing_and_malformed_reports_fail(self):
         for xml in [None, 'not XML', '<testsuite/>', '<testsuite><testcase/></testsuite>']:
@@ -82,6 +89,56 @@ class VerifyTests(unittest.TestCase):
 
     def test_ctest_failure_propagates(self):
         self.assertEqual(self.verify_report(None, code=8), 8)
+
+
+class ExtractAndSmokeTests(unittest.TestCase):
+    def test_extract_refuses_an_output_folder_inside_the_repository(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            nsp, keys = Path(temporary) / 'g.nsp', Path(temporary) / 'prod.keys'
+            nsp.touch(); keys.touch()
+            args = argparse.Namespace(nsp=str(nsp), keys=str(keys), out=str(ROOT / 'extracted'))
+            with patch.object(nx2linux.shutil, 'which', return_value='/usr/bin/dotnet'), \
+                    patch.object(nx2linux, 'NX_EXTRACT', ROOT / 'linux' / 'cli' / 'tests' / 'fake'), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                # nx_extract is checked before the output folder, so give it a project file that exists
+                fake = ROOT / 'linux' / 'cli' / 'tests' / 'fake'
+                fake.mkdir(exist_ok=True)
+                (fake / 'nx_extract.csproj').touch()
+                try:
+                    code = nx2linux.extract(args)
+                finally:
+                    (fake / 'nx_extract.csproj').unlink()
+                    fake.rmdir()
+            self.assertEqual(code, 2)
+            self.assertIn('inside the repository', err.getvalue())
+
+    def test_extract_accepts_the_keys_folder_and_reports_a_missing_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = argparse.Namespace(nsp=str(Path(temporary) / 'missing.nsp'), keys=temporary, out=None)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(nx2linux.extract(args), 2)
+
+    def smoke_args(self, script, runs=3):
+        return argparse.Namespace(runs=runs, timeout=20, title_id='0100000000000000', game_version='1', profile='p',
+                                  log_dir=None, command_line=[sys.executable, '-c', script])
+
+    def test_smoke_passes_when_every_run_exits_cleanly_without_red(self):
+        script = 'print("gpu: llvmpipe"); print("driver: lavapipe")'
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(nx2linux.smoke(self.smoke_args(script)), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual((report['gpu'], report['driver'], len(report['runs'])), ('llvmpipe', 'lavapipe', 3))
+
+    def test_smoke_fails_on_a_red_line_or_a_bad_exit(self):
+        for script in ('print("[RED] unexplained")', 'raise SystemExit(3)'):
+            with self.subTest(script=script), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(nx2linux.smoke(self.smoke_args(script)), 1)
+
+    def test_smoke_without_a_command_is_a_usage_error(self):
+        args = self.smoke_args('')
+        args.command_line = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(nx2linux.smoke(args), 2)
 
 
 if __name__ == '__main__':
