@@ -46,6 +46,6 @@ fonction ARM64 --remill-lift--> sub_<adresse> (LLVM IR) --clang++--> x86_64
 ## Limites et lacunes (à ne pas oublier)
 
 - Hypothèses H7 à H10 dans `hypotheses.md` : `ret` ignore x30, `br` = appel terminal vers une entrée de fonction (pas de tables de sauts), pas de SIMD/flottants.
-- **Atomiques (mission 6), mesure faite mais pas traitée** : Remill lifte `ldxr`, `ldaxr`, `stlxr`, `ldar`, `dmb` ; il refuse `stxr`, `stlr`, `isb` et les instructions LSE. Les cœurs A57 de la Switch n'ont pas LSE : `stxr`, `stlr` et `isb` sont les prochains manques à combler (même méthode que `adc`).
+- **Atomiques** : traités après coup, voir [T3b-atomiques.md](T3b-atomiques.md). Restent non décodés : `ldxrb/h`, `stxrb/h`, `ldxp/stxp` et LSE.
 - Pas de mesure de performance. Les registres vivent dans la structure d'état, pas dans des registres x86 entre les fonctions.
 - Le JIT de secours n'existe pas : une cible inconnue s'arrête. C'est T4.
