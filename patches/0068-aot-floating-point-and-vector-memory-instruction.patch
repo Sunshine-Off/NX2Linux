@@ -1,0 +1,646 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 18:16:11 +0100
+Subject: [PATCH] aot: floating-point and vector memory instructions,
+ byte/halfword exclusives (blockers 3 and 4)
+
+The runtime defines __remill_fpu_exception_* (floating-point arithmetic was lifted but could not link, so
+it ran in the JIT); the vector registers, FPCR and FPSR go in and out of Aot.run. test_aot_simd assembles
+each instruction with aarch64-linux-gnu-as, lifts it alone and compares it with Unicorn on edge-value
+vector registers: 48 memory forms, 175 scalar FP, 54 exclusives and barriers. module_validate gets a census
+(every distinct instruction of a module, lifted or not) and random vector registers in its differential
+run. On Balatro: 0.91% -> 0.55% of instructions unlifted, 88.6% -> 97.4% of functions liftable, main's
+entries left to the JIT 14.1% -> 3.5%. The Remill patch is fork en cours/remill-patches/0004.
+
+Upstream-Status: pending
+Reason: floating-point and exclusive-access coverage of the AArch64 -> x86_64 recompilation (NX2Linux); no game data in the tests
+Issue: none yet (NX2Linux, branch feat/teo-t7-module-reel)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/aot_jit.cpp                 |   4 +-
+ dm/tools/aot_lift.py                 |  11 +-
+ dm/tools/aot_runtime.cpp             |  17 ++-
+ dm/tools/aot_runtime.h               |   7 +
+ dm/tools/module_validate.py          |  72 +++++++++-
+ dm/tools/tests/test_aot_cache.py     |  15 +-
+ dm/tools/tests/test_aot_realistic.py |   9 +-
+ dm/tools/tests/test_aot_simd.py      | 207 +++++++++++++++++++++++++++
+ dm/tools/tests/test_aot_stub.py      |  28 +++-
+ 9 files changed, 342 insertions(+), 28 deletions(-)
+ create mode 100644 dm/tools/tests/test_aot_simd.py
+
+diff --git a/dm/tools/aot_jit.cpp b/dm/tools/aot_jit.cpp
+index d0fcca2..7e1751f 100644
+--- a/dm/tools/aot_jit.cpp
++++ b/dm/tools/aot_jit.cpp
+@@ -220,7 +220,7 @@ void load(Cpu &c, const State *st) {   // State -> Jit
+     c.jit->SetSP(st->gpr.sp.qword);
+     c.jit->SetPstate((uint32_t)((st->sr.n << 31) | (st->sr.z << 30) | (st->sr.c << 29) | (st->sr.v << 28)));
+     for (int i = 0; i < 32; i++) { A64::Vector v; memcpy(&v, &st->simd.v[i], 16); c.jit->SetVector(i, v); }
+-    c.jit->SetFpcr((uint32_t)st->fpcr.flat); c.jit->SetFpsr((uint32_t)st->fpsr.flat);
++    c.jit->SetFpcr((uint32_t)st->fpcr.flat); c.jit->SetFpsr(aot_fpsr_get(*st));
+     c.tpidr = st->sr.tpidr_el0.qword; c.tpidrro = st->sr.tpidrro_el0.qword;
+ }
+ 
+@@ -232,7 +232,7 @@ void store(Cpu &c, State *st) {   // Jit -> State
+     uint32_t ps = c.jit->GetPstate();
+     st->sr.n = ps >> 31 & 1; st->sr.z = ps >> 30 & 1; st->sr.c = ps >> 29 & 1; st->sr.v = ps >> 28 & 1;
+     for (int i = 0; i < 32; i++) { A64::Vector v = c.jit->GetVector(i); memcpy(&st->simd.v[i], &v, 16); }
+-    st->fpcr.flat = c.jit->GetFpcr(); st->fpsr.flat = c.jit->GetFpsr();
++    st->fpcr.flat = c.jit->GetFpcr(); aot_fpsr_set(*st, c.jit->GetFpsr());
+     st->sr.tpidr_el0.qword = c.tpidr;
+ }
+ 
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index 1388a48..6794440 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -287,7 +287,7 @@ class Aot:
+         return buf.value.decode()
+ 
+     class _Guest(ctypes.Structure):
+-        _fields_ = [('x', ctypes.c_uint64 * 31), ('sp', ctypes.c_uint64), ('nzcv', ctypes.c_uint64), ('tpidr_el0', ctypes.c_uint64), ('tpidrro_el0', ctypes.c_uint64)]
++        _fields_ = [('x', ctypes.c_uint64 * 31), ('sp', ctypes.c_uint64), ('nzcv', ctypes.c_uint64), ('tpidr_el0', ctypes.c_uint64), ('tpidrro_el0', ctypes.c_uint64), ('v', ctypes.c_uint64 * 64), ('fpcr', ctypes.c_uint64), ('fpsr', ctypes.c_uint64)]
+ 
+     def map(self, base, size, data=None):
+         self.lib.aot_map(base, size); self.regions.append((base, size, bytes(data) if data else bytes(size)))
+@@ -339,16 +339,21 @@ class Aot:
+ 
+     def stat(self, name): return self.lib.aot_stat(STATS.index(name))
+ 
+-    def run(self, pc, regs=None, nzcv=0, sp=0, tpidr_el0=0, tpidrro_el0=0):
++    def run(self, pc, regs=None, nzcv=0, sp=0, tpidr_el0=0, tpidrro_el0=0, vregs=None, fpcr=0, fpsr=0):
+         """Run the AOT function at pc. Returns {'x0'..'x30', 'sp', 'nzcv', 'tpidr_el0', 'mem': {base: bytes}} or {'fault': reason}.
+-        tpidr_el0, tpidrro_el0: the thread pointers this guest thread sees (on Horizon tpidrro_el0 points at the thread-local region)"""
++        tpidr_el0, tpidrro_el0: the thread pointers this guest thread sees (on Horizon tpidrro_el0 points at the thread-local region).
++        vregs: {'v0': 128-bit int, ...} the vector registers going in (the others are 0), fpcr, fpsr; the result has 'v0'..'v31' (128-bit ints), 'fpcr' and 'fpsr' too"""
+         g = self._Guest()
+         for k, v in (regs or {}).items(): g.x[int(k[1:])] = v & (2 ** 64 - 1)
+         g.sp, g.nzcv, g.tpidr_el0, g.tpidrro_el0 = sp, nzcv, tpidr_el0, tpidrro_el0
++        for k, v in (vregs or {}).items(): i = int(k[1:]); g.v[2 * i] = v & (2 ** 64 - 1); g.v[2 * i + 1] = v >> 64 & (2 ** 64 - 1)
++        g.fpcr, g.fpsr = fpcr, fpsr
+         err = ctypes.create_string_buffer(300)
+         rc = self.lib.aot_run(ctypes.byref(g), pc, err, 300)
+         if rc: return {'fault': err.value.decode()}
+         out = {f'x{i}': g.x[i] for i in range(31)}; out['sp'] = g.sp; out['nzcv'] = g.nzcv; out['tpidr_el0'] = g.tpidr_el0
++        for i in range(32): out[f'v{i}'] = g.v[2 * i] | g.v[2 * i + 1] << 64
++        out['fpcr'], out['fpsr'] = g.fpcr, g.fpsr
+         out['mem'] = {b: self.peek(b, n) for b, n, _ in self.regions}
+         return out
+ 
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index 898d333..6d90e85 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -4,6 +4,7 @@
+ //     fallback (T4) takes it. A direct `bl` needs none of this: Remill lifted it into a call of sub_<address>, resolved at link time.
+ //   · errors leave the lifted code by longjmp (its frames hold no destructors), and aot_run reports them as text.
+ // ADDRESS_SIZE_BITS=64 and Remill's include folder are on the command line (aot_lift.py). Flag and compare intrinsics are markers whose first argument is already the value, as in remill_host.cpp.
++#include <cfenv>   // before Remill's headers: they define __FE_DENORM as a macro, which breaks glibc's own fenv.h
+ #include "aot_runtime.h"
+ #include <atomic>
+ #include <csetjmp>
+@@ -135,6 +136,16 @@ CAS(8, uint8_t) CAS(16, uint16_t) CAS(32, uint32_t) CAS(64, uint64_t)
+ Memory *__remill_atomic_begin(Memory *m) { return m; }   // the CAS above is the atomic operation; these only bracket the instruction
+ Memory *__remill_atomic_end(Memory *m) { return m; }
+ 
++// Floating-point exception flags. Remill's AArch64 semantics clear them, run the operation on the host FPU and read them back into FPSR; the masks are AArch64's FPSR bit positions
++// (invalid 1, divide by zero 2, overflow 4, underflow 8, inexact 16, input denormal 128: x86 has no flag for that last one, so it is never reported)
++static int fe_of(int32_t m) { return (m & 1 ? FE_INVALID : 0) | (m & 2 ? FE_DIVBYZERO : 0) | (m & 4 ? FE_OVERFLOW : 0) | (m & 8 ? FE_UNDERFLOW : 0) | (m & 16 ? FE_INEXACT : 0); }
++int32_t __remill_fpu_exception_test(int32_t mask) {
++    int e = fetestexcept(fe_of(mask));
++    return (e & FE_INVALID ? 1 : 0) | (e & FE_DIVBYZERO ? 2 : 0) | (e & FE_OVERFLOW ? 4 : 0) | (e & FE_UNDERFLOW ? 8 : 0) | (e & FE_INEXACT ? 16 : 0);
++}
++void __remill_fpu_exception_clear(int32_t mask) { feclearexcept(fe_of(mask)); }
++void __remill_fpu_exception_raise(int32_t mask) { feraiseexcept(fe_of(mask)); }
++
+ // Barriers, each ordering what its name says on any host (free on x86 but store->load, which needs the full fence)
+ Memory *__remill_barrier_load_load(Memory *m) { std::atomic_thread_fence(std::memory_order_acquire); return m; }
+ Memory *__remill_barrier_load_store(Memory *m) { std::atomic_thread_fence(std::memory_order_acquire); return m; }
+@@ -204,7 +215,7 @@ Memory *aot_unlifted(State *st, uint64_t pc, Memory *m, const char *why) {
+ }
+ 
+ // ---- the harness side (ctypes) ----
+-struct Guest { uint64_t x[31]; uint64_t sp; uint64_t nzcv; uint64_t tpidr_el0; uint64_t tpidrro_el0; };   // nzcv: N Z C V as bits 3..0
++struct Guest { uint64_t x[31]; uint64_t sp; uint64_t nzcv; uint64_t tpidr_el0; uint64_t tpidrro_el0; uint64_t v[64]; uint64_t fpcr; uint64_t fpsr; };   // v: v0..v31 as low, high 64 bits   // nzcv: N Z C V as bits 3..0
+ 
+ // Map zeroed guest memory at base: 0, or 1 when it overlaps a region or the table is full (a service answers with an error code; the harness aborts)
+ int aot_try_map(uint64_t base, uint64_t size) {
+@@ -246,6 +257,8 @@ int aot_run(Guest *g, uint64_t pc, char *err, uint64_t errn) {
+     X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30)
+ #undef X
+     st.gpr.sp.qword = g->sp; st.sr.tpidr_el0.qword = g->tpidr_el0; st.sr.tpidrro_el0.qword = g->tpidrro_el0;
++    for (int i = 0; i < 32; i++) memcpy(&st.simd.v[i], &g->v[2 * i], 16);
++    st.fpcr.flat = (uint32_t)g->fpcr; aot_fpsr_set(st, (uint32_t)g->fpsr);
+     st.sr.n = g->nzcv >> 3 & 1; st.sr.z = g->nzcv >> 2 & 1; st.sr.c = g->nzcv >> 1 & 1; st.sr.v = g->nzcv & 1;
+     jmp_buf jb; int rc = 0;
+     if (setjmp(jb)) rc = 1;
+@@ -261,6 +274,8 @@ int aot_run(Guest *g, uint64_t pc, char *err, uint64_t errn) {
+ #define X(i) g->x[i] = st.gpr.x##i.qword;
+     X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30)
+ #undef X
++    for (int i = 0; i < 32; i++) memcpy(&g->v[2 * i], &st.simd.v[i], 16);
++    g->fpcr = st.fpcr.flat; g->fpsr = aot_fpsr_get(st);
+     g->sp = st.gpr.sp.qword; g->tpidr_el0 = st.sr.tpidr_el0.qword; g->nzcv = st.sr.n << 3 | st.sr.z << 2 | st.sr.c << 1 | st.sr.v;
+     if (rc) snprintf(err, errn, "%s", g_err); else if (errn) err[0] = 0;
+     return rc;
+diff --git a/dm/tools/aot_runtime.h b/dm/tools/aot_runtime.h
+index 0784979..f806fb9 100644
+--- a/dm/tools/aot_runtime.h
++++ b/dm/tools/aot_runtime.h
+@@ -4,6 +4,13 @@
+ #include <cstdint>
+ 
+ typedef Memory *(*AotFn)(State *, uint64_t, Memory *);
++// FPSR: the cumulative exception flags live in State.sr (where the lifted floating-point code sets them), the rest of the register in State.fpsr
++static inline uint32_t aot_fpsr_get(const State &st) {
++    return (uint32_t)(st.fpsr.flat & ~0x9Full) | st.sr.ioc | st.sr.dzc << 1 | st.sr.ofc << 2 | st.sr.ufc << 3 | st.sr.ixc << 4 | st.sr.idc << 7;
++}
++static inline void aot_fpsr_set(State &st, uint32_t v) {
++    st.fpsr.flat = v & ~0x9Fu; st.sr.ioc = v & 1; st.sr.dzc = v >> 1 & 1; st.sr.ofc = v >> 2 & 1; st.sr.ufc = v >> 3 & 1; st.sr.ixc = v >> 4 & 1; st.sr.idc = v >> 7 & 1;
++}
+ // Statistics, in the order aot_lift.py names them (STATS)
+ enum { AOT_S_CALLS, AOT_S_JUMPS, AOT_S_FALLBACK, AOT_S_READS, AOT_S_WRITES, AOT_S_REGIONS,
+        AOT_S_JIT_ENTRIES, AOT_S_JIT_TO_AOT, AOT_S_JIT_INVALIDATIONS, AOT_S_JIT_PAGES, AOT_S_UNLIFTED, AOT_S_SVC, AOT_S_IMPORTS, AOT_S_N };
+diff --git a/dm/tools/module_validate.py b/dm/tools/module_validate.py
+index 264e21d..5963b8f 100644
+--- a/dm/tools/module_validate.py
++++ b/dm/tools/module_validate.py
+@@ -2,9 +2,11 @@
+ """Validation of the AArch64 -> x86_64 recompilation on a real module (NX2Linux T7). Nothing of the game is stored or printed beyond addresses, counts and mnemonics: the module is read from a folder of NSOs
+ (the ExeFS nx_extract writes) and everything derived from it goes to a scratch folder you name.
+   coverage  how much of the module Remill can lift: every function (or a sample), in parallel; the failures by first unliftable instruction and by mnemonic
++  census    every distinct instruction (register numbers masked) of the module, whether Remill lifts it, and how many times and in how many functions the unliftable ones occur: the list of what to implement next
+   diff      leaf functions (no call, no indirect branch, no svc, no system register) lifted, compiled and run on random inputs next to the Unicorn ARM64 core on the same relocated module image:
+             registers, NZCV and the writable memory must be identical. Both-fault and step-budget cases prove nothing and are counted apart.
+-Usage: module_validate.py coverage <exefs dir> <work dir> <module> [--sample N] [--jobs J]
++Usage: module_validate.py census <exefs dir> <work dir> <module>[,<module>...] [--top N]
++       module_validate.py coverage <exefs dir> <work dir> <module> [--sample N] [--jobs J]
+        module_validate.py diff <exefs dir> <work dir> <module> [--functions N] [--cases K] [--jobs J] [--seed S]
+ Needs REMILL_BUILD, clang++, capstone and unicorn, like the tests."""
+ import argparse, collections, concurrent.futures as cf, json, os, random, struct, subprocess, sys, time
+@@ -80,6 +82,48 @@ def cmd_coverage(a):
+     (Path(a.work) / f'{a.module}.coverage.json').write_text(json.dumps(dict(functions=len(funcs), lift=len(funcs) - len(bad), unliftable={hex(mod.base + s): e for s, e in sorted(bad.items())}), indent=1))
+ 
+ 
++# ---- census ----
++REGS = ~((0x1F << 16) | (0x1F << 5) | 0x1F) & 0xFFFFFFFF   # Rd, Rn, Rm (and Rt, Rt2's neighbour): the register numbers do not change what an instruction is
++
++
++def census_lift(w):
++    import aot_lift, tempfile
++    with tempfile.TemporaryDirectory() as d:
++        try: aot_lift.lift(w, os.path.join(d, 'c.ll'), 0x1000); return w, None
++        except aot_lift.LiftError as e: return w, str(e)
++        except Exception as e: return w, f'{type(e).__name__}: {e}'
++
++
++def cmd_census(a):
++    import capstone
++    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
++    count, funcs, example = collections.Counter(), collections.Counter(), {}
++    total = 0
++    for name in a.module.split(','):
++        man, mod, _ = module(a.exefs, a.work, name)
++        for f in json.loads(man.read_text())['functions']:
++            if f['how'] == 'call': continue
++            seen = set()
++            for (w,) in struct.iter_unpack('<I', bytes(mod.image[f['start']:f['end']])):
++                k = w & REGS; count[k] += 1; total += 1; seen.add(k); example.setdefault(k, w)
++            for k in seen: funcs[k] += 1
++    valid = {}
++    for k, w in example.items():
++        i = next(md.disasm(struct.pack('<I', w), 0), None)
++        if i: valid[k] = (w, i.mnemonic, f'{i.mnemonic} {i.op_str}')
++    print(f'{total} words, {len(count)} distinct classes, {len(valid)} decode as instructions', flush=True)
++    with cf.ProcessPoolExecutor(a.jobs) as ex: res = dict(ex.map(census_lift, [w for w, _, _ in valid.values()], chunksize=16))
++    bad = {k: v for k, v in valid.items() if res[v[0]]}
++    nbad = sum(count[k] for k in bad); nall = sum(count[k] for k in valid)
++    print(f'{len(bad)} classes are not lifted: {nbad} of {nall} instructions ({100 * nbad / nall:.2f}%)')
++    by_m = collections.defaultdict(lambda: [0, 0, 0, ''])
++    for k, (w, m, text) in bad.items():
++        r = by_m[m]; r[0] += count[k]; r[1] += funcs[k]; r[2] += 1; r[3] = r[3] or text
++    print('mnemonic: instructions / (sum over classes of) functions / classes   example')
++    for m, (n, fn, cl, ex_) in sorted(by_m.items(), key=lambda kv: -kv[1][0])[:a.top]: print(f'  {m:10} {n:8} {fn:8} {cl:4}   {ex_}')
++    (Path(a.work) / f'{a.module.replace(",", "+")}.census.json').write_text(json.dumps({m: dict(count=v[0], classes=v[2], example=v[3]) for m, v in by_m.items()}, indent=1))
++
++
+ # ---- differential run ----
+ def candidates(man, mod, switches=False):
+     """Starts of the leaf functions: no call, no indirect branch, no svc or system register, every direct branch inside the function.
+@@ -103,6 +147,15 @@ def candidates(man, mod, switches=False):
+     return out
+ 
+ 
++def _nan(x):
++    return ((x >> 52) & 0x7FF == 0x7FF and x & ((1 << 52) - 1)) or any((x >> sh & 0xFFFFFFFF) >> 23 & 0xFF == 0xFF and (x >> sh & 0x7FFFFF) for sh in (0, 32))
++
++
++VPOOL = [v for v in ([struct.unpack('<Q', struct.pack('<d', f))[0] for f in (0.0, -0.0, 1.0, -1.0, 0.5, 1.5, -2.5, 3.7, 100.25, 1e10, -1e10, 1e-10, 2.0 ** 31, 2.0 ** 63, 1e300)] +
++                      [struct.unpack('<I', struct.pack('<f', f))[0] | struct.unpack('<I', struct.pack('<f', g))[0] << 32 for f, g in ((1.0, 2.0), (-3.5, 0.25), (1e10, -1e-10), (7.0, 0.0))] +
++                      [0, 1, 0xFFFFFFFFFFFFFFFF, 0x7FFFFFFF, 0x80000000, 0x0123456789ABCDEF, 0x00FF00FF00FF00FF]) if not _nan(v)]   # no NaN: payloads and priorities differ between x86 and ARM
++
++
+ def inputs(rng, mod, k):
+     data_lo = mod.base + next(sg['vaddr'] for sg in mod.m['segments'] if sg['perms'] == 'rw-')
+     data_sz = len(mod.image) - (data_lo - mod.base)
+@@ -116,14 +169,14 @@ def inputs(rng, mod, k):
+         if c < .85: return MASK
+         if c < .90: return 1 << 63
+         return rng.randrange(0, 1 << 16)
+-    return [dict({f'x{i}': one() for i in range(8)}, nzcv=rng.randrange(16)) for _ in range(k)]
++    return [dict({f'x{i}': one() for i in range(8)}, nzcv=rng.randrange(16), v={f'v{i}': rng.choice(VPOOL) | rng.choice(VPOOL) << 64 for i in range(32)}) for _ in range(k)]
+ 
+ 
+ def worker(a):
+     """Run a batch of functions: AOT next to Unicorn; prints one JSON line per function"""
+     import aot_lift
+     from unicorn import Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM
+-    from unicorn.arm64_const import UC_ARM64_REG_SP, UC_ARM64_REG_NZCV, UC_ARM64_REG_PC
++    from unicorn.arm64_const import UC_ARM64_REG_SP, UC_ARM64_REG_NZCV, UC_ARM64_REG_PC, UC_ARM64_REG_Q0, UC_ARM64_REG_CPACR_EL1, UC_ARM64_REG_FPCR, UC_ARM64_REG_FPSR
+     import arm64_ref as ref
+     man, mod, _ = module(a.exefs, a.work, a.module)
+     starts = [int(x, 16) for x in a.starts.split(',')]
+@@ -138,26 +191,30 @@ def worker(a):
+     aot.map(mod.base + rw, mod.size - rw, img[rw:]); aot.map(SCRATCH, SCRATCH_SIZE, scratch); aot.map(STACK, STACK_SIZE)
+     uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+     uc.mem_map(mod.base, mod.size); uc.mem_write(mod.base, img); uc.mem_map(SCRATCH, SCRATCH_SIZE); uc.mem_map(STACK, STACK_SIZE); uc.mem_map(STOP, 0x1000)
++    uc.reg_write(UC_ARM64_REG_CPACR_EL1, 3 << 20)   # floating point and vectors on
+     for s in starts:
+         r = dict(function=hex(mod.base + s), status='', cases=0, detail='')
+         r['jit'] = bool(a.jit and mod.base + s in aot.unlifted)   # an unliftable function runs in the JIT when there is one
+         if mod.base + s in aot.unlifted and not a.jit: r['status'] = 'unliftable'; r['detail'] = aot.unlifted[mod.base + s][:200]; print(json.dumps(r), flush=True); continue
+         counts = collections.Counter(); j0 = aot.stat('indirect_jumps'); f0 = aot.stat('fallback_requests')
+         for inp in inputs(rng, mod, a.cases):
+-            nz = inp.pop('nzcv')
++            nz = inp.pop('nzcv'); vr = inp.pop('v')
+             uc.mem_write(mod.base + rw, img[rw:]); uc.mem_write(SCRATCH, scratch); uc.mem_write(STACK, bytes(STACK_SIZE))
+             for i in range(31): uc.reg_write(ref.xreg(i), inp.get(f'x{i}', 0))
++            for i in range(32): uc.reg_write(UC_ARM64_REG_Q0 + i, vr[f'v{i}'])
++            uc.reg_write(UC_ARM64_REG_FPCR, 0); uc.reg_write(UC_ARM64_REG_FPSR, 0)
+             uc.reg_write(ref.xreg(30), STOP); uc.reg_write(UC_ARM64_REG_SP, STACK + STACK_SIZE - 0x100); uc.reg_write(UC_ARM64_REG_NZCV, nz << 28)
+             try: uc.emu_start(mod.base + s, STOP, count=200000); fault = None
+             except UcError as e: fault = str(e)
+             if fault is None and uc.reg_read(UC_ARM64_REG_PC) != STOP: counts['budget'] += 1; continue
+             aot.reset()
+-            got = aot.run(mod.base + s, dict(inp, x30=STOP), nz, STACK + STACK_SIZE - 0x100)
++            got = aot.run(mod.base + s, dict(inp, x30=STOP), nz, STACK + STACK_SIZE - 0x100, vregs=vr)
+             if fault is not None or 'fault' in got:
+                 if fault is not None and 'fault' in got: counts['both-fault'] += 1
+                 else: counts['fault-differs'] += 1; r['detail'] = f'inputs {inp} nzcv {nz:04b}: unicorn {fault!r}, aot {got.get("fault")!r}'
+                 continue
+             want = {f'x{i}': uc.reg_read(ref.xreg(i)) for i in range(31)}; want['sp'] = uc.reg_read(UC_ARM64_REG_SP); want['nzcv'] = uc.reg_read(UC_ARM64_REG_NZCV) >> 28
++            want.update({f'v{i}': uc.reg_read(UC_ARM64_REG_Q0 + i) for i in range(32)})
+             diff = [k for k in want if got[k] != want[k]]
+             for b, size in ((mod.base + rw, mod.size - rw), (SCRATCH, SCRATCH_SIZE), (STACK, STACK_SIZE)):
+                 if bytes(uc.mem_read(b, size)) != got['mem'][b]: diff.append(f'memory@{b:#x}')
+@@ -210,15 +267,16 @@ def cmd_diff(a):
+ 
+ def main():
+     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+-    p.add_argument('cmd', choices=['coverage', 'diff', '_worker']); p.add_argument('exefs'); p.add_argument('work'); p.add_argument('module')
++    p.add_argument('cmd', choices=['coverage', 'census', 'diff', '_worker']); p.add_argument('exefs'); p.add_argument('work'); p.add_argument('module')
+     p.add_argument('--sample', type=int, default=0); p.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) - 2)); p.add_argument('--seed', type=int, default=1)
+     p.add_argument('--functions', type=int, default=200); p.add_argument('--cases', type=int, default=12); p.add_argument('--batch', type=int, default=8); p.add_argument('--timeout', type=int, default=240)
+-    p.add_argument('--starts', default=''); p.add_argument('--jit', action='store_true', help='also build the dynarmic fallback: unliftable functions then run in it (needs DYNARMIC_DIR)')
++    p.add_argument('--top', type=int, default=60); p.add_argument('--starts', default=''); p.add_argument('--jit', action='store_true', help='also build the dynarmic fallback: unliftable functions then run in it (needs DYNARMIC_DIR)')
+     p.add_argument('--switches', action='store_true', help='diff: test the functions that contain a jump table (switch) instead of the plain leaves')
+     p.add_argument('--only-unliftable', action='store_true', help='diff: test only the functions coverage found unliftable (needs a previous coverage run of the same module)')
+     a = p.parse_args()
+     Path(a.work).mkdir(parents=True, exist_ok=True)
+     if a.cmd == 'coverage': cmd_coverage(a)
++    elif a.cmd == 'census': cmd_census(a)
+     elif a.cmd == 'diff': sys.exit(cmd_diff(a))
+     else: worker(a)
+ 
+diff --git a/dm/tools/tests/test_aot_cache.py b/dm/tools/tests/test_aot_cache.py
+index 261bec2..c1c4e61 100644
+--- a/dm/tools/tests/test_aot_cache.py
++++ b/dm/tools/tests/test_aot_cache.py
+@@ -13,8 +13,9 @@ import aot_lift
+ import arm64_fixture as fx
+ import arm64_ref as ref
+ from test_aot_t3 import DATA, MEM, SP, READY, fixture
++from test_aot_stub import needs_missing_symbol
+ 
+-G, D = 0x500, 0x600   # an unliftable function (ccmn, register form) and fadd, which needs runtime symbols nobody defines
++G, D = 0x500, 0x600   # an unliftable function (ccmn, register form) and a plain one that the tests make need a symbol nobody defines
+ 
+ 
+ @unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++ and unicorn')
+@@ -67,12 +68,16 @@ class Cache(unittest.TestCase):
+         self.assertIn('ccmn', str(c.exception))
+ 
+     def test_a_function_that_needs_an_undefined_runtime_symbol_is_stubbed_from_the_recorded_symbols(self):
+-        d = (D, struct.pack('<2I', 0x1E612800, aot_lift.RET))   # fadd d0, d0, d1
++        d = (D, struct.pack('<2I', 0x91000400, aot_lift.RET))   # add x0, x0, #1 ; ret
+         fs = [d] + self.funcs(('arith',))
+-        a = self.build(fs, stub_unliftable=True); self.assertIn('__remill_fpu_exception', a.unlifted[D]); a.close()
++        with needs_missing_symbol():
++            a = self.build(fs, stub_unliftable=True)
++            self.assertEqual(sorted(a.unlifted), sorted([D, self.ranges['arith'][0]])); a.close()
+         self.assertTrue(list(Path(self.cache).rglob('*.syms')))
+-        b = self.build(fs, stub_unliftable=True)
+-        try: self.assertEqual((b.cache_hits, b.cache_misses, list(b.unlifted)), (2, 0, [D]))
++        more = fs + self.funcs(('branch',))   # one function more, so that the library is not cached as a whole but both earlier objects are
++        with needs_missing_symbol():
++            b = self.build(more, stub_unliftable=True)
++        try: self.assertEqual((b.cache_hits, b.cache_misses, sorted(b.unlifted)), (2, 1, sorted([D, self.ranges['arith'][0], self.ranges['branch'][0]])))   # the first two were stubbed from their recorded .syms
+         finally: b.close()
+ 
+     def test_the_toolchain_is_part_of_the_key(self):
+diff --git a/dm/tools/tests/test_aot_realistic.py b/dm/tools/tests/test_aot_realistic.py
+index ed09c12..af0e054 100644
+--- a/dm/tools/tests/test_aot_realistic.py
++++ b/dm/tools/tests/test_aot_realistic.py
+@@ -18,9 +18,9 @@ GCC = shutil.which('aarch64-linux-gnu-gcc')
+ BASE, RODATA = 0x10000, 0x12000
+ GLOBALS = {0x2F000: bytes(0x2000)}   # the sample's .bss (g_lock, g_counter, g_flag at 0x2ffe8..0x30000), mapped for the AOT code and the reference alike
+ MEM_ALL = {**MEM, **GLOBALS}
+-NAMES = ('sw', 'sw2', 'hash', 'sort', 'strlen_', 'mul128', 'cmpf', 'lock', 'unlock', 'inc', 'cas')
+-LIFTS_NOT = {'scale', 'vadd', 'inc8', 'cas16', 'objcopy', 'conv', 'bits'}           # whole functions Remill cannot lift
+-INSNS_NOT = {'fmul', 'str', 'stp', 'fcvtzs', 'cnt', 'ldxrb', 'stxrb', 'ldaxrh', 'stlxrh'}   # the mnemonics behind them
++NAMES = ('sw', 'sw2', 'hash', 'sort', 'strlen_', 'mul128', 'cmpf', 'lock', 'unlock', 'inc', 'cas', 'inc8', 'cas16', 'objcopy', 'conv', 'vadd')
++LIFTS_NOT = {'scale', 'bits'}           # whole functions Remill cannot lift (vector multiply by element, cnt): the byte and halfword exclusives, the Q stores and the scalar conversions lift since patch 0004
++INSNS_NOT = {'fmul', 'cnt'}   # the mnemonics behind them: a vector multiply by element and a population count
+ 
+ 
+ def build(tmp):
+@@ -97,6 +97,9 @@ class Realistic(unittest.TestCase):
+         self.compare(a, 'cmpf', [{'x0': DATA + o, 'x1': DATA + o + 8} for o in (0, 4, 40)])
+         self.compare(a, 'cas', [{'x0': DATA + 32, 'x1': e, 'x2': 9} for e in (0, 5)])
+         self.compare(a, 'inc', [{}])
++        self.compare(a, 'inc8', [{'x0': DATA + o} for o in (40, 41, 255)])
++        self.compare(a, 'cas16', [{'x0': DATA + 34, 'x1': e, 'x2': 9} for e in (0, 0x2321, 0x2322)])   # 16-bit exclusives
++        self.compare(a, 'objcopy', [{'x0': DATA + 0x100, 'x1': DATA + o} for o in (0x20, 0x31)])        # copies a struct with Q stores/loads
+ 
+     def test_the_tables_are_found(self):
+         tables = [jt for n in NAMES for jt in jump_tables.find_jump_tables(self.image, *self.fn[n])]
+diff --git a/dm/tools/tests/test_aot_simd.py b/dm/tools/tests/test_aot_simd.py
+new file mode 100644
+index 0000000..02a9b1f
+--- /dev/null
++++ b/dm/tools/tests/test_aot_simd.py
+@@ -0,0 +1,207 @@
++"""Floating-point and vector instructions, one by one, lifted by Remill, compiled and compared with the Unicorn ARM64 core (NX2Linux, known blockers 3 and 4: the instructions a real game uses and Remill did not lift).
++Each instruction is written as assembly (aarch64-linux-gnu-as turns it into its word), becomes a one-instruction function, and runs on the same inputs on both sides: vector registers holding edge
++values (zeros, -0, 1.5, large and tiny floats, infinities, integers on the boundaries), a data region, the general registers. Registers, NZCV, memory and FPCR must be identical. FPSR (the cumulative
++exception flags) is compared separately and listed: Remill does not model every flag, and a game almost never reads them. NaNs are left out of the inputs (their payload and sign differ between x86 and
++ARM: see the hypotheses file).
++Needs aarch64-linux-gnu-as, REMILL_BUILD, clang++ and unicorn; skipped otherwise."""
++import os, random, shutil, struct, subprocess, sys, tempfile, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_ref as ref
++from test_aot_t3 import READY
++
++AS = shutil.which('aarch64-linux-gnu-as')
++OBJCOPY = shutil.which('aarch64-linux-gnu-objcopy')
++RET = 0xD65F03C0
++CODE, STEP = 0x10000, 0x100          # instruction i is the function at CODE + i * STEP: the instruction, then ret
++DATA, DATA_SIZE, STACK, STACK_SIZE = 0x100000, 0x2000, 0x200000, 0x10000
++SP = STACK + STACK_SIZE - 0x800   # room above for loads that post-increment
++MASK = (1 << 64) - 1
++DATA_BYTES = bytes((i * 131 + 7) & 0xFF for i in range(DATA_SIZE))
++
++
++def f32(x): return struct.unpack('<I', struct.pack('<f', x))[0]
++def f64(x): return struct.unpack('<Q', struct.pack('<d', x))[0]
++
++
++FLOATS = [0.0, -0.0, 1.0, -1.0, 0.5, 1.5, -2.5, 3.7, -3.7, 100.25, 1e10, -1e10, 1e-10, 2.0 ** 31, -2.0 ** 31, 2.0 ** 63, 3.0e38, 1.17549435e-38]
++POOL64 = ([f64(x) for x in FLOATS + [1e300, -1e300, 5e-324, 2.0 ** 64, 4503599627370496.5]] + [f64(float('inf')), f64(float('-inf'))] +
++          [f32(a) | f32(b) << 32 for a, b in zip(FLOATS, FLOATS[3:] + FLOATS[:3])] + [f32(float('inf')) | f32(1.0) << 32] +
++          [0, 1, MASK, 0x7FFFFFFF, 0x80000000, 0x7FFFFFFFFFFFFFFF, 0x8000000000000000, 0x00FF00FF00FF00FF, 0x0123456789ABCDEF, 0xFEDCBA9876543210, 0x0001000200030004, 0x8000800080008000])
++
++
++def has_nan(x):
++    """Whether the 64 bits are a NaN as a double, or either half is one as a single (or either 16-bit quarter, as a half): NaN payloads, and which NaN wins when there are two, differ between x86 and ARM"""
++    if (x >> 52) & 0x7FF == 0x7FF and x & ((1 << 52) - 1): return True
++    for sh in (0, 32):
++        h = x >> sh & 0xFFFFFFFF
++        if (h >> 23) & 0xFF == 0xFF and h & 0x7FFFFF: return True
++    return False
++
++
++POOL_NO_NAN = [v for v in POOL64 if not has_nan(v)]
++
++
++def assemble(lines, tmp):
++    """The words of each line: instructions separated by ';' are one function (the function is followed by a ret). Each function starts on a STEP boundary of the assembled code"""
++    src = Path(tmp) / 'insns.s'
++    src.write_text('.text\n' + ''.join(f'.balign {STEP}\n' + l.replace(';', '\n') + '\nret\n' for l in lines))
++    obj, binf = Path(tmp) / 'insns.o', Path(tmp) / 'insns.bin'
++    r = subprocess.run([AS, '-march=armv8.2-a+fp16+crypto', str(src), '-o', str(obj)], capture_output=True, text=True)
++    if r.returncode: raise RuntimeError(r.stderr)
++    subprocess.run([OBJCOPY, '-O', 'binary', '-j', '.text', str(obj), str(binf)], check=True)
++    data = binf.read_bytes().ljust(STEP * len(lines), b'\0')
++    out = []
++    for i in range(len(lines)):
++        words = struct.unpack('<%dI' % (STEP // 4), data[i * STEP:(i + 1) * STEP])
++        out.append(words[:words.index(RET) + 1])
++    return out
++
++
++class Harness:
++    def __init__(self, lines, tmp):
++        self.lines, self.words = lines, assemble(lines, tmp)
++        funcs = [(CODE + i * STEP, struct.pack('<%dI' % len(w), *w)) for i, w in enumerate(self.words)]
++        self.unlifted = {}
++        self.aot = aot_lift.Aot(funcs, stub_unliftable=True)
++        for a, why in self.aot.unlifted.items(): self.unlifted[self.lines[(a - CODE) // STEP]] = why
++        for b, data in ((DATA, DATA_BYTES), (STACK, bytes(STACK_SIZE))): self.aot.map(b, len(data), data)
++        from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM
++        from unicorn.arm64_const import UC_ARM64_REG_CPACR_EL1
++        self.uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
++        self.uc.mem_map(CODE, 0x10000 * ((len(lines) * STEP + 0xFFFF) // 0x10000))
++        for i, w in enumerate(self.words): self.uc.mem_write(CODE + i * STEP, struct.pack('<%dI' % len(w), *w))
++        self.uc.mem_map(DATA, DATA_SIZE); self.uc.mem_map(STACK, STACK_SIZE); self.uc.mem_map(ref.STOP, 0x1000)
++        self.uc.reg_write(UC_ARM64_REG_CPACR_EL1, 3 << 20)   # floating point and vectors on
++
++    def close(self): self.aot.close()
++
++    def inputs(self, rng, n, nan_free=True):
++        pool = POOL_NO_NAN if nan_free else POOL64
++        out = []
++        for _ in range(n):
++            v = {f'v{i}': rng.choice(pool) | rng.choice(pool) << 64 for i in range(32)}
++            x = {'x0': DATA + 0x100, 'x1': rng.choice([0, 1, 2, 3, 5, 8]), 'x2': DATA + 0x400, 'x3': rng.choice([0, 1, 5, 200, 1 << 40, MASK, 0x80000000, 0x7FFFFFFF, 0xFFFFFFFF, 1 << 63]),
++                 'x4': rng.choice(pool), 'x5': 77}
++            out.append((x, rng.randrange(16), v))
++        return out
++
++    def run(self, idx, case):
++        """-> (got, want) dicts of everything compared; got may be {'fault': ...}"""
++        from unicorn import UcError
++        from unicorn.arm64_const import UC_ARM64_REG_SP, UC_ARM64_REG_NZCV, UC_ARM64_REG_FPCR, UC_ARM64_REG_FPSR, UC_ARM64_REG_Q0
++        x, nz, v = case
++        uc, entry = self.uc, CODE + idx * STEP
++        uc.mem_write(DATA, DATA_BYTES); uc.mem_write(STACK, bytes(STACK_SIZE))
++        for i in range(31): uc.reg_write(ref.xreg(i), x.get(f'x{i}', 0))
++        for i in range(32): uc.reg_write(UC_ARM64_REG_Q0 + i, v.get(f'v{i}', 0))
++        uc.reg_write(ref.xreg(30), ref.STOP); uc.reg_write(UC_ARM64_REG_SP, SP); uc.reg_write(UC_ARM64_REG_NZCV, nz << 28)
++        uc.reg_write(UC_ARM64_REG_FPCR, 0); uc.reg_write(UC_ARM64_REG_FPSR, 0)
++        try: uc.emu_start(entry, ref.STOP, count=200); want_fault = None
++        except UcError as e: want_fault = str(e)
++        self.aot.reset()
++        got = self.aot.run(entry, dict(x, x30=ref.STOP), nz, SP, vregs=v)
++        if want_fault or 'fault' in got: return got, ({'fault': want_fault} if want_fault else None)
++        want = {f'x{i}': uc.reg_read(ref.xreg(i)) for i in range(31)}
++        want.update({f'v{i}': uc.reg_read(UC_ARM64_REG_Q0 + i) for i in range(32)})
++        want.update(sp=uc.reg_read(UC_ARM64_REG_SP), nzcv=uc.reg_read(UC_ARM64_REG_NZCV) >> 28, fpcr=uc.reg_read(UC_ARM64_REG_FPCR), fpsr=uc.reg_read(UC_ARM64_REG_FPSR))
++        want['mem'] = {DATA: bytes(uc.mem_read(DATA, DATA_SIZE)), STACK: bytes(uc.mem_read(STACK, STACK_SIZE))}
++        return got, want
++
++    def compare(self, idx, cases):
++        """(number of cases equal, [description of each difference], [fpsr differences])"""
++        eq, diffs, fpsr = 0, [], []
++        for case in cases:
++            got, want = self.run(idx, case)
++            if ('fault' in got) != (want is not None and 'fault' in want):   # both faulting proves nothing, and is not counted; one faulting is a difference
++                diffs.append(f'fault: aot {got.get("fault")!r} unicorn {None if want is None else want.get("fault")!r}'); continue
++            if 'fault' in got: continue
++            bad = [k for k in want if k not in ('mem', 'fpsr') and got[k] != want[k]]
++            bad += [f'mem@{b:#x}' for b in want['mem'] if got['mem'][b] != want['mem'][b]]
++            if got['fpsr'] != want['fpsr']: fpsr.append((got['fpsr'], want['fpsr']))
++            if bad: diffs.append(f'differs in {bad[:5]}: ' + ', '.join(f'{k} {got[k]:#x} != {want[k]:#x}' for k in bad[:3] if k in got and not k.startswith('mem')))
++            else: eq += 1
++        return eq, diffs, fpsr
++
++
++MEMORY = [   # batch 1: stores of vector registers (offset, pre/post index, register offset) and pairs; the loads that already lifted are controls
++    'stp q0, q1, [x0]', 'stp q2, q3, [x0, #32]', 'stp q4, q5, [x0, #-64]', 'stp q6, q7, [x0, #-96]!', 'stp q8, q9, [x0, #48]!', 'stp q10, q11, [x0], #32', 'stp q12, q13, [x0], #-16',
++    'stp d8, d9, [sp, #-16]!', 'stp d10, d11, [x0, #16]!', 'stp d12, d13, [x0], #24', 'stp d0, d1, [x0, #8]', 'stp s0, s1, [x0, #-8]!', 'stp s2, s3, [x0], #12', 'stp s4, s5, [x0, #4]',
++    'str q0, [x0], #16', 'str q1, [x0], #-16', 'str q2, [x0, #-32]!', 'str q3, [x0, x1, lsl #4]', 'str q4, [x0, x1]', 'stur q5, [x0, #-3]',
++    'str d0, [x0], #8', 'str d1, [x0, #-8]!', 'str d2, [x0, x1, lsl #3]', 'str d3, [x0, x1]', 'str d4, [x0, #8]', 'str d5, [x0, w1, uxtw #3]', 'str d6, [x0, w3, sxtw #3]',
++    'str s0, [x0], #4', 'str s1, [x0, #-4]!', 'str s2, [x0, x1, lsl #2]', 'str s3, [x0, w1, uxtw #2]', 'str s4, [x0, x1]',
++    'str h0, [x0], #2', 'str h1, [x0, #-2]!', 'str h2, [x0, x1, lsl #1]', 'str h3, [x0, x1]',
++    'str b0, [x0], #1', 'str b1, [x0, #-1]!', 'str b2, [x0, x1]', 'str b3, [x0, w1, uxtw]',
++    'ldp q0, q1, [x0]', 'ldp d8, d9, [sp], #16', 'ldp q2, q3, [x0, #-32]!', 'ldr q0, [x0], #16', 'ldr d1, [x0, x1, lsl #3]', 'ldr s2, [x0, #-4]!', 'ldr h3, [x0, #2]', 'ldr b4, [x0, x1]',
++]
++
++SCALAR = (   # batch 2: scalar floating point
++    [f'fcsel {r}0, {r}1, {r}2, {c}' for r in 'ds' for c in ('eq', 'ne', 'cs', 'cc', 'mi', 'pl', 'vs', 'vc', 'hi', 'ls', 'ge', 'lt', 'gt', 'le', 'al')] +
++    [f'{op} {d}, {s}' for op in ('scvtf', 'ucvtf') for d, s in (('d0', 'x3'), ('d0', 'w3'), ('s0', 'x3'), ('s0', 'w3'), ('d1', 'd2'), ('s1', 's2'))] +
++    [f'{op} {d}, {s}, #{k}' for op in ('scvtf', 'ucvtf') for d, s, k in (('d0', 'x3', 16), ('d0', 'w3', 8), ('s0', 'x3', 31), ('s0', 'w3', 4), ('d1', 'd2', 12), ('s1', 's2', 5))] +
++    [f'{op} {d}, {s}' for op in ('fcvtzs', 'fcvtzu', 'fcvtms', 'fcvtmu', 'fcvtps', 'fcvtpu', 'fcvtas', 'fcvtau', 'fcvtns', 'fcvtnu') for d, s in (('w0', 's1'), ('w0', 'd1'), ('x0', 's1'), ('x0', 'd1'))] +
++    [f'{op} {d}, {s}, #{k}' for op in ('fcvtzs', 'fcvtzu') for d, s, k in (('w9', 's0', 13), ('x9', 'd0', 20), ('w9', 'd0', 5), ('x9', 's0', 33))] +
++    [f'{op} {r}0, {r}1, {r}2' for op in ('fmin', 'fmax', 'fminnm', 'fmaxnm', 'fnmul', 'fdiv', 'fadd', 'fsub', 'fmul') for r in 'ds'] +
++    [f'{op} {r}0, {r}1, {r}2, {r}3' for op in ('fmadd', 'fmsub', 'fnmadd', 'fnmsub') for r in 'ds'] +
++    [f'{op} {r}0, {r}1' for op in ('fsqrt', 'frintm', 'frintp', 'frintz', 'frinta', 'frintx', 'frinti', 'frintn', 'fabs', 'fneg', 'fmov') for r in 'ds'] +
++    [f'{op} {r}1, {r}2, #{n}, {c}' for op in ('fccmp', 'fccmpe') for r in 'ds' for n, c in ((0, 'ls'), (5, 'eq'), (15, 'ge'))] +
++    ['fcmp d0, d1', 'fcmp s0, s1', 'fcmp d0, #0.0', 'fcmpe d0, d1', 'fcmpe s0, #0.0', 'fcvt d0, s1', 'fcvt s0, d1', 'fmov d0, #1.5', 'fmov s0, #-2.0', 'fmov x0, d1', 'fmov d0, x1', 'fmov w0, s1', 'fmov s0, w1'])
++
++EXCL = (   # batch 3: byte and halfword exclusives, release stores, CLREX, DSB, the prefetches (blocker 4); the word and doubleword ones are controls
++    [f'ldxr{sz} w1, [x0]; add w1, w1, #1; stxr{sz} w2, w1, [x0]' for sz in ('b', 'h')] + [f'ldaxr{sz} w1, [x0]; add w1, w1, #1; stlxr{sz} w2, w1, [x0]' for sz in ('b', 'h')] +
++    [f'ldxr{sz} w1, [x0]; str{sz} w3, [x0]; stxr{sz} w2, w1, [x0]' for sz in ('b', 'h')] +        # another store in between: fails unless it wrote the same value (the model of QEMU too)
++    [f'ldxr{sz} w1, [x0]; clrex; stxr{sz} w2, w1, [x0]' for sz in ('b', 'h')] +
++    [f'ldxr{sz} w1, [x0]; stxr{sz} w2, w1, [x2]' for sz in ('b', 'h')] +                          # a different address than the load
++    [f'stxr{sz} w2, w1, [x0]' for sz in ('b', 'h')] + [f'stlxr{sz} w2, w1, [x0]' for sz in ('b', 'h')] +   # no load at all
++    [f'ldxr{sz} w1, [x0]; stxr{sz} w2, w1, [x0]; stxr{sz} w4, w1, [x0]' for sz in ('b', 'h')] +    # the second store finds the monitor cleared
++    ['ldxr w1, [x0]; add w1, w1, #1; stxr w2, w1, [x0]', 'ldxr x1, [x0]; add x1, x1, #1; stxr w2, x1, [x0]', 'ldaxr w1, [x0]; stlxr w2, w1, [x0]', 'ldxr w1, [x0]; clrex; stxr w2, w1, [x0]'] +
++    ['stlrb w1, [x0]', 'stlrh w1, [x0]', 'stlr w1, [x0]', 'stlr x1, [x0]', 'ldarb w1, [x0]', 'ldarh w1, [x0]', 'ldar w1, [x0]', 'ldar x1, [x0]'] +
++    ['clrex', 'clrex #5', 'dsb sy', 'dsb ish', 'dmb ish', 'isb', 'prfm pldl1keep, [x0]', 'prfm pstl2strm, [x0, #8]', 'prfm pldl3keep, [x0, x1]', 'prfum pldl1keep, [x0, #-3]', 'nop'])
++
++
++@unittest.skipUnless(AS and OBJCOPY and READY, 'needs aarch64-linux-gnu-as, REMILL_BUILD, clang++ and unicorn')
++class Batch(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp = tempfile.TemporaryDirectory()
++        cls.groups = {}
++
++    @classmethod
++    def tearDownClass(cls):
++        for h in cls.groups.values(): h.close()
++        cls.tmp.cleanup()
++
++    def check(self, name, lines, cases=24, allow_unlifted=(), nan_free=True):
++        h = Harness(lines, self.tmp.name); self.groups[name] = h
++        rng = random.Random(name)
++        report = []
++        for i, line in enumerate(lines):
++            if line in h.unlifted:
++                if line in allow_unlifted: continue
++                report.append(f'{line}: not lifted: {h.unlifted[line][:100]}'); continue
++            eq, diffs, fpsr = h.compare(i, h.inputs(rng, cases, nan_free))
++            if diffs: report.append(f'{line}: {len(diffs)} of {cases} differ; first: {diffs[0]}')
++        self.assertEqual(report, [], '\n' + '\n'.join(l[:230] for l in report))
++
++    def test_memory_batch(self): self.check('memory', MEMORY)
++
++    def test_scalar_fp_batch(self): self.check('scalar', SCALAR)
++
++    def test_the_exception_flags_of_the_scalar_batch_agree_except_the_known_ones(self):
++        """FPSR's cumulative flags (inexact, invalid...) come from the host FPU around each operation. They equal Unicorn's for all but two families: the inexact flag of a conversion from an integer
++        (scvtf: the host sets it in cases the lowering of the conversion hides), and fmadd's underflow (Remill's own workaround). A new difference is a regression"""
++        h = Harness(SCALAR, self.tmp.name); self.groups['scalar_fpsr'] = h
++        rng = random.Random('scalar')
++        differ = set()
++        for i, line in enumerate(SCALAR):
++            if line in h.unlifted: continue
++            if h.compare(i, h.inputs(rng, 24))[2]: differ.add(line.split()[0])
++        self.assertLessEqual(differ, {'scvtf', 'fmadd'}, sorted(differ))
++
++    def test_exclusives_batch(self): self.check('excl', EXCL, nan_free=False)
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_aot_stub.py b/dm/tools/tests/test_aot_stub.py
+index 20d6830..e24826f 100644
+--- a/dm/tools/tests/test_aot_stub.py
++++ b/dm/tools/tests/test_aot_stub.py
+@@ -1,7 +1,7 @@
+ """A function the translator cannot lift no longer stops the build of its callers (known blocker 1, fork en cours/blocages-connus.md).
+   · by default it is still an explicit error: LiftError for the instruction, LinkError for the caller whose callee is missing;
+   · with stub_unliftable it gets a stub `sub_<address>`: a direct `bl` to it links and runs it through the JIT, or stops naming the function and the reason when there is no JIT;
+-  · a function whose code needs a runtime symbol that is not defined (fadd needs the FPU exception intrinsics) is stubbed the same way;
++  · a function whose code needs a runtime symbol that is not defined is stubbed the same way;
+   · with the JIT the result equals the Unicorn ARM64 reference.
+ Needs REMILL_BUILD, DYNARMIC_DIR, clang++ and unicorn; skipped otherwise."""
+ import os, struct, sys, unittest
+@@ -35,6 +35,21 @@ MEM_AOT = {**MEM, 0: IMG}
+ fn = lambda at, n: (at, IMG[at:at + 4 * n])
+ 
+ 
++import contextlib
++
++
++@contextlib.contextmanager
++def needs_missing_symbol():
++    """Every function lifted inside the block also refers to a symbol the runtime does not define"""
++    real = aot_lift.lift_function
++    def lift_function(code, address, ll, entry=None):
++        real(code, address, ll, entry)
++        with open(ll, 'a') as f: f.write('\ndeclare void @nx_missing_symbol()\ndefine void @nx_user() { call void @nx_missing_symbol() ret void }\n')
++    aot_lift.lift_function = lift_function
++    try: yield
++    finally: aot_lift.lift_function = real
++
++
+ def mapped(a):
+     for b, data in MEM_AOT.items(): a.map(b, len(data), data)
+     return a
+@@ -74,13 +89,12 @@ class Stub(unittest.TestCase):
+         finally: a.close()
+ 
+     def test_a_function_that_lifts_but_needs_an_undefined_runtime_symbol_is_stubbed(self):
+-        # fadd lifts, but its IR calls __remill_fpu_exception_clear/test, which the runtime does not define yet (a gap found here, see blocages-connus.md)
+-        with self.assertRaisesRegex(aot_lift.LinkError, '__remill_fpu_exception'): aot_lift.Aot([fn(D, 2)])
+-        a = mapped(aot_lift.Aot([fn(P, 4), fn(D, 2)], jit=True, stub_unliftable=True))
++        # a lifted function whose IR calls a symbol the runtime does not define (what fadd did before the FPU exception intrinsics existed): the link fails, the function is stubbed, the rest links
++        with needs_missing_symbol():
++            with self.assertRaisesRegex(aot_lift.LinkError, 'nx_missing_symbol'): aot_lift.Aot([fn(P, 4)])
++            a = mapped(aot_lift.Aot([fn(P, 4), fn(D, 2)], jit=True, stub_unliftable=True))
+         try:
+-            self.assertEqual(list(a.unlifted), [D]); self.assertIn('__remill_fpu_exception', a.unlifted[D])
+-            r = a.run(P, {'x30': ref.STOP}, 0, SP)
+-            self.assertNotIn('fault', r); self.assertEqual(a.stat('jit_entries'), 1)
++            self.assertEqual(sorted(a.unlifted), [D, P]); self.assertIn('nx_missing_symbol', a.unlifted[D])
+         finally: a.close()
+ 
+     def test_a_callee_nobody_gave_stays_an_error_even_in_stub_mode(self):
