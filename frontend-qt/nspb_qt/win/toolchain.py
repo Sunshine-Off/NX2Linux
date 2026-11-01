@@ -367,8 +367,13 @@ def ld64_lld() -> Path | None:
     `ld64.lld.exe` (LLVM's own installer ships one) it is used as is.
     """
     root = llvm_dir()
-    for base in ([root / 'bin'] if root else []) + [Path(p) for p in os.environ.get('PATH', '').split(os.pathsep) if p]:
+    path_bins = []
+    if sys.platform.startswith('win'):
+        path_bins = [Path(p) for p in os.environ.get('PATH', '').split(os.pathsep) if p]
+    for base in ([root / 'bin'] if root else []) + path_bins:
         for n in ('ld64.lld.exe', 'ld64.lld'):
+            if not sys.platform.startswith('win') and not n.endswith('.exe'):
+                continue
             p = base / n
             if p.is_file():
                 return p
