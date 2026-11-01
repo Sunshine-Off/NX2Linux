@@ -127,11 +127,7 @@ class Model(QObject):
             # LOCALAPPDATA is set on every normal Windows session, but a stripped environment
             # (a service, a scheduled task, this project's own test harness) may lack it: fall
             # back to the home directory rather than failing to start over a log file.
-            if pu.IS_WIN:
-                root = Path(os.environ.get('LOCALAPPDATA') or (Path.home() / 'AppData' / 'Local'))
-                base = root / 'NS Port Builder' / 'logs'
-            else:
-                base = Path.home() / 'Library' / 'Logs' / 'NS Port Builder'
+            base = pu.log_dir('nx2linux' if pu.IS_LINUX else 'NS Port Builder')
             base.mkdir(parents=True, exist_ok=True)
             self.log_path = base / 'last-run.log'
             self.log_path.write_text('', encoding='utf-8')
