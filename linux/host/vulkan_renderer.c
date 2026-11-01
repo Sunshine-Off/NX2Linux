@@ -211,6 +211,12 @@ static int create_swapchain(Nx2LinuxVulkanRenderer *renderer)
         extent.width = (uint32_t)width;
         extent.height = (uint32_t)height;
     }
+    if (extent.width == 0 || extent.height == 0) {
+        free(formats);
+        free(modes);
+        SDL_SetError("Vulkan surface has no drawable extent");
+        return 1;
+    }
     uint32_t image_count = capabilities.minImageCount + 1;
     if (capabilities.maxImageCount != 0 && image_count > capabilities.maxImageCount) {
         image_count = capabilities.maxImageCount;
@@ -271,6 +277,55 @@ static int create_swapchain(Nx2LinuxVulkanRenderer *renderer)
         result = vkCreateImageView(renderer->device, &view, NULL, &renderer->image_views[i]);
         if (result != VK_SUCCESS) {
             return fail("cannot create Vulkan image view", result);
+        }
+    }
+    return 0;
+}
+
+static int create_render_pass(Nx2LinuxVulkanRenderer *renderer)
+{
+    VkAttachmentDescription attachment = {
+        .format = renderer->swapchain_format,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    };
+    VkAttachmentReference color_ref = {.attachment = 0, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass = {
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &color_ref,
+    };
+    VkRenderPassCreateInfo render_pass_info = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &attachment,
+        .subpassCount = 1,
+        .pSubpasses = &subpass,
+    };
+    VkResult result = vkCreateRenderPass(renderer->device, &render_pass_info, NULL, &renderer->render_pass);
+    return result == VK_SUCCESS ? 0 : fail("cannot create Vulkan render pass", result);
+}
+
+static int create_framebuffers(Nx2LinuxVulkanRenderer *renderer)
+{
+    for (uint32_t i = 0; i < renderer->image_count; ++i) {
+        VkImageView attachments[] = {renderer->image_views[i]};
+        VkFramebufferCreateInfo framebuffer = {
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass = renderer->render_pass,
+            .attachmentCount = 1,
+            .pAttachments = attachments,
+            .width = renderer->swapchain_extent.width,
+            .height = renderer->swapchain_extent.height,
+            .layers = 1,
+        };
+        VkResult result = vkCreateFramebuffer(renderer->device, &framebuffer, NULL,
+                                               &renderer->framebuffers[i]);
+        if (result != VK_SUCCESS) {
+            return fail("cannot create Vulkan framebuffer", result);
         }
     }
     return 0;
@@ -399,6 +454,13 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer, SDL_Window *window, c
     }
     memset(renderer, 0, sizeof(*renderer));
     renderer->window = window;
+    size_t shader_dir_length = strlen(shader_dir) + 1;
+    renderer->shader_dir = malloc(shader_dir_length);
+    if (renderer->shader_dir == NULL) {
+        SDL_SetError("out of memory while storing Vulkan shader path");
+        return -1;
+    }
+    memcpy(renderer->shader_dir, shader_dir, shader_dir_length);
     if (!SDL_Vulkan_LoadLibrary(NULL)) {
         return -1;
     }
@@ -468,49 +530,14 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer, SDL_Window *window, c
     if (create_swapchain(renderer) != 0) {
         return -1;
     }
-    VkAttachmentDescription attachment = {
-        .format = renderer->swapchain_format,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-    };
-    VkAttachmentReference color_ref = {.attachment = 0, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkSubpassDescription subpass = {
-        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &color_ref,
-    };
-    VkRenderPassCreateInfo render_pass_info = {
-        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-        .attachmentCount = 1,
-        .pAttachments = &attachment,
-        .subpassCount = 1,
-        .pSubpasses = &subpass,
-    };
-    result = vkCreateRenderPass(renderer->device, &render_pass_info, NULL, &renderer->render_pass);
-    if (result != VK_SUCCESS) {
-        return fail("cannot create Vulkan render pass", result);
+    if (create_render_pass(renderer) != 0) {
+        return -1;
     }
     if (create_pipeline(renderer, shader_dir) != 0) {
         return -1;
     }
-    for (uint32_t i = 0; i < renderer->image_count; ++i) {
-        VkImageView attachments[] = {renderer->image_views[i]};
-        VkFramebufferCreateInfo framebuffer = {
-            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-            .renderPass = renderer->render_pass,
-            .attachmentCount = 1,
-            .pAttachments = attachments,
-            .width = renderer->swapchain_extent.width,
-            .height = renderer->swapchain_extent.height,
-            .layers = 1,
-        };
-        result = vkCreateFramebuffer(renderer->device, &framebuffer, NULL, &renderer->framebuffers[i]);
-        if (result != VK_SUCCESS) {
-            return fail("cannot create Vulkan framebuffer", result);
-        }
+    if (create_framebuffers(renderer) != 0) {
+        return -1;
     }
     VkCommandPoolCreateInfo pool = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -541,6 +568,39 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer, SDL_Window *window, c
         return fail("cannot create Vulkan frame synchronization", result);
     }
     renderer->initialized = true;
+    return 0;
+}
+
+int nx2linux_vulkan_recreate_swapchain(Nx2LinuxVulkanRenderer *renderer)
+{
+    if (renderer == NULL || !renderer->initialized || renderer->device == VK_NULL_HANDLE) {
+        return -1;
+    }
+    VkResult result = vkDeviceWaitIdle(renderer->device);
+    if (result != VK_SUCCESS) {
+        return fail("cannot wait for Vulkan swapchain recreation", result);
+    }
+    destroy_swapchain_objects(renderer);
+    if (renderer->pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(renderer->device, renderer->pipeline, NULL);
+        renderer->pipeline = VK_NULL_HANDLE;
+    }
+    if (renderer->pipeline_layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(renderer->device, renderer->pipeline_layout, NULL);
+        renderer->pipeline_layout = VK_NULL_HANDLE;
+    }
+    if (renderer->render_pass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(renderer->device, renderer->render_pass, NULL);
+        renderer->render_pass = VK_NULL_HANDLE;
+    }
+    int status = create_swapchain(renderer);
+    if (status != 0) {
+        return status;
+    }
+    if (create_render_pass(renderer) != 0 || create_pipeline(renderer, renderer->shader_dir) != 0 ||
+        create_framebuffers(renderer) != 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -617,7 +677,11 @@ int nx2linux_vulkan_draw_triangle(Nx2LinuxVulkanRenderer *renderer)
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
         return 1;
     }
-    return result == VK_SUCCESS ? 0 : fail("cannot present Vulkan triangle", result);
+    if (result != VK_SUCCESS) {
+        return fail("cannot present Vulkan triangle", result);
+    }
+    renderer->frames_rendered++;
+    return 0;
 }
 
 void nx2linux_vulkan_shutdown(Nx2LinuxVulkanRenderer *renderer)
@@ -644,6 +708,7 @@ void nx2linux_vulkan_shutdown(Nx2LinuxVulkanRenderer *renderer)
         vkDestroyInstance(renderer->instance, NULL);
     }
     SDL_Vulkan_UnloadLibrary();
+    free(renderer->shader_dir);
     memset(renderer, 0, sizeof(*renderer));
 }
 
@@ -657,4 +722,9 @@ const char *nx2linux_vulkan_gpu_name(const Nx2LinuxVulkanRenderer *renderer)
     vkGetPhysicalDeviceProperties(renderer->physical_device, &properties);
     snprintf(name, sizeof(name), "%s", properties.deviceName);
     return name;
+}
+
+uint64_t nx2linux_vulkan_frames_rendered(const Nx2LinuxVulkanRenderer *renderer)
+{
+    return renderer != NULL ? renderer->frames_rendered : 0;
 }

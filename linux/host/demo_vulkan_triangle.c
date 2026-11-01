@@ -39,11 +39,18 @@ int main(void)
         while (nx2linux_host_poll_event(&host, &event) == 1) {
             if (event.type == NX2LINUX_EVENT_QUIT) {
                 running = false;
+            } else if (event.type == NX2LINUX_EVENT_WINDOW_RESIZED &&
+                       nx2linux_vulkan_recreate_swapchain(&renderer) != 0) {
+                fprintf(stderr, "Could not recreate Vulkan swapchain: %s\n", SDL_GetError());
+                running = false;
             }
         }
         if (running) {
             int result = nx2linux_vulkan_draw_triangle(&renderer);
-            if (result < 0) {
+            if (result == 1 && nx2linux_vulkan_recreate_swapchain(&renderer) != 0) {
+                fprintf(stderr, "Could not recreate Vulkan swapchain: %s\n", SDL_GetError());
+                running = false;
+            } else if (result < 0) {
                 fprintf(stderr, "Could not draw Vulkan triangle: %s\n", SDL_GetError());
                 nx2linux_vulkan_shutdown(&renderer);
                 nx2linux_host_shutdown(&host);

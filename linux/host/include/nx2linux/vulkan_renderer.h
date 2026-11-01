@@ -32,6 +32,8 @@ typedef struct Nx2LinuxVulkanRenderer {
     VkSemaphore image_available;
     VkSemaphore render_finished;
     VkFence in_flight;
+    char *shader_dir;
+    uint64_t frames_rendered;
     bool initialized;
 } Nx2LinuxVulkanRenderer;
 
@@ -43,8 +45,13 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer,
 /* Draws one frame. Returns 0 on success, 1 when the swapchain needs recreation, -1 on error. */
 int nx2linux_vulkan_draw_triangle(Nx2LinuxVulkanRenderer *renderer);
 
+/* Rebuilds swapchain-dependent resources after a resize or surface loss. */
+int nx2linux_vulkan_recreate_swapchain(Nx2LinuxVulkanRenderer *renderer);
+
 void nx2linux_vulkan_shutdown(Nx2LinuxVulkanRenderer *renderer);
 
 const char *nx2linux_vulkan_gpu_name(const Nx2LinuxVulkanRenderer *renderer);
+
+uint64_t nx2linux_vulkan_frames_rendered(const Nx2LinuxVulkanRenderer *renderer);
 
 #endif

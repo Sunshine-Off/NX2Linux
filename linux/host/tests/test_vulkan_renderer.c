@@ -30,8 +30,40 @@ int main(void)
         return 77;
     }
     int result = nx2linux_vulkan_draw_triangle(&renderer);
+    if (result == 1) {
+        result = nx2linux_vulkan_recreate_swapchain(&renderer);
+        if (result == 0) {
+            result = nx2linux_vulkan_draw_triangle(&renderer);
+        }
+    }
     if (result != 0) {
         fprintf(stderr, "Vulkan triangle failed: %s\n", SDL_GetError());
+        nx2linux_vulkan_shutdown(&renderer);
+        nx2linux_host_shutdown(&host);
+        return 1;
+    }
+    const int sizes[][2] = {{800, 450}, {1024, 576}, {640, 360}};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        SDL_SetWindowSize(nx2linux_host_window(&host), sizes[i][0], sizes[i][1]);
+        if (nx2linux_vulkan_recreate_swapchain(&renderer) != 0 ||
+            nx2linux_vulkan_draw_triangle(&renderer) != 0) {
+            fprintf(stderr, "Vulkan swapchain recreation failed at %dx%d: %s\n",
+                    sizes[i][0], sizes[i][1], SDL_GetError());
+            nx2linux_vulkan_shutdown(&renderer);
+            nx2linux_host_shutdown(&host);
+            return 1;
+        }
+    }
+    for (int i = 0; i < 60; ++i) {
+        if (nx2linux_vulkan_draw_triangle(&renderer) != 0) {
+            fprintf(stderr, "Vulkan frame %d failed: %s\n", i, SDL_GetError());
+            nx2linux_vulkan_shutdown(&renderer);
+            nx2linux_host_shutdown(&host);
+            return 1;
+        }
+    }
+    if (nx2linux_vulkan_frames_rendered(&renderer) < 64) {
+        fprintf(stderr, "Vulkan frame counter is too low\n");
         nx2linux_vulkan_shutdown(&renderer);
         nx2linux_host_shutdown(&host);
         return 1;
