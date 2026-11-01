@@ -6,7 +6,7 @@ Classé par gravité, avec la preuve de chacun. « Prouvé » = mesuré par un t
 
 | # | Problème | Preuve | Piste |
 |---|---|---|---|
-| 1 | **Une fonction non liftable empêche de construire tout appelant direct.** Si `f` fait `bl g` et que Remill ne sait pas lifter `g`, le lien échoue (`sub_<g>` indéfini) ; message actuel trompeur (« the runtime does not define »). | Prouvé : `f` seule → `LinkError … sub_2000` ; `f` + `g` (avec `svc`) → `LiftError`. | Pour chaque fonction non liftable, générer un **stub `sub_<adresse>` qui appelle le JIT** (compté, journalisé). Petit, et il rend tout module constructible. À faire en premier. |
+| 1 | **RÉGLÉ le 2026-11-01 (voir bas de page).** ~~Une fonction non liftable empêche de construire tout appelant direct.** Si `f` fait `bl g` et que Remill ne sait pas lifter `g`, le lien échoue (`sub_<g>` indéfini) ; message actuel trompeur (« the runtime does not define »). | Prouvé : `f` seule → `LinkError … sub_2000` ; `f` + `g` (avec `svc`) → `LiftError`. | Fait : `Aot(..., stub_unliftable=True)`. |
 | 2 | **Les tables de sauts (`switch`) passent toutes par le JIT.** Chaque aiguillage = 1 entrée JIT ; en AOT seul, erreur explicite. | Prouvé (test_aot_realistic) : `switch` à 20 cas compilé par GCC → `br x2` vers le milieu de la fonction ; 20 aiguillages = 20 entrées JIT. | Lire la table au moment de la traduction et enregistrer chaque cible comme point d'entrée AOT supplémentaire (le fragment se termine par `ret` et reste correct), ou le transformer en `switch` local. Critère « JIT mesuré et limité » impossible tant que ce n'est pas fait. |
 | 3 | **Trou de couverture FP/SIMD dans Remill.** Sur un échantillon C modeste compilé par GCC : 6 fonctions sur 20 ne se liftent pas ; 7 instructions sur 290 (2 %). | Prouvé : `fmul vN.4s, vN.4s, v0.s[0]`, `fsqrt`, `fcvtzs`, `cnt`, `str qN`, `stp qN, qM`, `str sN, [x, x]`. | Après le point 1, le JIT les exécute. Pour de bonnes performances : patcher Remill instruction par instruction, comme `adc`. Un jeu est très riche en flottants et vecteurs : la proportion réelle est inconnue. |
 | 4 | **Exclusifs octet et demi-mot non décodés.** GCC (sans fonctions d'aide) émet `ldxrb`, `stxrb`, `ldaxrh`, `stlxrh`. | Prouvé (même test). | Même méthode que `stxr` (patch Remill) : variantes `B`/`H` de `LDXR`, `LDAXR`, `STXR`, `STLXR`, `LDAR`, `STLR`. |
@@ -30,3 +30,20 @@ Classé par gravité, avec la preuve de chacun. « Prouvé » = mesuré par un t
 ## Défauts de mes propres tests trouvés en route (tous corrigés)
 
 Comparaisons « vides » qui passaient sans rien vérifier (référence qui échoue comme l'AOT ; `inc` jamais comparé car Unicorn échouait sur les globales non mappées) ; constantes de registres Unicorn ; mémoire AOT non remise à zéro ; message du lieur non reconnu en français ; adresse de retour factice dans x30. Tout test de comparaison refuse maintenant qu'une exécution de référence échoue sans que ce soit attendu.
+
+## Blocage 1 réglé (2026-11-01)
+
+`Aot(functions, stub_unliftable=True)` : une fonction que Remill ne sait pas lifter, ou dont le code appelle un symbole que le runtime ne définit pas, devient un **stub** `sub_<adresse>` (fichier généré `stubs<n>.cpp`, fonction `aot_unlifted` dans `aot_runtime.cpp`). Analogie : une déviation balisée sur une route coupée, au lieu d'un pont qui manque et qui empêche de construire toute la route.
+
+```
+bl g  --(lien)-->  sub_g (stub)  --> aot_unlifted  -- JIT présent -->  dynarmic exécute g (compté, journalisé)
+                                                   -- pas de JIT   -->  erreur : adresse + raison (instruction fautive)
+```
+
+- Par défaut rien ne change : `LiftError` / `LinkError` explicites. Le stub est un choix de l'appelant.
+- Le stub n'est pas dans la table AOT : un appel indirect vers cette fonction passe par le JIT comme toute cible inconnue (pas de cas particulier).
+- Une fonction appelée mais **jamais fournie** (`sub_X` indéfini) reste une `LinkError` même en mode stub : c'est une entrée manquante, pas une limite de Remill.
+- Compteur `unlifted_calls`. `Aot.unlifted` donne `{adresse: raison}`.
+- Tests : `tests/test_aot_stub.py` (8 tests, dont l'égalité avec Unicorn sur 36 cas via le JIT).
+
+**Trouvé en route (nouveau, pas encore réglé)** : `fadd`, `fmul`, `fdiv` se liftent mais leur IR appelle `__remill_fpu_exception_clear/test`, que le runtime ne définit pas. Avant ce correctif, tout code flottant arithmétique échouait donc au lien. Désormais ces fonctions passent par le JIT (correct, mais plus lent). Les définir dans le runtime (AOT natif) est à faire avec le blocage 3.
