@@ -1,0 +1,29 @@
+name: Linux native foundation
+on:
+  pull_request:
+    paths: ['linux/**', 'tools/check_linux.py', '.github/workflows/linux-host.yml']
+  push:
+    branches: [main]
+    paths: ['linux/**', 'tools/check_linux.py', '.github/workflows/linux-host.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  headless:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: CLI tests
+        run: python3 -m unittest discover -s linux/cli/tests -v
+      - name: Configure without SDL or Vulkan
+        run: cmake -S linux/host -B build/native -DNX2LINUX_GRAPHICS=OFF -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+      - name: Build native ELF host and synthetic modules
+        run: cmake --build build/native --parallel 2
+      - name: Strict native verification
+        run: python3 linux/cli/nx2linux.py verify --headless --build-dir build/native

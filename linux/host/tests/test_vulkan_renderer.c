@@ -24,10 +24,10 @@ int main(void)
     }
     Nx2LinuxVulkanRenderer renderer = {0};
     if (nx2linux_vulkan_init(&renderer, nx2linux_host_window(&host), NX2LINUX_SHADER_DIR) != 0) {
-        fprintf(stderr, "SKIP: Vulkan renderer unavailable: %s\n", SDL_GetError());
+        fprintf(stderr, "FAIL: Vulkan renderer initialization: %s\n", SDL_GetError());
         nx2linux_vulkan_shutdown(&renderer);
         nx2linux_host_shutdown(&host);
-        return 77;
+        return 1;
     }
     int result = nx2linux_vulkan_draw_triangle(&renderer);
     if (result == 1) {
@@ -44,13 +44,21 @@ int main(void)
     }
     const int sizes[][2] = {{800, 450}, {1024, 576}, {640, 360}};
     for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
-        SDL_SetWindowSize(nx2linux_host_window(&host), sizes[i][0], sizes[i][1]);
+        if (!SDL_SetWindowSize(nx2linux_host_window(&host), sizes[i][0], sizes[i][1])) return 1;
+        SDL_SyncWindow(nx2linux_host_window(&host));
+        SDL_PumpEvents();
+        VkPipeline pipeline = renderer.pipeline;
+        VkFormat format = renderer.swapchain_format;
         if (nx2linux_vulkan_recreate_swapchain(&renderer) != 0 ||
             nx2linux_vulkan_draw_triangle(&renderer) != 0) {
             fprintf(stderr, "Vulkan swapchain recreation failed at %dx%d: %s\n",
                     sizes[i][0], sizes[i][1], SDL_GetError());
             nx2linux_vulkan_shutdown(&renderer);
             nx2linux_host_shutdown(&host);
+            return 1;
+        }
+        if (renderer.swapchain_format == format && renderer.pipeline != pipeline) {
+            fprintf(stderr, "Size-only resize unnecessarily recreated the pipeline\n");
             return 1;
         }
     }
@@ -71,5 +79,5 @@ int main(void)
     printf("Vulkan triangle rendered on %s\n", nx2linux_vulkan_gpu_name(&renderer));
     nx2linux_vulkan_shutdown(&renderer);
     nx2linux_host_shutdown(&host);
-    return 0;
+    return atomic_load(&renderer.validation_errors) == 0 ? 0 : 1;
 }

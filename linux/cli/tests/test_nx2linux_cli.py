@@ -17,6 +17,27 @@ import nx2linux
 
 
 class CliTests(unittest.TestCase):
+    def test_doctor_rejects_old_cmake_and_missing_compiler(self):
+        def version(command):
+            if command[0] in ('cmake', 'ctest'):
+                return command[0] + ' version 3.20.0'
+            return None
+        with patch.object(nx2linux, 'tool_version', side_effect=version):
+            report = nx2linux.doctor_report()
+        for name in ('cmake', 'ctest', 'compiler', 'glslc'):
+            self.assertFalse(report[name]['ok'], name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(nx2linux.print_doctor(report, False), 1)
+
+    def test_headless_build_disables_graphics_and_keeps_tests(self):
+        args = nx2linux.parser().parse_args(['build', '--headless'])
+        with patch.object(nx2linux, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertEqual(nx2linux.configure_and_build(args), 0)
+        configure = run.call_args_list[0].args[0]
+        self.assertIn('-DNX2LINUX_GRAPHICS=OFF', configure)
+        self.assertIn('-DBUILD_TESTING=ON', configure)
+        self.assertIn(str(ROOT / 'build/linux-headless'), configure)
+
     def test_xdg_paths_use_environment(self):
         with patch.dict(os.environ, {'XDG_CONFIG_HOME': '/tmp/nx-config'}, clear=False):
             self.assertEqual(nx2linux.xdg_dir('config'), Path('/tmp/nx-config/nx2linux'))
@@ -42,15 +63,22 @@ class CliTests(unittest.TestCase):
 
 
 class VerifyTests(unittest.TestCase):
-    def verify_report(self, xml, *, code=0, require=True):
+    base = ('<testcase name="nx2linux_posix_host" status="run"/>'
+            '<testcase name="nx2linux_headless_module" status="run"/>'
+            '<testcase name="nx2linux_demo_exit_status" status="run"/>')
+
+    def verify_report(self, xml, *, code=0, require=True, headless=False, validation=False):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             (directory / 'nx2linux_vulkan_demo').touch()
+            (directory / 'nx2linux_headless').touch()
             args = argparse.Namespace(build_dir=str(directory), build=False, jobs=0,
-                                      require_vulkan=require)
+                                      require_vulkan=require, headless=headless, require_validation=validation)
             def ctest(command, **kwargs):
                 self.assertIn('--no-tests=error', command)
                 self.assertNotIn('capture', kwargs)
+                if validation:
+                    self.assertEqual(kwargs['env']['NX2LINUX_VK_VALIDATION'], '1')
                 report = Path(command[command.index('--output-junit') + 1])
                 if xml is not None:
                     report.write_text(xml)
@@ -59,7 +87,7 @@ class VerifyTests(unittest.TestCase):
                 return nx2linux.verify(args)
 
     def test_both_required_tests_ran(self):
-        self.assertEqual(self.verify_report('<testsuite>'
+        self.assertEqual(self.verify_report('<testsuite>' + self.base +
             '<testcase name="nx2linux_sdl_host_smoke" status="run"/>'
             '<testcase name="nx2linux_vulkan_triangle" status="run"/>'
             '</testsuite>'), 0)
@@ -74,11 +102,24 @@ class VerifyTests(unittest.TestCase):
                        '<testcase name="nx2linux_vulkan_triangle" status="run"><skipped/></testcase>',
                        '<testcase name="nx2linux_vulkan_triangle" status="run"><failure/></testcase>']:
             with self.subTest(vulkan=vulkan):
-                self.assertNotEqual(self.verify_report('<testsuite><testcase name="nx2linux_sdl_host_smoke" status="run"/>' + vulkan + '</testsuite>'), 0)
+                self.assertNotEqual(self.verify_report('<testsuite>' + self.base + '<testcase name="nx2linux_sdl_host_smoke" status="run"/>' + vulkan + '</testsuite>'), 0)
 
     def test_headless_mode_still_requires_sdl(self):
-        self.assertEqual(self.verify_report('<testsuite><testcase name="nx2linux_sdl_host_smoke" status="run"/></testsuite>', require=False), 0)
+        self.assertEqual(self.verify_report('<testsuite>' + self.base + '<testcase name="nx2linux_sdl_host_smoke" status="run"/></testsuite>', require=False), 0)
         self.assertNotEqual(self.verify_report('<testsuite/>', require=False), 0)
+
+    def test_native_only_requires_native_tests(self):
+        xml = ('<testsuite><testcase name="nx2linux_posix_host" status="run"/>'
+               '<testcase name="nx2linux_headless_module" status="run"/></testsuite>')
+        self.assertEqual(self.verify_report(xml, require=False, headless=True), 0)
+        self.assertNotEqual(self.verify_report(xml, require=False), 0)
+        self.assertEqual(self.verify_report(xml, headless=True), 2)
+
+    def test_validation_requires_a_vulkan_test_and_sets_environment(self):
+        xml = '<testsuite>' + self.base + '<testcase name="nx2linux_sdl_host_smoke" status="run"/>'
+        self.assertNotEqual(self.verify_report(xml + '</testsuite>', require=False, validation=True), 0)
+        xml += '<testcase name="nx2linux_vulkan_triangle" status="run"/></testsuite>'
+        self.assertEqual(self.verify_report(xml, require=False, validation=True), 0)
 
     def test_ctest_failure_propagates(self):
         self.assertEqual(self.verify_report(None, code=8), 8)

@@ -25,6 +25,7 @@ CHECKS = (
     Check('patch queue', ('patches/', '.upstream-ref'), 'python3 tools/engine.py check', '.', False),
     Check('Qt front end', ('frontend-qt/',), 'python3 -m unittest discover -s frontend-qt/tests'
           ' && python3 frontend-qt/gen_localization.py && git diff --exit-code HEAD -- frontend-qt/nspb_qt/localization.py', '.', True),
+    Check('Linux foundation', ('linux/', 'tools/check_linux.py'), 'python3 tools/check_linux.py', '.', False),
     Check('tools', ('tools/',), 'python3 -m unittest discover tools/tests', '.', True),
     Check('triage scripts', ('.github/scripts/',), 'python3 -m unittest discover -s .github/scripts/tests', '.', True),
     Check('Mac launcher (slow)', ('frontend/',), 'swift build && swift test', 'frontend', True),

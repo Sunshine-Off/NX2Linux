@@ -1,5 +1,26 @@
 # NX2Linux — Partie Swann
 
+## Corrected delivery status
+
+This section supersedes earlier claims that all of S1–S6 were complete.
+See [remediation and validation](Jalons-remediation.md).
+
+| Milestone | Delivered scope | Remaining gate |
+|---|---|---|
+| S1a | Native headless ELF fixture host, guarded scratch memory, clock and native thread/TLS tests | Not a Switch runtime |
+| S1b | Explicit native/runtime ownership boundary | Agree and test the AOT runtime adapter with Téo |
+| S2 | SDL window, keyboard and opened gamepads with virtual-device tests | Physical controller and desktop acceptance |
+| S3 | Synthetic Vulkan triangle with corrected command pool | Strict Khronos and lavapipe checks on a working installation |
+| S4a | Demo swapchain lifecycle and corrected presentation semaphores | Same strict Vulkan gate as S3 |
+| S4b | Not implemented | Game resources, guest shaders, NVN commands and synchronization |
+| S5 | Native/headless and graphics build checks through CLI | Game-artifact workflow depends on S1b/S4b |
+| S6 | Qt controls for the synthetic host demo | Game-oriented progress and launch await integration |
+| S7 | T7 branch/report inspection started, see [handoff](S7-integration.md) | Headless execution needs S1b, game graphics need S4b |
+| S8 | Not started | Packaging and distribution acceptance |
+
+S1a and S4a are subdivisions, not replacements for the original S1/S4 objectives.
+A passing native fixture or triangle does not close S1b/S4b.
+
 ## Partie lisible par les humains
 
 ### Responsabilité
@@ -96,12 +117,9 @@ frontend-qt/nspb_qt/ui.py
 
 Swann fournit au runtime :
 
-- le manifest de modules
-- l’adresse d’entrée recompilée
-- l’état mémoire invité
-- les callouts SVC
-- les événements de chargement
-- les logs de traduction et de fallback
+- native platform facilities, window/input and the graphics backend
+- an adapter to the agreed runtime callbacks and lifecycle
+- process logs and integration tests
 
 Téo fournit à Swann :
 
@@ -110,6 +128,8 @@ Téo fournit à Swann :
 - les symboles ou tables nécessaires au loader
 - les exigences de mémoire et TLS
 - les tests de conformité AOT/JIT
+- the versioned artifact manifest and entry/callout contract
+- guest memory, CPU state, SVC and exception semantics
 
 ### Règle de décision
 

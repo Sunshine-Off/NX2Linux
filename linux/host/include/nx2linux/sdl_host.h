@@ -2,9 +2,11 @@
 #define NX2LINUX_SDL_HOST_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct SDL_Window SDL_Window;
+typedef struct SDL_Gamepad SDL_Gamepad;
 
 typedef enum Nx2LinuxInputEventType {
     NX2LINUX_EVENT_NONE = 0,
@@ -41,6 +43,8 @@ typedef struct Nx2LinuxHostConfig {
 
 typedef struct Nx2LinuxHost {
     SDL_Window *window;
+    SDL_Gamepad **gamepads;
+    size_t gamepad_count;
     bool initialized;
 } Nx2LinuxHost;
 
@@ -50,7 +54,7 @@ int nx2linux_host_init(Nx2LinuxHost *host, const Nx2LinuxHostConfig *config);
 /* Safe to call more than once and safe after a failed initialization. */
 void nx2linux_host_shutdown(Nx2LinuxHost *host);
 
-/* Returns 1 for an event, 0 when the queue is empty, or -1 for an invalid host. */
+/* Returns 1 for an event, 0 when empty, -1 for invalid host or device-open failure. */
 int nx2linux_host_poll_event(Nx2LinuxHost *host, Nx2LinuxInputEvent *event);
 
 SDL_Window *nx2linux_host_window(const Nx2LinuxHost *host);

@@ -1,5 +1,18 @@
 # NX2Linux — Partie Téo
 
+## Native host handoff clarification
+
+Swann now supplies a graphics-independent native fixture host. Its
+[native ABI](../linux/host/NATIVE_ABI.md) exercises platform facilities only.
+It is not an agreed guest ABI and must not dictate the CPU state or address
+model used by the recompiler.
+
+The joint S1b gate requires an agreed artifact manifest, entry/callout signatures,
+guest memory/TLS ownership, SVC dispatch, error propagation and shutdown contract.
+Téo retains ownership of AOT correctness and guest runtime/loader semantics.
+Swann implements the platform adapter against that contract. The game graphics
+path is a separate S4b gate, not something furnished by the current triangle.
+
 ## Partie lisible par les humains
 
 ### Responsabilité

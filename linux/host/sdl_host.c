@@ -3,6 +3,45 @@
 #include <SDL3/SDL.h>
 
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+static int shutdown_with_error(Nx2LinuxHost *host)
+{
+    char message[512];
+    snprintf(message, sizeof(message), "%s", SDL_GetError());
+    nx2linux_host_shutdown(host);
+    SDL_SetError("%s", message);
+    return -1;
+}
+
+static int open_gamepad(Nx2LinuxHost *host, SDL_JoystickID id)
+{
+    for (size_t i = 0; i < host->gamepad_count; i++)
+        if (SDL_GetGamepadID(host->gamepads[i]) == id) return 0;
+    SDL_Gamepad *pad = SDL_OpenGamepad(id);
+    if (pad == NULL) return -1;
+    SDL_Gamepad **pads = realloc(host->gamepads, (host->gamepad_count + 1) * sizeof(*pads));
+    if (pads == NULL) {
+        SDL_CloseGamepad(pad);
+        SDL_OutOfMemory();
+        return -1;
+    }
+    host->gamepads = pads;
+    host->gamepads[host->gamepad_count++] = pad;
+    return 0;
+}
+
+static void close_gamepad(Nx2LinuxHost *host, SDL_JoystickID id)
+{
+    for (size_t i = 0; i < host->gamepad_count; i++) {
+        if (SDL_GetGamepadID(host->gamepads[i]) == id) {
+            SDL_CloseGamepad(host->gamepads[i]);
+            host->gamepads[i] = host->gamepads[--host->gamepad_count];
+            return;
+        }
+    }
+}
 
 static void clear_event(Nx2LinuxInputEvent *event)
 {
@@ -21,6 +60,7 @@ int nx2linux_host_init(Nx2LinuxHost *host, const Nx2LinuxHostConfig *config)
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         return -1;
     }
+    host->initialized = true;
 
     SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE;
     if (config->hidden) {
@@ -32,10 +72,21 @@ int nx2linux_host_init(Nx2LinuxHost *host, const Nx2LinuxHostConfig *config)
     host->window = SDL_CreateWindow(config->title != NULL ? config->title : "NX2Linux",
                                     config->width, config->height, flags);
     if (host->window == NULL) {
-        SDL_Quit();
-        return -1;
+        return shutdown_with_error(host);
     }
     host->initialized = true;
+    int count = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&count);
+    if (ids == NULL) {
+        return shutdown_with_error(host);
+    }
+    for (int i = 0; i < count; i++) {
+        if (open_gamepad(host, ids[i]) != 0) {
+            SDL_free(ids);
+            return shutdown_with_error(host);
+        }
+    }
+    SDL_free(ids);
     return 0;
 }
 
@@ -44,6 +95,8 @@ void nx2linux_host_shutdown(Nx2LinuxHost *host)
     if (host == NULL) {
         return;
     }
+    for (size_t i = 0; i < host->gamepad_count; i++) SDL_CloseGamepad(host->gamepads[i]);
+    free(host->gamepads);
     if (host->window != NULL) {
         SDL_DestroyWindow(host->window);
     }
@@ -70,6 +123,7 @@ int nx2linux_host_poll_event(Nx2LinuxHost *host, Nx2LinuxInputEvent *event)
         event->type = NX2LINUX_EVENT_QUIT;
         break;
     case SDL_EVENT_WINDOW_RESIZED:
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
         event->type = NX2LINUX_EVENT_WINDOW_RESIZED;
         event->window_width = (uint32_t)raw.window.data1;
         event->window_height = (uint32_t)raw.window.data2;
@@ -85,10 +139,12 @@ int nx2linux_host_poll_event(Nx2LinuxHost *host, Nx2LinuxInputEvent *event)
         event->scancode = raw.key.scancode;
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
+        if (open_gamepad(host, raw.gdevice.which) != 0) return -1;
         event->type = NX2LINUX_EVENT_GAMEPAD_ADDED;
         event->gamepad_id = raw.gdevice.which;
         break;
     case SDL_EVENT_GAMEPAD_REMOVED:
+        close_gamepad(host, raw.gdevice.which);
         event->type = NX2LINUX_EVENT_GAMEPAD_REMOVED;
         event->gamepad_id = raw.gdevice.which;
         break;

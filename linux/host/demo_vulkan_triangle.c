@@ -34,22 +34,38 @@ int main(void)
 
     Uint64 deadline = SDL_GetTicks() + 10000;
     bool running = true;
+    int exit_status = 0;
     while (running && SDL_GetTicks() < deadline) {
         Nx2LinuxInputEvent event;
-        while (nx2linux_host_poll_event(&host, &event) == 1) {
+        int event_status;
+        bool resize_requested = false;
+        while ((event_status = nx2linux_host_poll_event(&host, &event)) == 1) {
             if (event.type == NX2LINUX_EVENT_QUIT) {
                 running = false;
-            } else if (event.type == NX2LINUX_EVENT_WINDOW_RESIZED &&
-                       nx2linux_vulkan_recreate_swapchain(&renderer) != 0) {
-                fprintf(stderr, "Could not recreate Vulkan swapchain: %s\n", SDL_GetError());
-                running = false;
+            } else if (event.type == NX2LINUX_EVENT_WINDOW_RESIZED) {
+                resize_requested = true;
             }
+        }
+        if (event_status < 0) {
+            fprintf(stderr, "Could not poll host events: %s\n", SDL_GetError());
+            exit_status = 1;
+            break;
+        }
+        if (running && resize_requested) {
+            int status = nx2linux_vulkan_recreate_swapchain(&renderer);
+            if (status < 0) {
+                fprintf(stderr, "Could not recreate Vulkan swapchain: %s\n", SDL_GetError());
+                exit_status = 1;
+                break;
+            }
+            if (status == 1) { SDL_Delay(16); continue; }
         }
         if (running) {
             int result = nx2linux_vulkan_draw_triangle(&renderer);
-            if (result == 1 && nx2linux_vulkan_recreate_swapchain(&renderer) != 0) {
+            if (result == 1 && nx2linux_vulkan_recreate_swapchain(&renderer) < 0) {
                 fprintf(stderr, "Could not recreate Vulkan swapchain: %s\n", SDL_GetError());
                 running = false;
+                exit_status = 1;
             } else if (result < 0) {
                 fprintf(stderr, "Could not draw Vulkan triangle: %s\n", SDL_GetError());
                 nx2linux_vulkan_shutdown(&renderer);
@@ -62,5 +78,5 @@ int main(void)
 
     nx2linux_vulkan_shutdown(&renderer);
     nx2linux_host_shutdown(&host);
-    return 0;
+    return exit_status != 0 || atomic_load(&renderer.validation_errors) != 0 ? 1 : 0;
 }

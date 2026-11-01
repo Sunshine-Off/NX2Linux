@@ -1,5 +1,27 @@
 # NX2Linux — Solution globale
 
+## Delivery correction and integration gates
+
+The numbered global milestones below describe the target architecture, not
+completed deliveries. They are distinct from the S1–S8 and T1–T7 work tracks.
+The authoritative current status is in [Swann.md](Swann.md) and the
+[remediation report](Jalons-remediation.md).
+
+The original S1 delivery only added frontend/XDG support. S1a now supplies a
+native ELF fixture host independent of graphics. S1b remains the integration
+with Téo's actual guest runtime, not something proven by native TLS tests.
+
+The original S3/S4 deliveries were a synthetic triangle and demo lifecycle.
+S4b still requires the game graphics implementation. Do not treat guest shaders,
+textures, buffers, descriptors, NVN command translation or guest GPU synchronization
+as existing merely because a Vulkan window works.
+
+S7 artifact inspection and headless integration preparation can begin when Téo's
+code and reports become available. S7 cannot be accepted as a working game until
+the native/runtime contract, AOT conformance and required graphics path have
+concrete tests. Working CLI and Qt controls do not waive these gates. No complete
+static Switch game recompilation has been demonstrated by the Swann host tests.
+
 ## Objectif
 
 Transformer NX2Apple en un fork Linux x86_64 capable de préparer et lancer des jeux

@@ -14,6 +14,22 @@ typedef struct QueueFamilies {
     bool present_found;
 } QueueFamilies;
 
+static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT type,
+    const VkDebugUtilsMessengerCallbackDataEXT *data, void *user)
+{
+    (void)type;
+    Nx2LinuxVulkanRenderer *renderer = user;
+    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        atomic_fetch_add(&renderer->validation_errors, 1);
+        fprintf(stderr, "NX2Linux Vulkan validation error: %s\n", data->pMessage);
+    } else {
+        fprintf(stderr, "NX2Linux Vulkan validation warning: %s\n", data->pMessage);
+    }
+    return VK_FALSE;
+}
+
 static int fail(const char *message, VkResult result)
 {
     char text[160];
@@ -156,6 +172,9 @@ static void destroy_swapchain_objects(Nx2LinuxVulkanRenderer *renderer)
         return;
     }
     for (uint32_t i = 0; i < renderer->image_count; ++i) {
+        if (renderer->render_finished != NULL && renderer->render_finished[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(renderer->device, renderer->render_finished[i], NULL);
+        }
         if (renderer->framebuffers != NULL && renderer->framebuffers[i] != VK_NULL_HANDLE) {
             vkDestroyFramebuffer(renderer->device, renderer->framebuffers[i], NULL);
         }
@@ -166,6 +185,8 @@ static void destroy_swapchain_objects(Nx2LinuxVulkanRenderer *renderer)
     free(renderer->framebuffers);
     free(renderer->image_views);
     free(renderer->images);
+    free(renderer->render_finished);
+    renderer->render_finished = NULL;
     renderer->framebuffers = NULL;
     renderer->image_views = NULL;
     renderer->images = NULL;
@@ -186,8 +207,10 @@ static int create_swapchain(Nx2LinuxVulkanRenderer *renderer)
     }
     uint32_t format_count = 0;
     uint32_t mode_count = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(renderer->physical_device, renderer->surface, &format_count, NULL);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(renderer->physical_device, renderer->surface, &mode_count, NULL);
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(renderer->physical_device, renderer->surface, &format_count, NULL);
+    if (result != VK_SUCCESS) return fail("cannot query surface formats", result);
+    result = vkGetPhysicalDeviceSurfacePresentModesKHR(renderer->physical_device, renderer->surface, &mode_count, NULL);
+    if (result != VK_SUCCESS) return fail("cannot query present modes", result);
     if (format_count == 0 || mode_count == 0) {
         SDL_SetError("Vulkan surface has no formats or present modes");
         return -1;
@@ -200,8 +223,14 @@ static int create_swapchain(Nx2LinuxVulkanRenderer *renderer)
         SDL_SetError("out of memory while creating Vulkan swapchain");
         return -1;
     }
-    vkGetPhysicalDeviceSurfaceFormatsKHR(renderer->physical_device, renderer->surface, &format_count, formats);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(renderer->physical_device, renderer->surface, &mode_count, modes);
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(renderer->physical_device, renderer->surface, &format_count, formats);
+    if (result == VK_SUCCESS)
+        result = vkGetPhysicalDeviceSurfacePresentModesKHR(renderer->physical_device, renderer->surface, &mode_count, modes);
+    if (result != VK_SUCCESS || format_count == 0 || mode_count == 0) {
+        free(formats);
+        free(modes);
+        return fail("cannot read surface formats/present modes", result);
+    }
     VkSurfaceFormatKHR format = choose_format(formats, format_count);
     VkExtent2D extent = capabilities.currentExtent;
     if (extent.width == UINT32_MAX) {
@@ -217,6 +246,13 @@ static int create_swapchain(Nx2LinuxVulkanRenderer *renderer)
         SDL_SetError("Vulkan surface has no drawable extent");
         return 1;
     }
+    if (extent.width < capabilities.minImageExtent.width) extent.width = capabilities.minImageExtent.width;
+    if (extent.height < capabilities.minImageExtent.height) extent.height = capabilities.minImageExtent.height;
+    if (extent.width > capabilities.maxImageExtent.width) extent.width = capabilities.maxImageExtent.width;
+    if (extent.height > capabilities.maxImageExtent.height) extent.height = capabilities.maxImageExtent.height;
+    VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    while ((capabilities.supportedCompositeAlpha & alpha) == 0 && alpha < VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)
+        alpha <<= 1;
     uint32_t image_count = capabilities.minImageCount + 1;
     if (capabilities.maxImageCount != 0 && image_count > capabilities.maxImageCount) {
         image_count = capabilities.maxImageCount;
@@ -232,7 +268,7 @@ static int create_swapchain(Nx2LinuxVulkanRenderer *renderer)
         .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .preTransform = capabilities.currentTransform,
-        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .compositeAlpha = alpha,
         .presentMode = choose_present_mode(modes, mode_count),
         .clipped = VK_TRUE,
     };
@@ -251,16 +287,23 @@ static int create_swapchain(Nx2LinuxVulkanRenderer *renderer)
     }
     renderer->swapchain_format = format.format;
     renderer->swapchain_extent = extent;
-    vkGetSwapchainImagesKHR(renderer->device, renderer->swapchain, &renderer->image_count, NULL);
+    result = vkGetSwapchainImagesKHR(renderer->device, renderer->swapchain, &renderer->image_count, NULL);
+    if (result != VK_SUCCESS) return fail("cannot query swapchain images", result);
     renderer->images = calloc(renderer->image_count, sizeof(*renderer->images));
     renderer->image_views = calloc(renderer->image_count, sizeof(*renderer->image_views));
     renderer->framebuffers = calloc(renderer->image_count, sizeof(*renderer->framebuffers));
-    if (renderer->images == NULL || renderer->image_views == NULL || renderer->framebuffers == NULL) {
+    renderer->render_finished = calloc(renderer->image_count, sizeof(*renderer->render_finished));
+    if (renderer->images == NULL || renderer->image_views == NULL || renderer->framebuffers == NULL ||
+        renderer->render_finished == NULL) {
         SDL_SetError("out of memory while creating Vulkan swapchain images");
         return -1;
     }
-    vkGetSwapchainImagesKHR(renderer->device, renderer->swapchain, &renderer->image_count, renderer->images);
+    result = vkGetSwapchainImagesKHR(renderer->device, renderer->swapchain, &renderer->image_count, renderer->images);
+    if (result != VK_SUCCESS) return fail("cannot read swapchain images", result);
     for (uint32_t i = 0; i < renderer->image_count; ++i) {
+        VkSemaphoreCreateInfo semaphore = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        result = vkCreateSemaphore(renderer->device, &semaphore, NULL, &renderer->render_finished[i]);
+        if (result != VK_SUCCESS) return fail("cannot create presentation semaphore", result);
         VkImageViewCreateInfo view = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .image = renderer->images[i],
@@ -298,12 +341,20 @@ static int create_render_pass(Nx2LinuxVulkanRenderer *renderer)
         .colorAttachmentCount = 1,
         .pColorAttachments = &color_ref,
     };
+    VkSubpassDependency dependency = {
+        .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    };
     VkRenderPassCreateInfo render_pass_info = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
         .attachmentCount = 1,
         .pAttachments = &attachment,
         .subpassCount = 1,
         .pSubpasses = &subpass,
+        .dependencyCount = 1,
+        .pDependencies = &dependency,
     };
     VkResult result = vkCreateRenderPass(renderer->device, &render_pass_info, NULL, &renderer->render_pass);
     return result == VK_SUCCESS ? 0 : fail("cannot create Vulkan render pass", result);
@@ -453,6 +504,7 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer, SDL_Window *window, c
         return -1;
     }
     memset(renderer, 0, sizeof(*renderer));
+    atomic_init(&renderer->validation_errors, 0);
     renderer->window = window;
     size_t shader_dir_length = strlen(shader_dir) + 1;
     renderer->shader_dir = malloc(shader_dir_length);
@@ -464,6 +516,7 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer, SDL_Window *window, c
     if (!SDL_Vulkan_LoadLibrary(NULL)) {
         return -1;
     }
+    renderer->vulkan_library_loaded = true;
     uint32_t extension_count = 0;
     const char *const *extensions = SDL_Vulkan_GetInstanceExtensions(&extension_count);
     if (extensions == NULL) {
@@ -483,9 +536,48 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer, SDL_Window *window, c
         .enabledExtensionCount = extension_count,
         .ppEnabledExtensionNames = extensions,
     };
+    const char *validation = getenv("NX2LINUX_VK_VALIDATION");
+    const char *layer = "VK_LAYER_KHRONOS_validation";
+    VkDebugUtilsMessengerCreateInfoEXT debug_info = {
+        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+        .pfnUserCallback = validation_message, .pUserData = renderer,
+    };
+    const char **enabled_extensions = NULL;
+    VkValidationFeatureEnableEXT sync_validation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+    VkValidationFeaturesEXT validation_features = {
+        .sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
+        .pNext = &debug_info,
+        .enabledValidationFeatureCount = 1,
+        .pEnabledValidationFeatures = &sync_validation,
+    };
+    if (validation != NULL && strcmp(validation, "1") == 0) {
+        enabled_extensions = calloc(extension_count + 2, sizeof(*enabled_extensions));
+        if (enabled_extensions == NULL) { SDL_OutOfMemory(); return -1; }
+        memcpy(enabled_extensions, extensions, extension_count * sizeof(*extensions));
+        enabled_extensions[extension_count] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+        enabled_extensions[extension_count + 1] = VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME;
+        instance_info.enabledExtensionCount += 2;
+        instance_info.ppEnabledExtensionNames = enabled_extensions;
+        instance_info.enabledLayerCount = 1;
+        instance_info.ppEnabledLayerNames = &layer;
+        instance_info.pNext = &validation_features;
+    }
     VkResult result = vkCreateInstance(&instance_info, NULL, &renderer->instance);
+    free(enabled_extensions);
     if (result != VK_SUCCESS) {
         return fail("cannot create Vulkan instance", result);
+    }
+    if (instance_info.enabledLayerCount != 0) {
+        PFN_vkCreateDebugUtilsMessengerEXT create_debug = (PFN_vkCreateDebugUtilsMessengerEXT)
+            vkGetInstanceProcAddr(renderer->instance, "vkCreateDebugUtilsMessengerEXT");
+        if (create_debug == NULL) { SDL_SetError("Vulkan debug utils unavailable"); return -1; }
+        result = create_debug(renderer->instance, &debug_info, NULL, &renderer->debug_messenger);
+        if (result != VK_SUCCESS) return fail("cannot enable Vulkan validation messages", result);
     }
     if (!SDL_Vulkan_CreateSurface(window, renderer->instance, NULL, &renderer->surface)) {
         SDL_SetError("cannot create SDL Vulkan surface: %s", SDL_GetError());
@@ -541,6 +633,7 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer, SDL_Window *window, c
     }
     VkCommandPoolCreateInfo pool = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = renderer->graphics_family,
     };
     result = vkCreateCommandPool(renderer->device, &pool, NULL, &renderer->command_pool);
@@ -557,9 +650,6 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer, SDL_Window *window, c
     if (result == VK_SUCCESS) {
         result = vkCreateSemaphore(renderer->device, &semaphore, NULL, &renderer->image_available);
     }
-    if (result == VK_SUCCESS) {
-        result = vkCreateSemaphore(renderer->device, &semaphore, NULL, &renderer->render_finished);
-    }
     VkFenceCreateInfo fence = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT};
     if (result == VK_SUCCESS) {
         result = vkCreateFence(renderer->device, &fence, NULL, &renderer->in_flight);
@@ -573,32 +663,38 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer, SDL_Window *window, c
 
 int nx2linux_vulkan_recreate_swapchain(Nx2LinuxVulkanRenderer *renderer)
 {
-    if (renderer == NULL || !renderer->initialized || renderer->device == VK_NULL_HANDLE) {
+    if (renderer == NULL || !renderer->initialized || renderer->fatal_error || renderer->device == VK_NULL_HANDLE) {
         return -1;
     }
+    int width = 0, height = 0;
+    if (!SDL_GetWindowSizeInPixels(renderer->window, &width, &height)) return -1;
+    if (width == 0 || height == 0 || (SDL_GetWindowFlags(renderer->window) & SDL_WINDOW_MINIMIZED)) return 1;
     VkResult result = vkDeviceWaitIdle(renderer->device);
     if (result != VK_SUCCESS) {
         return fail("cannot wait for Vulkan swapchain recreation", result);
     }
+    VkFormat previous_format = renderer->swapchain_format;
     destroy_swapchain_objects(renderer);
-    if (renderer->pipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(renderer->device, renderer->pipeline, NULL);
-        renderer->pipeline = VK_NULL_HANDLE;
-    }
-    if (renderer->pipeline_layout != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(renderer->device, renderer->pipeline_layout, NULL);
-        renderer->pipeline_layout = VK_NULL_HANDLE;
-    }
-    if (renderer->render_pass != VK_NULL_HANDLE) {
-        vkDestroyRenderPass(renderer->device, renderer->render_pass, NULL);
-        renderer->render_pass = VK_NULL_HANDLE;
-    }
     int status = create_swapchain(renderer);
     if (status != 0) {
+        renderer->fatal_error = status < 0;
         return status;
     }
-    if (create_render_pass(renderer) != 0 || create_pipeline(renderer, renderer->shader_dir) != 0 ||
-        create_framebuffers(renderer) != 0) {
+    /* Viewport/scissor are dynamic. A size-only change does not invalidate shaders. */
+    if (previous_format != renderer->swapchain_format) {
+        vkDestroyPipeline(renderer->device, renderer->pipeline, NULL);
+        renderer->pipeline = VK_NULL_HANDLE;
+        vkDestroyPipelineLayout(renderer->device, renderer->pipeline_layout, NULL);
+        renderer->pipeline_layout = VK_NULL_HANDLE;
+        vkDestroyRenderPass(renderer->device, renderer->render_pass, NULL);
+        renderer->render_pass = VK_NULL_HANDLE;
+        if (create_render_pass(renderer) != 0 || create_pipeline(renderer, renderer->shader_dir) != 0) {
+            renderer->fatal_error = true;
+            return -1;
+        }
+    }
+    if (create_framebuffers(renderer) != 0) {
+        renderer->fatal_error = true;
         return -1;
     }
     return 0;
@@ -606,9 +702,11 @@ int nx2linux_vulkan_recreate_swapchain(Nx2LinuxVulkanRenderer *renderer)
 
 int nx2linux_vulkan_draw_triangle(Nx2LinuxVulkanRenderer *renderer)
 {
-    if (renderer == NULL || !renderer->initialized) {
+    if (renderer == NULL || !renderer->initialized || renderer->fatal_error) {
         return -1;
     }
+    if (renderer->swapchain == VK_NULL_HANDLE ||
+        (SDL_GetWindowFlags(renderer->window) & SDL_WINDOW_MINIMIZED)) return 1;
     VkResult result = vkWaitForFences(renderer->device, 1, &renderer->in_flight, VK_TRUE, UINT64_MAX);
     if (result != VK_SUCCESS) {
         return fail("cannot wait for Vulkan frame", result);
@@ -622,8 +720,11 @@ int nx2linux_vulkan_draw_triangle(Nx2LinuxVulkanRenderer *renderer)
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
         return fail("cannot acquire Vulkan swapchain image", result);
     }
-    vkResetFences(renderer->device, 1, &renderer->in_flight);
-    vkResetCommandBuffer(renderer->command_buffer, 0);
+    result = vkResetCommandBuffer(renderer->command_buffer, 0);
+    if (result != VK_SUCCESS) {
+        renderer->fatal_error = true;
+        return fail("cannot reset Vulkan command buffer", result);
+    }
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     result = vkBeginCommandBuffer(renderer->command_buffer, &begin);
     if (result == VK_SUCCESS) {
@@ -648,6 +749,7 @@ int nx2linux_vulkan_draw_triangle(Nx2LinuxVulkanRenderer *renderer)
         result = vkEndCommandBuffer(renderer->command_buffer);
     }
     if (result != VK_SUCCESS) {
+        renderer->fatal_error = true;
         return fail("cannot record Vulkan triangle", result);
     }
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -659,16 +761,22 @@ int nx2linux_vulkan_draw_triangle(Nx2LinuxVulkanRenderer *renderer)
         .commandBufferCount = 1,
         .pCommandBuffers = &renderer->command_buffer,
         .signalSemaphoreCount = 1,
-        .pSignalSemaphores = &renderer->render_finished,
+        .pSignalSemaphores = &renderer->render_finished[image_index],
     };
+    result = vkResetFences(renderer->device, 1, &renderer->in_flight);
+    if (result != VK_SUCCESS) {
+        renderer->fatal_error = true;
+        return fail("cannot reset Vulkan frame fence", result);
+    }
     result = vkQueueSubmit(renderer->graphics_queue, 1, &submit, renderer->in_flight);
     if (result != VK_SUCCESS) {
+        renderer->fatal_error = true;
         return fail("cannot submit Vulkan triangle", result);
     }
     VkPresentInfoKHR present = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &renderer->render_finished,
+        .pWaitSemaphores = &renderer->render_finished[image_index],
         .swapchainCount = 1,
         .pSwapchains = &renderer->swapchain,
         .pImageIndices = &image_index,
@@ -692,7 +800,6 @@ void nx2linux_vulkan_shutdown(Nx2LinuxVulkanRenderer *renderer)
     if (renderer->device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(renderer->device);
         if (renderer->in_flight != VK_NULL_HANDLE) vkDestroyFence(renderer->device, renderer->in_flight, NULL);
-        if (renderer->render_finished != VK_NULL_HANDLE) vkDestroySemaphore(renderer->device, renderer->render_finished, NULL);
         if (renderer->image_available != VK_NULL_HANDLE) vkDestroySemaphore(renderer->device, renderer->image_available, NULL);
         if (renderer->command_pool != VK_NULL_HANDLE) vkDestroyCommandPool(renderer->device, renderer->command_pool, NULL);
         if (renderer->pipeline != VK_NULL_HANDLE) vkDestroyPipeline(renderer->device, renderer->pipeline, NULL);
@@ -705,11 +812,18 @@ void nx2linux_vulkan_shutdown(Nx2LinuxVulkanRenderer *renderer)
         SDL_Vulkan_DestroySurface(renderer->instance, renderer->surface, NULL);
     }
     if (renderer->instance != VK_NULL_HANDLE) {
+        if (renderer->debug_messenger != VK_NULL_HANDLE) {
+            PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug = (PFN_vkDestroyDebugUtilsMessengerEXT)
+                vkGetInstanceProcAddr(renderer->instance, "vkDestroyDebugUtilsMessengerEXT");
+            if (destroy_debug != NULL) destroy_debug(renderer->instance, renderer->debug_messenger, NULL);
+        }
         vkDestroyInstance(renderer->instance, NULL);
     }
-    SDL_Vulkan_UnloadLibrary();
+    if (renderer->vulkan_library_loaded) SDL_Vulkan_UnloadLibrary();
     free(renderer->shader_dir);
+    unsigned errors = atomic_load(&renderer->validation_errors);
     memset(renderer, 0, sizeof(*renderer));
+    atomic_init(&renderer->validation_errors, errors);
 }
 
 const char *nx2linux_vulkan_gpu_name(const Nx2LinuxVulkanRenderer *renderer)

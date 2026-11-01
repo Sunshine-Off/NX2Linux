@@ -2,6 +2,7 @@
 #define NX2LINUX_VULKAN_RENDERER_H
 
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #include <vulkan/vulkan.h>
 
@@ -10,6 +11,8 @@
 typedef struct Nx2LinuxVulkanRenderer {
     SDL_Window *window;
     VkInstance instance;
+    VkDebugUtilsMessengerEXT debug_messenger;
+    atomic_uint validation_errors;
     VkPhysicalDevice physical_device;
     VkDevice device;
     VkQueue graphics_queue;
@@ -30,11 +33,13 @@ typedef struct Nx2LinuxVulkanRenderer {
     VkCommandPool command_pool;
     VkCommandBuffer command_buffer;
     VkSemaphore image_available;
-    VkSemaphore render_finished;
+    VkSemaphore *render_finished; /* Indexed by acquired swapchain image, not frame. */
     VkFence in_flight;
     char *shader_dir;
     uint64_t frames_rendered;
     bool initialized;
+    bool fatal_error;
+    bool vulkan_library_loaded;
 } Nx2LinuxVulkanRenderer;
 
 /* shader_dir must contain triangle.vert.spv and triangle.frag.spv. */
@@ -45,7 +50,8 @@ int nx2linux_vulkan_init(Nx2LinuxVulkanRenderer *renderer,
 /* Draws one frame. Returns 0 on success, 1 when the swapchain needs recreation, -1 on error. */
 int nx2linux_vulkan_draw_triangle(Nx2LinuxVulkanRenderer *renderer);
 
-/* Rebuilds swapchain-dependent resources after a resize or surface loss. */
+/* Rebuilds after resize/out-of-date. 1 means drawable suspended, -1 is fatal.
+ * Surface loss requires full reinitialization, not just swapchain recreation. */
 int nx2linux_vulkan_recreate_swapchain(Nx2LinuxVulkanRenderer *renderer);
 
 void nx2linux_vulkan_shutdown(Nx2LinuxVulkanRenderer *renderer);

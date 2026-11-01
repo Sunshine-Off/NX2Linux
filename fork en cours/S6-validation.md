@@ -1,5 +1,9 @@
 # S6 — Linux Qt host integration
 
+This is the historical S6 test report. It does not certify S1–S4 or the game
+renderer. The subsequent [remediation report](Jalons-remediation.md) supersedes
+the earlier milestone interpretation and records the open validation gates.
+
 ## Delivered scope
 
 The Linux entry point now selects `LinuxWindow` and `LinuxBackend`. macOS and

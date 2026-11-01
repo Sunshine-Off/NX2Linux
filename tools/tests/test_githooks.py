@@ -46,6 +46,8 @@ class ChecksFor(unittest.TestCase):
         self.assertEqual(H.CHECKS[0].command, 'python3 tools/engine.py check')
 
     def test_each_area_runs_its_own_check(self):
+        self.assertEqual(names(['linux/host/posix_host.c']), ['Linux foundation'])
+        self.assertEqual(names(['linux/cli/nx2linux.py']), ['Linux foundation'])
         self.assertEqual(names(['tools/engine.py']), ['tools'])
         self.assertEqual(names(['.github/scripts/triage_apply.py']), ['triage scripts'])
         self.assertEqual(names(['frontend-qt/nspb_qt/app.py']), ['Qt front end'])
