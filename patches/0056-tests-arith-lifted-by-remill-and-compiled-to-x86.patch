@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 13:52:06 +0100
+Subject: [PATCH] tests: arith lifted by Remill and compiled to x86_64 matches
+ an Unicorn AArch64 reference
+
+arm64_ref.py runs a fixture function on Unicorn and returns registers and NZCV, cross-checked
+by an independent Python model on 11 edge cases (every flag set at least once).
+test_recompile_arith.py lifts `arith` with remill-lift, compiles it with clang++ against
+remill_host.cpp and compares x0 and NZCV with the reference. Skipped without REMILL_BUILD or
+unicorn. A function needing memory or call intrinsics fails the link: an explicit error.
+
+Upstream-Status: pending
+Reason: T2 of an AArch64 -> x86_64 recompilation (NX2Linux); tests and a host stub only, nothing in the host, loader or shader chain changes
+Issue: none yet (NX2Linux, branch feat/teo-recompilation-arm64)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/tests/arm64_ref.py            | 44 +++++++++++++++++
+ dm/tools/tests/remill_host.cpp         | 24 +++++++++
+ dm/tools/tests/test_arm64_ref.py       | 38 +++++++++++++++
+ dm/tools/tests/test_recompile_arith.py | 67 ++++++++++++++++++++++++++
+ 4 files changed, 173 insertions(+)
+ create mode 100644 dm/tools/tests/arm64_ref.py
+ create mode 100644 dm/tools/tests/remill_host.cpp
+ create mode 100644 dm/tools/tests/test_arm64_ref.py
+ create mode 100644 dm/tools/tests/test_recompile_arith.py
+
+diff --git a/dm/tools/tests/arm64_ref.py b/dm/tools/tests/arm64_ref.py
+new file mode 100644
+index 0000000..f73d108
+--- /dev/null
++++ b/dm/tools/tests/arm64_ref.py
+@@ -0,0 +1,44 @@
++"""The ARM64 reference for the recompilation tests (NX2Linux T2): runs a function of a synthetic module (arm64_fixture.py) on Unicorn's AArch64 core and returns its registers and NZCV.
++The recompiled x86_64 code is compared with this, never with a model written by the same hand. model_arith() is a second, independent model in plain Python, used only to cross-check the reference."""
++import os, sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import arm64_fixture as fx
++
++MASK = (1 << 64) - 1
++BASE, STACK, STOP = 0x10000, 0x200000, 0x400000   # text mapped at BASE; STOP: the return address, where the run ends
++
++
++def run(name, regs=None, steps=10000):
++    """Run function `name` of the fixture with registers {'x0': v, ...}; returns {'x0'..'x30', 'sp', 'nzcv'} (nzcv: N Z C V as bits 3..0). The run ends when the function returns to STOP.
++    An exception of the core (an undecodable word, an unmapped access) propagates: a reference run never hides one."""
++    from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_CODE
++    from unicorn.arm64_const import UC_ARM64_REG_X0, UC_ARM64_REG_X30, UC_ARM64_REG_SP, UC_ARM64_REG_NZCV
++    words, ranges, _ = fx.text_layout()
++    import struct
++    code = struct.pack('<%dI' % len(words), *words)
++    uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
++    uc.mem_map(BASE, 0x10000); uc.mem_write(BASE, code); uc.mem_map(STACK - 0x10000, 0x10000); uc.mem_map(STOP, 0x1000)
++    for r, v in (regs or {}).items(): uc.reg_write(UC_ARM64_REG_X0 + int(r[1:]), v & MASK)
++    uc.reg_write(UC_ARM64_REG_SP, STACK); uc.reg_write(UC_ARM64_REG_X30, STOP)
++    start = BASE + ranges[name][0]
++    uc.emu_start(start, STOP, count=steps)
++    out = {f'x{i}': uc.reg_read(UC_ARM64_REG_X0 + i) for i in range(31)}
++    out['sp'] = uc.reg_read(UC_ARM64_REG_SP); out['nzcv'] = uc.reg_read(UC_ARM64_REG_NZCV) >> 28
++    return out
++
++
++def _flags(result, a, b, sub):
++    """NZCV of a 64-bit add (sub=False) or subtract a - b (sub=True), from the Arm ARM's AddWithCarry(a, b or ~b, carry in 0 or 1)"""
++    if sub: b, cin = ~b & MASK, 1
++    else: cin = 0
++    full = a + b + cin; r = full & MASK
++    sa, sb = a - (1 << 64) if a >> 63 else a, b - (1 << 64) if b >> 63 else b
++    return (r >> 63) << 3 | (r == 0) << 2 | (full > MASK) << 1 | (sa + sb + cin != (r - (1 << 64) if r >> 63 else r)), r
++
++
++def model_arith(x0, x1):
++    """What `arith` computes (add x2,x0,x1; adds x3,x2,x0; subs x4,x3,x1; mul x0,x2,x4), by the Arm ARM's definitions: (x0, nzcv)"""
++    x2 = (x0 + x1) & MASK
++    _, x3 = _flags(0, x2, x0, False)
++    nzcv, x4 = _flags(0, x3, x1, True)
++    return (x2 * x4) & MASK, nzcv
+diff --git a/dm/tools/tests/remill_host.cpp b/dm/tools/tests/remill_host.cpp
+new file mode 100644
+index 0000000..e46e72b
+--- /dev/null
++++ b/dm/tools/tests/remill_host.cpp
+@@ -0,0 +1,24 @@
++// Host side of a function Remill lifted from the fixture (NX2Linux T2): the lifted code takes a guest CPU state, a program counter and a memory token, and calls `__remill_*` intrinsics the
++// host defines. Compiled together with the lifted IR (test_recompile_arith.py) into one x86_64 shared library. ENTRY is the lifted function's name (sub_<address>).
++// The flag intrinsics only mark where a flag is computed for Remill's own analyses: the value passed first is already the flag, so they return it.
++#include "remill/Arch/AArch64/Runtime/State.h"
++#include <cstdint>
++#include <cstring>
++extern "C" {
++Memory *ENTRY(State *, uint64_t, Memory *);
++bool __remill_flag_computation_sign(bool r, ...) { return r; }
++bool __remill_flag_computation_zero(bool r, ...) { return r; }
++bool __remill_flag_computation_carry(bool r, ...) { return r; }
++bool __remill_flag_computation_overflow(bool r, ...) { return r; }
++Memory *__remill_function_return(State &, uint64_t, Memory *m) { return m; }   // `ret`: the run ends here
++// Every other intrinsic (memory access, indirect jumps, svc...) is absent on purpose: the library then fails to link instead of translating something it cannot do
++
++// run `arith`: x0, x1 in; x0 and NZCV (bits 3..0) out
++uint64_t run_lifted(uint64_t x0, uint64_t x1, uint8_t *nzcv, uint64_t pc) {
++    State st; memset(&st, 0, sizeof st);
++    st.gpr.x0.qword = x0; st.gpr.x1.qword = x1;
++    ENTRY(&st, pc, nullptr);
++    *nzcv = st.sr.n << 3 | st.sr.z << 2 | st.sr.c << 1 | st.sr.v;
++    return st.gpr.x0.qword;
++}
++}
+diff --git a/dm/tools/tests/test_arm64_ref.py b/dm/tools/tests/test_arm64_ref.py
+new file mode 100644
+index 0000000..5b2b38f
+--- /dev/null
++++ b/dm/tools/tests/test_arm64_ref.py
+@@ -0,0 +1,38 @@
++"""The Unicorn reference (arm64_ref.py) against the independent Python model of `arith`, on the NZCV edge cases: carry out, signed overflow, zero, negative. Skipped without unicorn."""
++from pathlib import Path
++import sys
++import unittest
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++import arm64_ref as ref
++
++try: import unicorn   # noqa: F401
++except ImportError: unicorn = None
++
++M = ref.MASK
++CASES = [(0, 0), (1, 2), (M, 1), (M, M), (1 << 63, 1 << 63), ((1 << 63) - 1, 1), (1 << 63, M), (0x7FFFFFFF, 0x80000000), (5, M - 4), (3, 1 << 63), (1, (1 << 63) - 1)]   # the last one sets V
++
++
++@unittest.skipUnless(unicorn, 'needs unicorn (pip install unicorn)')
++class Reference(unittest.TestCase):
++    def test_arith_matches_the_independent_model(self):
++        for a, b in CASES:
++            got = ref.run('arith', {'x0': a, 'x1': b})
++            self.assertEqual((got['x0'], got['nzcv']), ref.model_arith(a, b), (hex(a), hex(b)))
++
++    def test_the_cases_reach_every_flag(self):
++        seen = 0
++        for a, b in CASES: seen |= ref.model_arith(a, b)[1]
++        self.assertEqual(seen, 0b1111, 'the edge cases must set N, Z, C and V at least once')
++
++    def test_run_is_deterministic_and_leaves_sp(self):
++        a = ref.run('arith', {'x0': 7, 'x1': 9}); b = ref.run('arith', {'x0': 7, 'x1': 9})
++        self.assertEqual(a, b); self.assertEqual(a['sp'], ref.STACK)
++
++    def test_nested_calls_return_through_the_stack(self):
++        got = ref.run('caller', {'x0': 4, 'x1': 6})   # bl arith, bl branch
++        self.assertEqual(got['sp'], ref.STACK); self.assertIn(got['x0'], (1, 2))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/dm/tools/tests/test_recompile_arith.py b/dm/tools/tests/test_recompile_arith.py
+new file mode 100644
+index 0000000..3bb489a
+--- /dev/null
++++ b/dm/tools/tests/test_recompile_arith.py
+@@ -0,0 +1,67 @@
++"""T2: `arith` of the synthetic fixture, lifted to LLVM IR by Remill, compiled to x86_64 by clang, run and compared with the Unicorn ARM64 reference (arm64_ref.py) on the NZCV edge cases.
++Needs Remill built (REMILL_BUILD = its build folder, with bin/lift/remill-lift-*), clang++ and unicorn; skipped otherwise. Any intrinsic the lifted code needs that remill_host.cpp does not define
++fails the link: a translation that cannot be done is an error, never a silent guess."""
++import ctypes, glob, os, struct, subprocess, sys, tempfile, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++import arm64_fixture as fx
++import arm64_ref as ref
++from test_arm64_ref import CASES
++
++BUILD = os.environ.get('REMILL_BUILD')
++LIFT = next(iter(sorted(glob.glob(os.path.join(BUILD, 'bin/lift/remill-lift-*')))), None) if BUILD else None
++try: import unicorn   # noqa: F401
++except ImportError: unicorn = None
++
++
++def lift_function(name, out_ll):
++    """Lift fixture function `name` with remill-lift; returns (its address, the lifted function's symbol)"""
++    words, ranges, _ = fx.text_layout()
++    s, e = ranges[name]
++    code = struct.pack('<%dI' % ((e - s) // 4), *words[s // 4:e // 4])
++    subprocess.run([LIFT, '--arch', 'aarch64', '--address', hex(s), '--bytes', code.hex(), '--ir_out', out_ll], check=True, capture_output=True, text=True)
++    return s, f'sub_{s:x}'
++
++
++@unittest.skipUnless(LIFT and unicorn, 'needs REMILL_BUILD (a Remill build folder) and unicorn')
++class RecompileArith(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp = tempfile.TemporaryDirectory()
++        ll = os.path.join(cls.tmp.name, 'arith.ll'); so = os.path.join(cls.tmp.name, 'arith.so')
++        cls.addr, sym = lift_function('arith', ll)
++        inc = os.environ.get('REMILL_SRC', os.path.join(BUILD, '..'))
++        r = subprocess.run(['clang++', '-O2', '-shared', '-fPIC', '-std=c++17', f'-DENTRY={sym}', '-DADDRESS_SIZE_BITS=64', f'-I{inc}/include', f'-I{inc}', str(HERE / 'remill_host.cpp'), ll, '-o', so],
++                           capture_output=True, text=True)
++        if r.returncode: raise RuntimeError('compile/link of the lifted function failed:\n' + r.stderr[-2000:])
++        cls.lib = ctypes.CDLL(so)
++        cls.lib.run_lifted.restype = ctypes.c_uint64
++        cls.lib.run_lifted.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint64]
++
++    @classmethod
++    def tearDownClass(cls): cls.tmp.cleanup()
++
++    def run_x86(self, a, b):
++        nzcv = ctypes.c_uint8()
++        x0 = self.lib.run_lifted(a, b, ctypes.byref(nzcv), self.addr)
++        return x0, nzcv.value
++
++    def test_aot_equals_arm64_reference(self):
++        for a, b in CASES:
++            want = ref.run('arith', {'x0': a, 'x1': b})
++            self.assertEqual(self.run_x86(a, b), (want['x0'], want['nzcv']), (hex(a), hex(b)))
++
++    def test_unlifted_intrinsic_fails_the_link(self):
++        """A function that needs an intrinsic the host does not define (here `blr`, an indirect call) is not silently translated"""
++        ll = os.path.join(self.tmp.name, 'indirect.ll')
++        _, sym = lift_function('indirect', ll)
++        inc = os.environ.get('REMILL_SRC', os.path.join(BUILD, '..'))
++        r = subprocess.run(['clang++', '-O2', '-shared', '-fPIC', '-std=c++17', f'-DENTRY={sym}', '-DADDRESS_SIZE_BITS=64', f'-I{inc}/include', f'-I{inc}', str(HERE / 'remill_host.cpp'), ll, '-o', os.path.join(self.tmp.name, 'x.so'),
++                            '-Wl,--no-undefined'], capture_output=True, text=True)
++        self.assertNotEqual(r.returncode, 0); self.assertIn('__remill_', r.stderr)
++
++
++if __name__ == '__main__':
++    unittest.main()
