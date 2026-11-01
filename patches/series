@@ -44,3 +44,7 @@
 0063-aot-stub-for-functions-the-translator-cannot-lif.patch
 0064-aot-svc-reaches-the-horizon-service-handler-thre.patch
 0065-aot-elf-modules-and-a-manifest-instead-of-the-ma.patch
+0066-aot-validation-on-a-real-module-plt-split-lift-l.patch
+0067-aot-jump-tables-resolved-at-translation-time-tra.patch
+0068-aot-floating-point-and-vector-memory-instruction.patch
+0069-aot-neon-coverage-blocker-3-closed-for-balatro-t.patch
