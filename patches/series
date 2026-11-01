@@ -43,3 +43,4 @@
 0062-aot-real-gcc-output-as-a-test-scalar-float-memor.patch
 0063-aot-stub-for-functions-the-translator-cannot-lif.patch
 0064-aot-svc-reaches-the-horizon-service-handler-thre.patch
+0065-aot-elf-modules-and-a-manifest-instead-of-the-ma.patch
