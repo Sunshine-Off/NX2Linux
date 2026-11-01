@@ -14,3 +14,12 @@ Every assumption the recompilation work (ARM64 Switch modules → x86_64 Linux) 
 | H6 | Capstone 5 is the decoder (`patch_nso.py` refuses Capstone 6). | `patch_nso.py` header. | `pip install "capstone>=5,<6"`; `_md()` in `arm64_survey.py` checks the version. |
 
 Not assumed, only unknown: how the Switch's retail modules lay out their code (the survey has run on the fixture only), and which functions of a real game call `svc` outside the SDK wrappers.
+
+## 2026-11-01 (T3: branches, memory, calls — `aot_lift.py`, `aot_runtime.cpp`)
+
+| # | Assumption | Why it is made | How to confirm |
+|---|---|---|---|
+| H7 | A `ret` returns to the caller of the lifted function (the C return); x30 is not consulted. | `__remill_function_return` ends the lifted function; direct `bl` is a C call. | Code that rewrites x30 before `ret` (longjmp-like unwinding, coroutine switches, the SDK's context switch) would break this. Search a real module you own for `ret` after an `x30` write that is not a reload from the stack; T4/T5 must handle or refuse it. |
+| H8 | A `br` is a tail call to a function entry. A jump into the middle of a function (a jump table) is an explicit error. | The runtime's table holds function entries only. | Count `br` instructions in a real module with `arm64_survey.py` (kind `ibranch`) and check how many land inside the same function. Jump tables need their cases resolved at translation time. |
+| H9 | The guest memory is a few flat regions; an unaligned access to normal memory is allowed and not atomic. | AArch64 normal memory allows it. | Not for Device memory or atomics: do not apply to those. |
+| H10 | Floating point, SIMD, atomics and `svc` are not translated yet. | Remill refuses `svc`, `stxr`, `stlr`, `isb` and the LSE atomics (`ldadd`, `swp`, `cas`...) (LiftError), and the runtime has no memory or FP intrinsics beyond 8-64 bits (LinkError). | Re-run the scan of `ldxr stxr ldaxr stlxr ldar stlr ldadd swp cas dmb isb` after each Remill update. The Switch's A57 cores have no LSE, so the exclusives and barriers matter most. |

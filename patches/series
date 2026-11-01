@@ -37,3 +37,4 @@
 0056-tests-arith-lifted-by-remill-and-compiled-to-x86.patch
 0057-tests-26-flag-instructions-lifted-by-remill-matc.patch
 0058-tests-adc-and-adcs-join-the-instructions-checked.patch
+0059-aot-lift-ahead-of-time-recompilation-of-aarch64.patch
