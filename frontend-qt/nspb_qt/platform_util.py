@@ -42,7 +42,7 @@ def xdg_dir(kind: str, app: str = 'nx2linux') -> Path:
         raise ValueError(f'unknown XDG directory kind: {kind}')
     if IS_LINUX:
         env = os.environ.get(f'XDG_{kind.upper()}_HOME')
-        if env:
+        if env and Path(env).is_absolute():
             return Path(env) / app
         home = Path.home()
         defaults = {

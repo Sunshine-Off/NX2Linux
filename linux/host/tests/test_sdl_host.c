@@ -2,6 +2,10 @@
 
 #include <SDL3/SDL.h>
 
+/* The smoke test must exercise its checks and setup in Release builds too. */
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <assert.h>
 #include <stdio.h>
 

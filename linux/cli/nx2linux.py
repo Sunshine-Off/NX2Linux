@@ -8,6 +8,8 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Sequence
 
@@ -19,7 +21,7 @@ def xdg_dir(kind: str) -> Path:
     if kind not in ('config', 'cache', 'state', 'data'):
         raise ValueError(kind)
     env = os.environ.get(f'XDG_{kind.upper()}_HOME')
-    if env:
+    if env and Path(env).is_absolute():
         return Path(env) / 'nx2linux'
     defaults = {
         'config': Path.home() / '.config',
@@ -134,15 +136,26 @@ def verify(args: argparse.Namespace) -> int:
                                                         config='Debug', jobs=args.jobs))
         if result != 0:
             return result
-    result = run(['ctest', '--test-dir', str(directory), '--output-on-failure'], capture=True)
-    print(result.stdout, end='')
-    if result.stderr:
-        print(result.stderr, end='', file=sys.stderr)
-    if result.returncode != 0:
-        return result.returncode
-    if args.require_vulkan and 'Skipped' in result.stdout:
-        print('verify: Vulkan test was skipped but --require-vulkan was requested', file=sys.stderr)
-        return 1
+    with tempfile.TemporaryDirectory(prefix='nx2linux-verify-') as temporary:
+        report = Path(temporary) / 'tests.xml'
+        result = run(['ctest', '--test-dir', str(directory), '--output-on-failure',
+                      '--no-tests=error', '--timeout', '60', '--output-junit', str(report)])
+        if result.returncode != 0:
+            return result.returncode
+        try:
+            cases = {case.attrib['name']: case for case in ET.parse(report).iter('testcase')}
+            required = ['nx2linux_sdl_host_smoke']
+            if args.require_vulkan:
+                required.append('nx2linux_vulkan_triangle')
+            for name in required:
+                case = cases.get(name)
+                if (case is None or case.find('skipped') is not None
+                        or case.find('failure') is not None or case.find('error') is not None
+                        or case.get('status') != 'run'):
+                    raise ValueError(f'{name} did not run successfully')
+        except (OSError, ET.ParseError, KeyError, ValueError) as error:
+            print(f'verify: {error}', file=sys.stderr)
+            return 1
     return 0
 
 
