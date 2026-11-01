@@ -8,7 +8,7 @@ Classé par gravité, avec la preuve de chacun. « Prouvé » = mesuré par un t
 |---|---|---|---|
 | 1 | **RÉGLÉ le 2026-11-01 (voir bas de page).** ~~Une fonction non liftable empêche de construire tout appelant direct.** Si `f` fait `bl g` et que Remill ne sait pas lifter `g`, le lien échoue (`sub_<g>` indéfini) ; message actuel trompeur (« the runtime does not define »). | Prouvé : `f` seule → `LinkError … sub_2000` ; `f` + `g` (avec `svc`) → `LiftError`. | Fait : `Aot(..., stub_unliftable=True)`. |
 | 2 | **RÉGLÉ le 2026-11-02 (voir bas de page).** ~~Les tables de sauts (`switch`) passent toutes par le JIT.~~ Chaque aiguillage = 1 entrée JIT ; en AOT seul, erreur explicite. | Prouvé (test_aot_realistic) : `switch` à 20 cas compilé par GCC → `br x2` vers le milieu de la fonction ; 20 aiguillages = 20 entrées JIT. | Lire la table au moment de la traduction et enregistrer chaque cible comme point d'entrée AOT supplémentaire (le fragment se termine par `ret` et reste correct), ou le transformer en `switch` local. Critère « JIT mesuré et limité » impossible tant que ce n'est pas fait. |
-| 3 | **PARTIELLEMENT RÉGLÉ le 2026-11-02 (scalaire et mémoire faits, NEON restant : voir bas de page).** Trou de couverture FP/SIMD dans Remill. Sur un échantillon C modeste compilé par GCC : 6 fonctions sur 20 ne se liftent pas ; 7 instructions sur 290 (2 %). | Prouvé : `fmul vN.4s, vN.4s, v0.s[0]`, `fsqrt`, `fcvtzs`, `cnt`, `str qN`, `stp qN, qM`, `str sN, [x, x]`. | Après le point 1, le JIT les exécute. Pour de bonnes performances : patcher Remill instruction par instruction, comme `adc`. Un jeu est très riche en flottants et vecteurs : la proportion réelle est inconnue. |
+| 3 | **RÉGLÉ le 2026-11-02 pour le code de Balatro (NEON compris : voir « NEON » en bas de page) ; restent le chiffrement AES/SHA/CRC/PMULL et les paires exclusives.** Trou de couverture FP/SIMD dans Remill. Sur un échantillon C modeste compilé par GCC : 6 fonctions sur 20 ne se liftent pas ; 7 instructions sur 290 (2 %). | Prouvé : `fmul vN.4s, vN.4s, v0.s[0]`, `fsqrt`, `fcvtzs`, `cnt`, `str qN`, `stp qN, qM`, `str sN, [x, x]`. | Après le point 1, le JIT les exécute. Pour de bonnes performances : patcher Remill instruction par instruction, comme `adc`. Un jeu est très riche en flottants et vecteurs : la proportion réelle est inconnue. |
 | 4 | **RÉGLÉ le 2026-11-02 (voir bas de page).** ~~Exclusifs octet et demi-mot non décodés.~~ GCC (sans fonctions d'aide) émet `ldxrb`, `stxrb`, `ldaxrh`, `stlxrh`. | Prouvé (même test). | Même méthode que `stxr` (patch Remill) : variantes `B`/`H` de `LDXR`, `LDAXR`, `STXR`, `STLXR`, `LDAR`, `STLR`. |
 
 ## Gênants, pas bloquants
@@ -94,3 +94,26 @@ Ce qui a été fait (Remill patch 0004, `remill-patches/`, et `aot_runtime.cpp`)
 Ce qui reste du blocage 3, par ordre d'effet sur Balatro (nombre de fonctions) : NEON `fmul`/`fmla` par élément (455 / 214), `scvtf`/`ucvtf` vectoriels (289), `st2`/`st4`/`ld1`-`ld4` par voie, `mov v.d[1], v.d[0]` (244), `shl`/`ushll`/`ushr`/`ushl` (≈ 180 chacune), `uzp`/`zip`/`trn`, `xtn`, `dup` élément, `cmhi`/`cmhs`, `rev64`, `sqrdmulh`, `cnt`, `clz`, `fcvtn`/`fcvtl`, plus le `ccmn` en forme registre. Ce sont des centaines de formes (7 arrangements × variantes) ; elles restent au JIT, qui les exécute correctement (testé par les tests de T4 et les comparaisons réelles ci-dessus).
 
 Écarts connus (testés, figés) : le drapeau Inexact des conversions entier -> flottant (`scvtf`) et le Underflow de `fmadd` (contournement propre à Remill) diffèrent d'Unicorn ; les NaN (priorité entre deux NaN, charge utile) ne sont pas ceux d'ARM sauf le NaN par défaut.
+
+## NEON (2026-11-02) : vectoriel entier, flottant, accès aux structures
+
+Remill patch 0005 (`remill-patches/`). Même méthode que pour le scalaire : chaque instruction est assemblée avec `aarch64-linux-gnu-as`, liftée seule et comparée à Unicorn sur des registres vectoriels de valeurs limites et aléatoires (`test_aot_simd.py`).
+
+| Famille | Formes testées (égales à Unicorn) |
+|---|---|
+| Entier : décalages immédiats (`shl`, `ushr`, `sshr`, `usra`, `ssra`, `urshr`, `srshr`, `sli`, `sri`), élargissants (`ushll`, `sshll`, `shll`), rétrécissants (`xtn`, `shrn`, `rshrn`, `sqshrn`, `sqrshrn`), permutations (`uzp`, `zip`, `trn`), comparaisons et arithmétique saturante / demi-somme / arrondie (`ushl`, `sshl`, `cmhi`, `cmhs`, `sqadd`, `shadd`, `urhadd`, `mul`, `mla`, `sqrdmulh`, `sabd`, `saba`...), `rev`, `cnt`, `clz`, `neg`, `abs`, sommes par paires et sur tous les voies, `orn`, `bic`/`orr` immédiat, `tbl`, `dup`/`ins` d'élément, multiplications et additions élargies (`smull`, `umlal`, `saddw`...) | 530 |
+| Flottant vectoriel (2S, 4S, 2D) : `fadd`, `fsub`, `fmul`, `fdiv`, `fmin`/`fmax` (et `nm`), `fabd`, `fmla`/`fmls` (et par élément), comparaisons (aussi avec zéro), `fneg`, `fabs`, `fsqrt`, `frint*`, `scvtf`/`ucvtf`/`fcvtz*` (aussi virgule fixe), `fcvtn`/`fcvtl`, `fmov` immédiat | 154 |
+| `ld1`-`ld4` / `st1`-`st4` : plusieurs structures, une voie, avec et sans post-incrément (immédiat ou registre), et `ld1r`-`ld4r` ; tous les arrangements | 534 |
+| Formes scalaires SIMD, formes par élément entières (`mul`, `mla`, `sqdmulh`, `smull`...), `smsubl`, `umsubl`, `ldursb`/`ldursh` vers X | 89 |
+
+Mesuré sur Balatro (`census` : toutes les instructions distinctes des quatre modules, 7 256 380 mots) :
+
+| | Début de la session | Après les flottants scalaires | **Après le NEON** |
+|---|---|---|---|
+| Instructions non liftées | 66 047 (0,91 %) | 39 811 (0,55 %) | **1 720 (0,02 %), 153 classes** |
+| Fonctions de `subsdk0` liftables entièrement (1 500 au hasard) | 88,6 % | 97,4 % | **99,8 % (3 sur 1 500)** |
+| Fonctions réelles sans appel comparées à Unicorn (registres vectoriels aléatoires) | | 197 identiques sur 1 802 cas | **227 identiques sur 2 009 cas, 0 différence, aucune non liftable** |
+
+Ce qui reste (1 720 instructions, 14 fonctions environ pour chacune) : `aese`/`aesmc`/`aesimc` (AES), `sha1*`/`sha256*`, `pmull`, `crc32*`, les paires exclusives `ldxp`/`stxp`/`ldaxp`/`stlxp` (16-18 fonctions), `mrs ctr_el0`, `udf`, `sqxtn`/`uqxtn`, `frecps`/`frecpe`/`frsqrts`, `cas*`/`swp*` (atomiques ARMv8.1, présents dans la bibliothèque d'outline atomics) et quelques formes scalaires. Elles restent au JIT, qui les exécute.
+
+Écarts connus et figés par un test : le drapeau Inexact d'un `scvtf`, d'un `fdiv` et d'un `fmul`/`fmla` par élément diffèrent d'Unicorn dans quelques cas (4 formes sur 678) ; le drapeau de saturation QC des instructions entières est identique partout.

@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 18:59:33 +0100
+Subject: [PATCH] aot: NEON coverage (blocker 3 closed for Balatro); the tests
+ lift and compare 1,300 vector forms
+
+test_aot_simd compares 530 integer NEON forms, 154 floating-point vector forms, 534 structure loads and stores
+and 89 scalar SIMD / by-element forms with Unicorn, over random and edge-value vector registers. Aot builds
+text-mode subprocess output tolerantly. module_validate census shows 0.91% -> 0.02% of Balatro's
+instructions unlifted, 88.6% -> 99.8% of sampled functions liftable. The Remill patch is
+fork en cours/remill-patches/0005.
+
+Upstream-Status: pending
+Reason: NEON coverage of the AArch64 -> x86_64 recompilation (NX2Linux); no game data in the tests
+Issue: none yet (NX2Linux, branch feat/teo-t7-module-reel)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/aot_lift.py                 | 14 ++--
+ dm/tools/tests/test_aot_realistic.py |  7 +-
+ dm/tools/tests/test_aot_simd.py      | 95 +++++++++++++++++++++++++++-
+ 3 files changed, 104 insertions(+), 12 deletions(-)
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index 6794440..6982f73 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -47,7 +47,7 @@ def include_dir():
+ def table_obj(table, base, d, n):
+     """The generated address table compiled on its own (the JIT build links objects, not sources)"""
+     obj = os.path.join(d, f'table{n}.o')
+-    r = subprocess.run(['clang++', '-c', '-std=c++17', *base, table, '-o', obj], capture_output=True, text=True)
++    r = subprocess.run(['clang++', '-c', '-std=c++17', *base, table, '-o', obj], capture_output=True, text=True, errors='replace')
+     if r.returncode: raise LinkError('build of the address table failed:\n' + r.stderr[-2000:])
+     return obj
+ 
+@@ -60,7 +60,7 @@ def fixed_obj(src, std, base, dyn):
+     """The runtime and the JIT do not depend on the functions: compiled once per process"""
+     if (src, std) not in _objs:
+         obj = os.path.join(_objs_dir.name, f'{Path(src).stem}.o')
+-        r = subprocess.run(['clang++', '-c', f'-std={std}', *base, f'-I{dyn}/src', f'-I{dyn}/externals/mcl/include', f'-I{dyn}/externals/fmt/include', f'-I{dyn}/build/src', str(HERE / src), '-o', obj], capture_output=True, text=True)
++        r = subprocess.run(['clang++', '-c', f'-std={std}', *base, f'-I{dyn}/src', f'-I{dyn}/externals/mcl/include', f'-I{dyn}/externals/fmt/include', f'-I{dyn}/build/src', str(HERE / src), '-o', obj], capture_output=True, text=True, errors='replace')
+         if r.returncode: raise LinkError(f'build of {src} failed:\n' + r.stderr[-2000:])
+         _objs[src, std] = obj
+     return _objs[src, std]
+@@ -81,7 +81,7 @@ MAX_LIFT_BYTES = 60000   # remill-lift takes the code as one hex argument, and L
+ def _run_lift(code, address, ll, entry=None):
+     if len(code) > MAX_LIFT_BYTES:
+         raise LiftError(f'function {address:#x}: {len(code)} bytes are more than the {MAX_LIFT_BYTES} remill-lift accepts on its command line (one hex argument, 128 KiB at most)')
+-    subprocess.run([lifter(), '--arch', 'aarch64', '--address', hex(address), *(['--entry_address', hex(entry)] if entry is not None else []), '--bytes', code.hex(), '--ir_out', ll], check=True, capture_output=True, text=True)
++    subprocess.run([lifter(), '--arch', 'aarch64', '--address', hex(address), *(['--entry_address', hex(entry)] if entry is not None else []), '--bytes', code.hex(), '--ir_out', ll], check=True, capture_output=True, text=True, errors='replace')
+     return '@__remill_error' in Path(ll).read_text()
+ 
+ 
+@@ -113,7 +113,7 @@ def toolchain_key():
+     global _toolkey
+     if _toolkey is None:
+         st = os.stat(lifter())
+-        cv = subprocess.run(['clang++', '--version'], capture_output=True, text=True).stdout
++        cv = subprocess.run(['clang++', '--version'], capture_output=True, text=True, errors='replace').stdout
+         _toolkey = hashlib.sha256(f'{lifter()}|{st.st_size}|{st.st_mtime_ns}|{cv}|O2 fPIC|{MAX_LIFT_BYTES}|{include_dir()}'.encode()).hexdigest()
+     return _toolkey
+ 
+@@ -128,7 +128,7 @@ def _atomic(path, data):
+ 
+ def undefined_symbols(obj):
+     """The undefined symbols of an object file (nm -u)"""
+-    out = subprocess.run(['nm', '-u', obj], capture_output=True, text=True).stdout
++    out = subprocess.run(['nm', '-u', obj], capture_output=True, text=True, errors='replace').stdout
+     return sorted({l.split()[-1] for l in out.splitlines() if l.strip()})
+ 
+ 
+@@ -178,7 +178,7 @@ class Aot:
+             try: lift_function(code, origin, ll, addr if addr != origin else None); return addr, ll, None
+             except LiftError as e: return addr, ll, e
+         def compile_ll(ll, obj):
+-            r = subprocess.run(['clang++', '-c', '-O2', '-fPIC', '-Wno-override-module', ll, '-o', obj], capture_output=True, text=True)
++            r = subprocess.run(['clang++', '-c', '-O2', '-fPIC', '-Wno-override-module', ll, '-o', obj], capture_output=True, text=True, errors='replace')
+             if r.returncode: raise LinkError(f'build of {ll} failed:\n' + r.stderr[-1500:])
+         if cache:
+             def cached_item(item):   # -> (addr, object path, None) or (addr, None, reason); lifts and compiles only what the cache lacks
+@@ -239,7 +239,7 @@ class Aot:
+                 cmd = ['clang++', '-shared', *fixed, table_obj(table, base, d, n), table_obj(stubs, base, d, f'{n}s'), *objs.values(), '-o', so, '-Wl,--start-group', *libs, '-Wl,--end-group', '-lpthread', '-Wl,--no-undefined']
+             else:
+                 cmd = ['clang++', '-shared', '-std=c++17', *base, str(HERE / 'aot_runtime.cpp'), table, stubs, *objs.values(), '-o', so, '-Wl,--no-undefined']
+-            r = subprocess.run(cmd, capture_output=True, text=True)
++            r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
+             if not r.returncode: break
+             missing = missing_symbols(r.stderr)
+             if stub_unliftable:
+diff --git a/dm/tools/tests/test_aot_realistic.py b/dm/tools/tests/test_aot_realistic.py
+index af0e054..c51feb8 100644
+--- a/dm/tools/tests/test_aot_realistic.py
++++ b/dm/tools/tests/test_aot_realistic.py
+@@ -18,9 +18,9 @@ GCC = shutil.which('aarch64-linux-gnu-gcc')
+ BASE, RODATA = 0x10000, 0x12000
+ GLOBALS = {0x2F000: bytes(0x2000)}   # the sample's .bss (g_lock, g_counter, g_flag at 0x2ffe8..0x30000), mapped for the AOT code and the reference alike
+ MEM_ALL = {**MEM, **GLOBALS}
+-NAMES = ('sw', 'sw2', 'hash', 'sort', 'strlen_', 'mul128', 'cmpf', 'lock', 'unlock', 'inc', 'cas', 'inc8', 'cas16', 'objcopy', 'conv', 'vadd')
+-LIFTS_NOT = {'scale', 'bits'}           # whole functions Remill cannot lift (vector multiply by element, cnt): the byte and halfword exclusives, the Q stores and the scalar conversions lift since patch 0004
+-INSNS_NOT = {'fmul', 'cnt'}   # the mnemonics behind them: a vector multiply by element and a population count
++NAMES = ('sw', 'sw2', 'hash', 'sort', 'strlen_', 'mul128', 'cmpf', 'lock', 'unlock', 'inc', 'cas', 'inc8', 'cas16', 'objcopy', 'conv', 'vadd', 'bits', 'scale')
++LIFTS_NOT = set()   # every function of the sample lifts since the vector instructions (patch 0069): the vector multiply by element, cnt, the Q stores and the scalar conversions
++INSNS_NOT = set()   # and so does every instruction
+ 
+ 
+ def build(tmp):
+@@ -97,6 +97,7 @@ class Realistic(unittest.TestCase):
+         self.compare(a, 'cmpf', [{'x0': DATA + o, 'x1': DATA + o + 8} for o in (0, 4, 40)])
+         self.compare(a, 'cas', [{'x0': DATA + 32, 'x1': e, 'x2': 9} for e in (0, 5)])
+         self.compare(a, 'inc', [{}])
++        self.compare(a, 'bits', [{'x0': x} for x in (1, 0x80, 0xF0F0, 0xFFFFFFFF, 0x12345678)])   # clz, ctz, popcount (cnt) and bswap
+         self.compare(a, 'inc8', [{'x0': DATA + o} for o in (40, 41, 255)])
+         self.compare(a, 'cas16', [{'x0': DATA + 34, 'x1': e, 'x2': 9} for e in (0, 0x2321, 0x2322)])   # 16-bit exclusives
+         self.compare(a, 'objcopy', [{'x0': DATA + 0x100, 'x1': DATA + o} for o in (0x20, 0x31)])        # copies a struct with Q stores/loads
+diff --git a/dm/tools/tests/test_aot_simd.py b/dm/tools/tests/test_aot_simd.py
+index 02a9b1f..f18ef18 100644
+--- a/dm/tools/tests/test_aot_simd.py
++++ b/dm/tools/tests/test_aot_simd.py
+@@ -50,7 +50,7 @@ def assemble(lines, tmp):
+     src = Path(tmp) / 'insns.s'
+     src.write_text('.text\n' + ''.join(f'.balign {STEP}\n' + l.replace(';', '\n') + '\nret\n' for l in lines))
+     obj, binf = Path(tmp) / 'insns.o', Path(tmp) / 'insns.bin'
+-    r = subprocess.run([AS, '-march=armv8.2-a+fp16+crypto', str(src), '-o', str(obj)], capture_output=True, text=True)
++    r = subprocess.run([AS, '-march=armv8.2-a+fp16+crypto', str(src), '-o', str(obj)], capture_output=True, text=True, errors='replace')
+     if r.returncode: raise RuntimeError(r.stderr)
+     subprocess.run([OBJCOPY, '-O', 'binary', '-j', '.text', str(obj), str(binf)], check=True)
+     data = binf.read_bytes().ljust(STEP * len(lines), b'\0')
+@@ -80,7 +80,7 @@ class Harness:
+     def close(self): self.aot.close()
+ 
+     def inputs(self, rng, n, nan_free=True):
+-        pool = POOL_NO_NAN if nan_free else POOL64
++        pool = POOL_NO_NAN if nan_free else POOL64 + [rng.getrandbits(64) for _ in range(24)] + [rng.getrandbits(8) * 0x0101010101010101 for _ in range(4)] + [rng.getrandbits(16) | rng.getrandbits(16) << 32 for _ in range(4)]   # integer instructions: plenty of random bit patterns too
+         out = []
+         for _ in range(n):
+             v = {f'v{i}': rng.choice(pool) | rng.choice(pool) << 64 for i in range(32)}
+@@ -162,6 +162,77 @@ EXCL = (   # batch 3: byte and halfword exclusives, release stores, CLREX, DSB,
+     ['clrex', 'clrex #5', 'dsb sy', 'dsb ish', 'dmb ish', 'isb', 'prfm pldl1keep, [x0]', 'prfm pstl2strm, [x0, #8]', 'prfm pldl3keep, [x0, x1]', 'prfum pldl1keep, [x0, #-3]', 'nop'])
+ 
+ 
++A_BHS = ['8b', '16b', '4h', '8h', '2s', '4s']; A_ALL = A_BHS + ['2d']; A_HS = ['4h', '8h', '2s', '4s']; A_B = ['8b', '16b']
++def three(op, arrs, regs='v0, v1, v2'): return [f'{op} v0.{a}, v1.{a}, v2.{a}' for a in arrs]
++NEON_INT = (   # batch 4: integer NEON (the instructions Balatro uses most: shifts, permutes, compares, saturating and halving arithmetic, moves between elements, tables, widening)
++    sum([three(op, A_ALL) for op in ('ushl', 'sshl', 'urshl', 'srshl', 'cmhi', 'cmhs', 'sqadd', 'uqadd', 'sqsub', 'uqsub')], []) +
++    sum([three(op, A_BHS) for op in ('shadd', 'uhadd', 'srhadd', 'urhadd', 'shsub', 'uhsub', 'mul', 'mla', 'mls', 'sabd', 'uabd', 'saba', 'uaba')], []) +
++    sum([three(op, A_HS) for op in ('sqdmulh', 'sqrdmulh')], []) + three('orn', A_B) +
++    [f'{op} v0.{a}, v1.{a}' for op in ('neg', 'abs') for a in A_ALL] + [f'cnt v0.{a}, v1.{a}' for a in A_B] + [f'{op} v0.{a}, v1.{a}' for op in ('clz', 'cls') for a in A_BHS] +
++    [f'rev64 v0.{a}, v1.{a}' for a in A_BHS] + [f'rev32 v0.{a}, v1.{a}' for a in ('8b', '16b', '4h', '8h')] + [f'rev16 v0.{a}, v1.{a}' for a in A_B] +
++    [f'{op} v0.{d}, v1.{s}' for op in ('uaddlp', 'saddlp', 'uadalp', 'sadalp') for d, s in (('4h', '8b'), ('8h', '16b'), ('2s', '4h'), ('4s', '8h'), ('1d', '2s'), ('2d', '4s'))] +
++    [f'{op} {d}0, v1.{s}' for op in ('uaddlv', 'saddlv') for d, s in (('h', '8b'), ('h', '16b'), ('s', '4h'), ('s', '8h'), ('d', '4s'))] +
++    [f'xtn v0.{d}, v1.{s}' for d, s in (('8b', '8h'), ('4h', '4s'), ('2s', '2d'))] + [f'xtn2 v0.{d}, v1.{s}' for d, s in (('16b', '8h'), ('8h', '4s'), ('4s', '2d'))] +
++    [f'{op} v0.{d}, v1.{s}, #{k}' for op in ('shrn', 'rshrn', 'sqshrn', 'sqrshrn') for d, s, k in (('8b', '8h', 3), ('4h', '4s', 9), ('2s', '2d', 17))] +
++    [f'{op}2 v0.{d}, v1.{s}, #{k}' for op in ('shrn', 'rshrn', 'sqshrn', 'sqrshrn') for d, s, k in (('16b', '8h', 5), ('8h', '4s', 16), ('4s', '2d', 32))] +
++    [f'shl v0.{a}, v1.{a}, #{k}' for a, k in (('8b', 3), ('16b', 7), ('4h', 5), ('8h', 15), ('2s', 1), ('4s', 31), ('2d', 63), ('4s', 0))] +
++    [f'{op} v0.{a}, v1.{a}, #{k}' for op in ('ushr', 'sshr', 'usra', 'ssra', 'urshr', 'srshr', 'ursra', 'srsra', 'sri') for a, k in (('8b', 3), ('16b', 8), ('4h', 5), ('8h', 16), ('2s', 1), ('4s', 32), ('2d', 64), ('4s', 7))] +
++    [f'sli v0.{a}, v1.{a}, #{k}' for a, k in (('8b', 3), ('16b', 7), ('4h', 5), ('8h', 15), ('2s', 1), ('4s', 31), ('2d', 63))] +
++    [f'{op} v0.{d}, v1.{s}, #{k}' for op in ('ushll', 'sshll') for d, s, k in (('8h', '8b', 3), ('4s', '4h', 0), ('2d', '2s', 17))] + [f'{op}2 v0.{d}, v1.{s}, #{k}' for op in ('ushll', 'sshll') for d, s, k in (('8h', '16b', 7), ('4s', '8h', 1), ('2d', '4s', 31))] +
++    [f'shll v0.{d}, v1.{s}, #{k}' for d, s, k in (('8h', '8b', 8), ('4s', '4h', 16), ('2d', '2s', 32))] + [f'shll2 v0.{d}, v1.{s}, #{k}' for d, s, k in (('8h', '16b', 8), ('4s', '8h', 16), ('2d', '4s', 32))] +
++    sum([three(op, A_ALL) for op in ('uzp1', 'uzp2', 'zip1', 'zip2', 'trn1', 'trn2')], []) +
++    ['dup v0.4s, v1.s[2]', 'dup v0.2d, v1.d[1]', 'dup v0.8b, v1.b[5]', 'dup v0.16b, v1.b[15]', 'dup v0.4h, v1.h[3]', 'dup v0.8h, v1.h[0]', 'dup v0.2s, v1.s[1]',
++     'mov v0.d[1], v1.d[0]', 'mov v0.s[2], v1.s[3]', 'ins v0.b[3], v1.b[9]', 'mov v0.h[1], v3.h[5]', 'mov v0.d[0], v1.d[1]'] +
++    ['bic v0.4h, #0xff, lsl #8', 'bic v0.8h, #0x12', 'bic v0.2s, #0x3, lsl #16', 'bic v0.4s, #0xf, lsl #24', 'orr v0.4h, #0xff', 'orr v0.8h, #0x12, lsl #8', 'orr v0.2s, #0x3, lsl #16', 'orr v0.4s, #0x90, lsl #24'] +
++    ['tbl v0.16b, {v1.16b}, v2.16b', 'tbl v0.8b, {v1.16b}, v2.8b', 'tbl v0.8b, {v1.16b, v2.16b}, v3.8b', 'tbl v0.16b, {v30.16b, v31.16b, v0.16b}, v2.16b', 'tbl v5.16b, {v6.16b, v7.16b, v8.16b, v9.16b}, v2.16b'] +
++    [f'{op} v0.{d}, v1.{s}, v2.{s}' for op in ('smull', 'umull', 'smlal', 'umlal', 'smlsl', 'umlsl', 'saddl', 'uaddl', 'ssubl', 'usubl', 'sabdl', 'uabdl') for d, s in (('8h', '8b'), ('4s', '4h'), ('2d', '2s'))] +
++    [f'{op}2 v0.{d}, v1.{s}, v2.{s}' for op in ('smull', 'umull', 'smlal', 'umlal', 'smlsl', 'umlsl', 'saddl', 'uaddl', 'ssubl', 'usubl', 'sabdl', 'uabdl') for d, s in (('8h', '16b'), ('4s', '8h'), ('2d', '4s'))] +
++    [f'{op} v0.{d}, v1.{d}, v2.{s}' for op in ('saddw', 'uaddw', 'ssubw', 'usubw') for d, s in (('8h', '8b'), ('4s', '4h'), ('2d', '2s'))] + [f'{op}2 v0.{d}, v1.{d}, v2.{s}' for op in ('saddw', 'uaddw', 'ssubw', 'usubw') for d, s in (('8h', '16b'), ('4s', '8h'), ('2d', '4s'))])
++
++
++F3 = ['2s', '4s', '2d']
++NEON_FP = (   # batch 5: floating-point vectors
++    sum([three(op, F3) for op in ('fadd', 'fsub', 'fmul', 'fdiv', 'fmax', 'fmin', 'fmaxnm', 'fminnm', 'fabd', 'fcmeq', 'fcmge', 'fcmgt', 'facge', 'facgt', 'fmla', 'fmls')], []) +
++    [f'{op} v0.{a}, v1.{a}, #0.0' for op in ('fcmeq', 'fcmge', 'fcmgt', 'fcmle', 'fcmlt') for a in F3] +
++    [f'{op} v0.{a}, v1.{a}' for op in ('fneg', 'fabs', 'fsqrt', 'frintn', 'frinta', 'frintm', 'frintp', 'frintz', 'frintx', 'frinti', 'scvtf', 'ucvtf', 'fcvtzs', 'fcvtzu') for a in F3] +
++    ['scvtf v0.4s, v1.4s, #7', 'ucvtf v0.2d, v1.2d, #20', 'scvtf v0.2s, v1.2s, #1', 'fcvtzs v0.4s, v1.4s, #3', 'fcvtzu v0.2d, v1.2d, #60', 'fcvtzs v0.2s, v1.2s, #32', 'fcvtzu v0.4s, v1.4s, #12'] +
++    ['fcvtn v0.2s, v1.2d', 'fcvtn2 v0.4s, v1.2d', 'fcvtl v0.2d, v1.2s', 'fcvtl2 v0.2d, v1.4s'] +
++    [f'{op} v0.{a}, v1.{a}, v2.{e}[{i}]' for op in ('fmul', 'fmla', 'fmls') for a, e, i in (('4s', 's', 3), ('2s', 's', 1), ('2d', 'd', 1), ('4s', 's', 0), ('2d', 'd', 0))] +
++    [f'{op} {a}0, {a}1, v2.{a}[{i}]' for op in ('fmul', 'fmla', 'fmls') for a, i in (('s', 2), ('d', 1), ('s', 0), ('d', 0))] +
++    ['fabd s0, s1, s2', 'fabd d0, d1, d2', 'fcvtzs s0, s1', 'fcvtzs d0, d1', 'fcvtzu s0, s1', 'fcvtzu d0, d1'] +
++    ['fmov v0.4s, #1.0', 'fmov v0.2s, #-2.5', 'fmov v0.2d, #0.5', 'fmov v0.4s, #31.0', 'fmov v0.2d, #-0.125'])
++
++
++def _regs(first, n, a): return ', '.join(f'v{(first + i) % 32}.{a}' for i in range(n))
++_POST = [('', ''), (', #{b}', ''), (', x1', '')]
++def _memlines():
++    out = []
++    for op in ('ld', 'st'):
++        for n in (1, 2, 3, 4):
++            for a, regb in (('8b', 8), ('16b', 16), ('4h', 8), ('8h', 16), ('2s', 8), ('4s', 16), ('2d', 16), ('1d', 8)):
++                if n > 1 and a == '1d': continue
++                for post in ('', f', #{regb * n}', ', x1'):
++                    out.append(f'{op}{n} {{{_regs(30 if n == 4 else 3, n, a)}}}, [x0]{post}')
++        for n in (1, 2, 3, 4):
++            for e, a, sz in (('b', 'b', 1), ('h', 'h', 2), ('s', 's', 4), ('d', 'd', 8)):
++                for idx in {'b': (0, 5, 15), 'h': (0, 3, 7), 's': (0, 2, 3), 'd': (0, 1)}[e]:
++                    for post in ('', f', #{sz * n}', ', x1'):
++                        out.append(f'{op}{n} {{{_regs(5, n, e).replace("." + e, "." + e)}}}[{idx}], [x0]{post}'.replace('{' + _regs(5, n, e) + '}[', '{' + _regs(5, n, e) + '}['))
++    for n in (1, 2, 3, 4):
++        for a, sz in (('8b', 1), ('16b', 1), ('4h', 2), ('8h', 2), ('2s', 4), ('4s', 4), ('1d', 8), ('2d', 8)):
++            for post in ('', f', #{sz * n}', ', x1'): out.append(f'ld{n}r {{{_regs(29, n, a)}}}, [x0]{post}')
++    return out
++STRUCT = _memlines()
++NEON_MORE = (   # batch 6b: scalar SIMD forms, by-element integer forms, and a few integer instructions found in real code
++    ['add d0, d1, d2', 'cmeq d0, d1, d2', 'sqadd b0, b1, b2', 'sqadd h0, h1, h2', 'sqadd s0, s1, s2', 'sqadd d0, d1, d2', 'sqsub b0, b1, b2', 'sqsub s0, s1, s2', 'sqsub d0, d1, d2',
++     'mov s8, v5.s[1]', 'mov d0, v1.d[1]', 'mov b3, v2.b[7]', 'mov h1, v4.h[2]', 'dup s0, v1.s[3]'] +
++    [f'{op} v0.{a}, v1.{a}, v2.{e}[{i}]' for op in ('mul', 'mla', 'mls', 'sqdmulh', 'sqrdmulh') for a, e, i in (('4h', 'h', 3), ('8h', 'h', 7), ('2s', 's', 1), ('4s', 's', 3), ('8h', 'h', 0), ('4s', 's', 0)) if not (op != 'mul' and False)] +
++    ['sqdmulh h0, h1, v2.h[2]', 'sqrdmulh s0, s1, v2.s[1]', 'sqdmulh s0, s1, v2.s[3]'] +
++    [f'{op} v0.{d}, v1.{s}, v2.{e}[{i}]' for op in ('smull', 'umull', 'smlal', 'umlal', 'smlsl', 'umlsl') for d, s, e, i in (('4s', '4h', 'h', 5), ('2d', '2s', 's', 3), ('4s', '4h', 'h', 0), ('2d', '2s', 's', 0))] +
++    [f'{op}2 v0.{d}, v1.{s}, v2.{e}[{i}]' for op in ('smull', 'umull', 'smlal', 'umlal', 'smlsl', 'umlsl') for d, s, e, i in (('4s', '8h', 'h', 1), ('2d', '4s', 's', 2))] +
++    ['smsubl x0, w1, w2, x3', 'umsubl x0, w1, w2, x3', 'ldursb x0, [x2, #-3]', 'ldursh x0, [x2, #-30]', 'ldursb x0, [x2]', 'ldursh x0, [x2, #7]'])
++
++
+ @unittest.skipUnless(AS and OBJCOPY and READY, 'needs aarch64-linux-gnu-as, REMILL_BUILD, clang++ and unicorn')
+ class Batch(unittest.TestCase):
+     @classmethod
+@@ -201,6 +272,26 @@ class Batch(unittest.TestCase):
+             if h.compare(i, h.inputs(rng, 24))[2]: differ.add(line.split()[0])
+         self.assertLessEqual(differ, {'scvtf', 'fmadd'}, sorted(differ))
+ 
++    def test_neon_integer_batch(self): self.check('neon_int', NEON_INT, cases=64, nan_free=False)
++
++    def test_neon_floating_point_batch(self): self.check('neon_fp', NEON_FP, cases=32)
++
++    def test_the_exception_flags_of_the_neon_batches_agree_except_the_known_ones(self):
++        """The saturation flag QC of the integer instructions equals Unicorn's on every form; the floating-point lane operations differ in their flags for a few (the inexact flag of a conversion or a division,
++        the host's underflow rules): frozen here, a new one is a regression"""
++        h = Harness(NEON_FP + NEON_INT, self.tmp.name); self.groups['neon_fpsr'] = h
++        rng = random.Random('fp')
++        differ = set()
++        for i, line in enumerate(h.lines):
++            if line in h.unlifted: continue
++            if h.compare(i, h.inputs(rng, 32, line not in NEON_INT))[2]: differ.add(line)
++        self.assertLessEqual({l.split()[0] for l in differ}, {'fdiv', 'scvtf', 'fmul', 'fmla'}, sorted(differ))
++        self.assertEqual({l for l in differ if l in NEON_INT}, set())
++
++    def test_structure_loads_and_stores(self): self.check('struct', STRUCT, cases=12, nan_free=False)
++
++    def test_scalar_simd_and_element_forms(self): self.check('more', NEON_MORE, cases=40, nan_free=False)
++
+     def test_exclusives_batch(self): self.check('excl', EXCL, nan_free=False)
+ 
+ 
