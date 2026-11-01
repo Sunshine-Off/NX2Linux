@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 14:07:38 +0100
+Subject: [PATCH] tests: adc and adcs join the instructions checked against the
+ Unicorn reference
+
+Remill had no semantics or decoder for them; the fork's patch to Remill (not part of this repository)
+adds both, and the four forms (32 and 64 bits) now match Unicorn on 81 pairs of edge values x 16 NZCV
+states. ccmn in its register form stays a LiftError.
+
+Upstream-Status: pending
+Reason: instruction-level tests of the AArch64 -> x86_64 recompilation (NX2Linux); tests only; needs Remill with the ADC/ADCS patch to run, skipped otherwise
+Issue: none yet (NX2Linux, branch feat/teo-recompilation-arm64)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/tests/test_recompile_insn.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/dm/tools/tests/test_recompile_insn.py b/dm/tools/tests/test_recompile_insn.py
+index 75df04a..62c0187 100644
+--- a/dm/tools/tests/test_recompile_insn.py
++++ b/dm/tools/tests/test_recompile_insn.py
+@@ -21,6 +21,7 @@ INSNS = [  # (word, expected disassembly)
+     (rrr(0xAB000000), 'adds x2, x0, x1'), (rrr(0x2B000000), 'adds w2, w0, w1'), (rrr(0xEB000000), 'subs x2, x0, x1'), (rrr(0x6B000000), 'subs w2, w0, w1'),
+     (rrr(0xEB00001F, 31), 'cmp x0, x1'), (rrr(0x6B00001F, 31), 'cmp w0, w1'), (rrr(0xAB00001F, 31), 'cmn x0, x1'), (rrr(0x2B00001F, 31), 'cmn w0, w1'),
+     (rrr(0xDA000000), 'sbc x2, x0, x1'), (rrr(0x5A000000), 'sbc w2, w0, w1'), (rrr(0xFA000000), 'sbcs x2, x0, x1'), (rrr(0x7A000000), 'sbcs w2, w0, w1'),
++    (rrr(0x9A000000), 'adc x2, x0, x1'), (rrr(0x1A000000), 'adc w2, w0, w1'), (rrr(0xBA000000), 'adcs x2, x0, x1'), (rrr(0x3A000000), 'adcs w2, w0, w1'),
+     (rrr(0xEA000000), 'ands x2, x0, x1'), (rrr(0x6A000000), 'ands w2, w0, w1'), (rrr(0xEA00001F, 31), 'tst x0, x1'),
+     (0xEB0003E2, 'negs x2, x0'), (0x6B0003E2, 'negs w2, w0'),
+     (ccmp(0xFA400000, 'eq', 5), 'ccmp x0, x1, #5, eq'), (ccmp(0x7A400000, 'lt', 2), 'ccmp w0, w1, #2, lt'),
+@@ -29,9 +30,9 @@ INSNS = [  # (word, expected disassembly)
+     (csel(0x9A800000, 'lt'), 'csel x2, x0, x1, lt'), (csel(0x1A800000, 'ge'), 'csel w2, w0, w1, ge'), (csel(0x9A800400, 'hi'), 'csinc x2, x0, x1, hi'),
+ ]
+ 
+-# Remill (the pinned build, commit 56918a8) has no semantics for these: its lifted code calls __remill_error. The translator must stop on them, naming the instruction (LiftError), never run what it did not translate
+-UNSUPPORTED = [(rrr(0x9A000000), 'adc x2, x0, x1'), (rrr(0x1A000000), 'adc w2, w0, w1'), (rrr(0xBA000000), 'adcs x2, x0, x1'), (rrr(0x3A000000), 'adcs w2, w0, w1'),
+-               (ccmp(0xBA400000, 'hi', 0), 'ccmn x0, x1, #0, hi'), (ccmp(0x3A400000, 'vs', 15), 'ccmn w0, w1, #0xf, vs')]
++# Remill (commit 56918a8) has no semantics for these: its lifted code calls __remill_error. The translator must stop on them, naming the instruction (LiftError), never run what it did not translate.
++# adc and adcs were here too until the fork's Remill patch (fork en cours/remill-patches/0001-aarch64-add-adc-adcs.patch) gave Remill their semantics and decoders
++UNSUPPORTED = [(ccmp(0xBA400000, 'hi', 0), 'ccmn x0, x1, #0, hi'), (ccmp(0x3A400000, 'vs', 15), 'ccmn w0, w1, #0xf, vs')]
+ 
+ 
+ class LiftError(Exception):

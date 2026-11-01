@@ -30,13 +30,14 @@ Le code propre à NX2Linux est seulement l'hôte (`remill_host.cpp`) : l'état i
 ## Ce que T2 ne prouve pas (honnêteté)
 
 - Un seul bloc sans branche, sans mémoire. T3 doit traiter branches, mémoire, appels.
-- Les intrinsèques de flags et de comparaison (`__remill_flag_computation_*`, `__remill_compare_*`) sont des « marqueurs » qui renvoient leur premier argument. Vérifié (test_recompile_insn.py) sur 26 instructions en 32 et 64 bits : `adds`, `subs`, `cmp`, `cmn`, `sbc`, `sbcs`, `ands`, `tst`, `negs`, `ccmp` (registre et immédiat), `ccmn` (immédiat), `csel`, `csinc` — chacune sur 81 couples de valeurs limites × 16 états NZCV d'entrée, identique à Unicorn.
-- **Lacune de Remill (commit 56918a8) trouvée par ces tests** : aucune sémantique pour `adc` et `adcs` (32 et 64 bits), ni pour `ccmn` en forme registre. Le code lifté appelle alors `__remill_error`. Le test `test_unsupported_instruction_is_an_explicit_error` vérifie que l'outil s'arrête avec une `LiftError` (adresse, mot, raison). Pour la suite, deux voies : ajouter ces sémantiques à Remill (petit patch, à proposer en amont, licence Apache-2.0) ou faire passer ces instructions par le JIT de secours (T4). À décider avec Téo.
+- Les intrinsèques de flags et de comparaison (`__remill_flag_computation_*`, `__remill_compare_*`) sont des « marqueurs » qui renvoient leur premier argument. Vérifié (test_recompile_insn.py) sur 30 instructions en 32 et 64 bits : `adds`, `subs`, `cmp`, `cmn`, `adc`, `adcs`, `sbc`, `sbcs`, `ands`, `tst`, `negs`, `ccmp` (registre et immédiat), `ccmn` (immédiat), `csel`, `csinc` — chacune sur 81 couples de valeurs limites × 16 états NZCV d'entrée, identique à Unicorn.
+- **Lacunes de Remill (commit 56918a8) trouvées par ces tests** : aucune sémantique ni décodeur pour `adc` et `adcs` (32 et 64 bits), ni sémantique pour `ccmn` en forme registre. Le code lifté appelle alors `__remill_error` ; `lift()` lève une `LiftError` (adresse, mot, raison) et `test_unsupported_instruction_is_an_explicit_error` fige les mots concernés.
+- **`adc`/`adcs` corrigés** (choix de Téo : patcher Remill) par [remill-patches/0001-aarch64-add-adc-adcs.patch](remill-patches/0001-aarch64-add-adc-adcs.patch) : il fallait deux endroits, les sémantiques (`Semantics/BINARY.cpp`) et le décodeur (`Arch.cpp`, en retirant les stubs `return false` de `Decode.cpp`). Les quatre formes passent le test contre Unicorn. Le patch s'applique sur le commit 56918a8 de Remill (`git am`) ; il reste à le proposer à lifting-bits/remill. `ccmn` en forme registre reste une `LiftError`.
 - Performance non mesurée (état en mémoire, pas de registres allouées entre blocs).
 - Dynarmic (JIT, T4) non évalué : à faire au début de T4.
 - Licence de Remill : Apache-2.0 d'après le dépôt (à re-vérifier avant toute distribution).
 
 ## Reproduire
 
-Remill est compilé hors du dépôt (voir le README de Remill, section « Linux with system LLVM ») ; puis
+Remill est compilé hors du dépôt (voir le README de Remill, section « Linux with system LLVM »), après `git am` du patch ci-dessus ; puis
 `REMILL_BUILD=<dossier build de Remill> python3 -m unittest test_recompile_arith` dans `engine/dm/tools/tests`. Sans Remill ou Unicorn, le test est ignoré (skip).
