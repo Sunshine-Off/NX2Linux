@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 21:38:30 +0100
+Subject: [PATCH] aot: EXT, CRC32 and YIELD found by Balatro's main, caught by
+ tests (Remill patch 0006)
+
+module_validate diff on 150 leaf functions of a retail game's main found one function (a vector RNG) that differed from Unicorn: Remill's EXT indexed its result backwards. Tests now lift ext, crc32/crc32c (B, H, W, X) and yield next to Unicorn; the full module lifts 8065 of 8099 functions, and 400 sampled leaf functions equal Unicorn over 1,558 cases. The 34 left are trap words (udf and an unallocated word) and two functions over remill-lift's 60,000-byte limit, run by the JIT. module_validate prints the differing values. aot_lift links through a response file: a whole library has more objects than the kernel's argument limit.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: AArch64 -> x86_64 recompilation (NX2Linux S7): EXT, CRC32 and YIELD lifted correctly, found on a real module; tests use synthetic one-instruction functions, no game data
+Issue: none yet (NX2Linux, branch swann/jalon-s7-first-game)
+
+---
+ dm/tools/aot_lift.py            | 4 +++-
+ dm/tools/module_validate.py     | 2 +-
+ dm/tools/tests/test_aot_simd.py | 2 ++
+ 3 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index 6982f73..371ac8d 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -239,7 +239,9 @@ class Aot:
+                 cmd = ['clang++', '-shared', *fixed, table_obj(table, base, d, n), table_obj(stubs, base, d, f'{n}s'), *objs.values(), '-o', so, '-Wl,--start-group', *libs, '-Wl,--end-group', '-lpthread', '-Wl,--no-undefined']
+             else:
+                 cmd = ['clang++', '-shared', '-std=c++17', *base, str(HERE / 'aot_runtime.cpp'), table, stubs, *objs.values(), '-o', so, '-Wl,--no-undefined']
+-            r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
++            rsp = os.path.join(d, f'link{n}.rsp')   # a whole library has tens of thousands of objects: more than the kernel's argument limit, so clang reads them from a response file
++            Path(rsp).write_text('\n'.join(json.dumps(a) for a in cmd[1:]))
++            r = subprocess.run([cmd[0], f'@{rsp}'], capture_output=True, text=True, errors='replace')
+             if not r.returncode: break
+             missing = missing_symbols(r.stderr)
+             if stub_unliftable:
+diff --git a/dm/tools/module_validate.py b/dm/tools/module_validate.py
+index 5963b8f..c28722a 100644
+--- a/dm/tools/module_validate.py
++++ b/dm/tools/module_validate.py
+@@ -218,7 +218,7 @@ def worker(a):
+             diff = [k for k in want if got[k] != want[k]]
+             for b, size in ((mod.base + rw, mod.size - rw), (SCRATCH, SCRATCH_SIZE), (STACK, STACK_SIZE)):
+                 if bytes(uc.mem_read(b, size)) != got['mem'][b]: diff.append(f'memory@{b:#x}')
+-            if diff: counts['MISMATCH'] += 1; r['detail'] = f'inputs {inp} nzcv {nz:04b}: differs in {diff[:6]}'
++            if diff: counts['MISMATCH'] += 1; r['detail'] = f'inputs {inp} nzcv {nz:04b}: differs in {diff[:6]}; ' + ', '.join(f'{k} aot {got[k]:#x} unicorn {want[k]:#x}' for k in diff[:6] if k in want)
+             else: counts['equal'] += 1
+             r['cases'] += 1
+         counts['table-jumps'] = aot.stat('indirect_jumps') - j0; counts['jit-or-error-requests'] = aot.stat('fallback_requests') - f0   # indirect jumps taken (the tables') and those no AOT entry took
+diff --git a/dm/tools/tests/test_aot_simd.py b/dm/tools/tests/test_aot_simd.py
+index f18ef18..9866b5f 100644
+--- a/dm/tools/tests/test_aot_simd.py
++++ b/dm/tools/tests/test_aot_simd.py
+@@ -181,6 +181,8 @@ NEON_INT = (   # batch 4: integer NEON (the instructions Balatro uses most: shif
+     [f'{op} v0.{d}, v1.{s}, #{k}' for op in ('ushll', 'sshll') for d, s, k in (('8h', '8b', 3), ('4s', '4h', 0), ('2d', '2s', 17))] + [f'{op}2 v0.{d}, v1.{s}, #{k}' for op in ('ushll', 'sshll') for d, s, k in (('8h', '16b', 7), ('4s', '8h', 1), ('2d', '4s', 31))] +
+     [f'shll v0.{d}, v1.{s}, #{k}' for d, s, k in (('8h', '8b', 8), ('4s', '4h', 16), ('2d', '2s', 32))] + [f'shll2 v0.{d}, v1.{s}, #{k}' for d, s, k in (('8h', '16b', 8), ('4s', '8h', 16), ('2d', '4s', 32))] +
+     sum([three(op, A_ALL) for op in ('uzp1', 'uzp2', 'zip1', 'zip2', 'trn1', 'trn2')], []) +
++    [f'{op} w0, w1, {r}2' for op in ('crc32b', 'crc32h', 'crc32w', 'crc32cb', 'crc32ch', 'crc32cw') for r in ('w',)] + [f'{op} w0, w1, x2' for op in ('crc32x', 'crc32cx')] + ['crc32w w3, w3, w3', 'yield'] +   # the checksum instructions of a real library, and the hint
++    [f'ext v0.16b, v1.16b, v2.16b, #{k}' for k in (0, 1, 7, 8, 15)] + [f'ext v0.8b, v1.8b, v2.8b, #{k}' for k in (0, 3, 7)] + ['ext v3.16b, v2.16b, v2.16b, #8', 'ext v1.16b, v1.16b, v2.16b, #5', 'ext v2.8b, v1.8b, v2.8b, #4'] +   # a real RNG swaps the halves of a register with ext v,v,v,#8
+     ['dup v0.4s, v1.s[2]', 'dup v0.2d, v1.d[1]', 'dup v0.8b, v1.b[5]', 'dup v0.16b, v1.b[15]', 'dup v0.4h, v1.h[3]', 'dup v0.8h, v1.h[0]', 'dup v0.2s, v1.s[1]',
+      'mov v0.d[1], v1.d[0]', 'mov v0.s[2], v1.s[3]', 'ins v0.b[3], v1.b[9]', 'mov v0.h[1], v3.h[5]', 'mov v0.d[0], v1.d[1]'] +
+     ['bic v0.4h, #0xff, lsl #8', 'bic v0.8h, #0x12', 'bic v0.2s, #0x3, lsl #16', 'bic v0.4s, #0xf, lsl #24', 'orr v0.4h, #0xff', 'orr v0.8h, #0x12, lsl #8', 'orr v0.2s, #0x3, lsl #16', 'orr v0.4s, #0x90, lsl #24'] +

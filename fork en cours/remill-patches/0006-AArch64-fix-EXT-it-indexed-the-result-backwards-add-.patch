@@ -1,0 +1,258 @@
+From adb47835b04c0aab91df884b57dbe5a863cd3fa2 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 21:38:11 +0100
+Subject: [PATCH] AArch64: fix EXT (it indexed the result backwards), add
+ CRC32/CRC32C and YIELD
+
+EXT swapped bytes inside each half of the result: a real RNG's ext v,v,v,#8 returned the wrong value (found on Balatro's main by module_validate, 1 function of 150).
+CRC32{B,H,W,X} and CRC32C{B,H,W,X} are straight-line code (remill-lift does not finish on a loop in a semantic); YIELD is a hint, like NOP.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ lib/Arch/AArch64/Arch.cpp              | 48 ++++++++++++++++++++++++++
+ lib/Arch/AArch64/Decode.cpp            | 27 ---------------
+ lib/Arch/AArch64/Semantics/BITBYTE.cpp | 46 ++++++++++++++++++++++++
+ lib/Arch/AArch64/Semantics/MISC.cpp    |  1 +
+ lib/Arch/AArch64/Semantics/SIMD.cpp    |  9 +++--
+ 5 files changed, 99 insertions(+), 32 deletions(-)
+
+diff --git a/lib/Arch/AArch64/Arch.cpp b/lib/Arch/AArch64/Arch.cpp
+index 14ddb06..771e3f5 100644
+--- a/lib/Arch/AArch64/Arch.cpp
++++ b/lib/Arch/AArch64/Arch.cpp
+@@ -2724,6 +2724,54 @@ bool TryDecodeISB_BI_SYSTEM(const InstData &, Instruction &) {
+   return true;
+ }
+ 
++// CRC32B  <Wd>, <Wn>, <Wm>
++bool TryDecodeCRC32B_32C_DP_2SRC(const InstData &data, Instruction &inst) {
++  return TryDecodeLSLV_32_DP_2SRC(data, inst);
++}
++
++// CRC32H  <Wd>, <Wn>, <Wm>
++bool TryDecodeCRC32H_32C_DP_2SRC(const InstData &data, Instruction &inst) {
++  return TryDecodeLSLV_32_DP_2SRC(data, inst);
++}
++
++// CRC32W  <Wd>, <Wn>, <Wm>
++bool TryDecodeCRC32W_32C_DP_2SRC(const InstData &data, Instruction &inst) {
++  return TryDecodeLSLV_32_DP_2SRC(data, inst);
++}
++
++// CRC32X  <Wd>, <Wn>, <Xm>: the accumulator is 32 bits, the data 64
++bool TryDecodeCRC32X_64C_DP_2SRC(const InstData &data, Instruction &inst) {
++  AddRegOperand(inst, kActionWrite, kRegW, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, kRegW, kUseAsValue, data.Rn);
++  AddRegOperand(inst, kActionRead, kRegX, kUseAsValue, data.Rm);
++  return true;
++}
++
++// CRC32CB  <Wd>, <Wn>, <Wm>
++bool TryDecodeCRC32CB_32C_DP_2SRC(const InstData &data, Instruction &inst) {
++  return TryDecodeLSLV_32_DP_2SRC(data, inst);
++}
++
++// CRC32CH  <Wd>, <Wn>, <Wm>
++bool TryDecodeCRC32CH_32C_DP_2SRC(const InstData &data, Instruction &inst) {
++  return TryDecodeLSLV_32_DP_2SRC(data, inst);
++}
++
++// CRC32CW  <Wd>, <Wn>, <Wm>
++bool TryDecodeCRC32CW_32C_DP_2SRC(const InstData &data, Instruction &inst) {
++  return TryDecodeLSLV_32_DP_2SRC(data, inst);
++}
++
++// CRC32CX  <Wd>, <Wn>, <Xm>
++bool TryDecodeCRC32CX_64C_DP_2SRC(const InstData &data, Instruction &inst) {
++  return TryDecodeCRC32X_64C_DP_2SRC(data, inst);
++}
++
++// YIELD: a hint with no architectural effect on a single thread
++bool TryDecodeYIELD_HI_SYSTEM(const InstData &data, Instruction &inst) {
++  return TryDecodeNOP_HI_SYSTEM(data, inst);
++}
++
+ // UCVTF  <Hd>, <Wn>
+ bool TryDecodeUCVTF_H32_FLOAT2INT(const InstData &data, Instruction &inst) {
+   AddRegOperand(inst, kActionWrite, kRegH, kUseAsValue, data.Rd);
+diff --git a/lib/Arch/AArch64/Decode.cpp b/lib/Arch/AArch64/Decode.cpp
+index 77ee3c0..07beec7 100644
+--- a/lib/Arch/AArch64/Decode.cpp
++++ b/lib/Arch/AArch64/Decode.cpp
+@@ -3518,9 +3518,6 @@ bool TryDecodeSQDMULH_ASISDSAME_ONLY(const InstData &, Instruction &) {
+ //  30 1
+ //  31 1
+ // YIELD
+-bool TryDecodeYIELD_HI_SYSTEM(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // UBFM UXTH_UBFM_32M_bitfield:
+ //   0 x Rd       0
+@@ -14123,9 +14120,6 @@ bool TryDecodeSTCLRL_64S_MEMOP(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 0 sf       0
+ // CRC32CB  <Wd>, <Wn>, <Wm>
+-bool TryDecodeCRC32CB_32C_DP_2SRC(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // CRC32CH CRC32CH_32C_dp_2src:
+ //   0 x Rd       0
+@@ -14161,9 +14155,6 @@ bool TryDecodeCRC32CB_32C_DP_2SRC(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 0 sf       0
+ // CRC32CH  <Wd>, <Wn>, <Wm>
+-bool TryDecodeCRC32CH_32C_DP_2SRC(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // CRC32CW CRC32CW_32C_dp_2src:
+ //   0 x Rd       0
+@@ -14199,9 +14190,6 @@ bool TryDecodeCRC32CH_32C_DP_2SRC(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 0 sf       0
+ // CRC32CW  <Wd>, <Wn>, <Wm>
+-bool TryDecodeCRC32CW_32C_DP_2SRC(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // CRC32CX CRC32CX_64C_dp_2src:
+ //   0 x Rd       0
+@@ -14237,9 +14225,6 @@ bool TryDecodeCRC32CW_32C_DP_2SRC(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 1 sf       0
+ // CRC32CX  <Wd>, <Wn>, <Xm>
+-bool TryDecodeCRC32CX_64C_DP_2SRC(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // UADDLP UADDLP_asimdmisc_P:
+ //   0 x Rd       0
+@@ -33142,9 +33127,6 @@ bool TryDecodeLDSMINLB_32_MEMOP(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 0 sf       0
+ // CRC32B  <Wd>, <Wn>, <Wm>
+-bool TryDecodeCRC32B_32C_DP_2SRC(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // CRC32H CRC32H_32C_dp_2src:
+ //   0 x Rd       0
+@@ -33180,9 +33162,6 @@ bool TryDecodeCRC32B_32C_DP_2SRC(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 0 sf       0
+ // CRC32H  <Wd>, <Wn>, <Wm>
+-bool TryDecodeCRC32H_32C_DP_2SRC(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // CRC32W CRC32W_32C_dp_2src:
+ //   0 x Rd       0
+@@ -33218,9 +33197,6 @@ bool TryDecodeCRC32H_32C_DP_2SRC(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 0 sf       0
+ // CRC32W  <Wd>, <Wn>, <Wm>
+-bool TryDecodeCRC32W_32C_DP_2SRC(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // CRC32X CRC32X_64C_dp_2src:
+ //   0 x Rd       0
+@@ -33256,9 +33232,6 @@ bool TryDecodeCRC32W_32C_DP_2SRC(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 1 sf       0
+ // CRC32X  <Wd>, <Wn>, <Xm>
+-bool TryDecodeCRC32X_64C_DP_2SRC(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // URSHR URSHR_asisdshf_R:
+ //   0 x Rd       0
+diff --git a/lib/Arch/AArch64/Semantics/BITBYTE.cpp b/lib/Arch/AArch64/Semantics/BITBYTE.cpp
+index b0c80ae..15f29d1 100644
+--- a/lib/Arch/AArch64/Semantics/BITBYTE.cpp
++++ b/lib/Arch/AArch64/Semantics/BITBYTE.cpp
+@@ -189,3 +189,49 @@ DEF_ISEL(REV_64_DP_1SRC) = REV64;
+ 
+ DEF_ISEL(RBIT_32_DP_1SRC) = RBIT32;
+ DEF_ISEL(RBIT_64_DP_1SRC) = RBIT64;
++
++namespace {
++
++// CRC32 and CRC32C: the accumulator xor the data, shifted out one bit at a time, least significant first (reflected
++// polynomials 0xEDB88320 and 0x82F63B78). Straight-line code, no loop: remill-lift does not finish on a loop here
++template <uint32_t poly>
++ALWAYS_INLINE static uint32_t CrcStep(uint32_t c) {
++  return (c >> 1) ^ (poly & (0u - (c & 1u)));
++}
++template <uint32_t poly>
++ALWAYS_INLINE static uint32_t CrcByte(uint32_t c, uint64_t b) {
++  c ^= static_cast<uint32_t>(b & 0xFF);
++  c = CrcStep<poly>(c); c = CrcStep<poly>(c); c = CrcStep<poly>(c); c = CrcStep<poly>(c);
++  c = CrcStep<poly>(c); c = CrcStep<poly>(c); c = CrcStep<poly>(c); c = CrcStep<poly>(c);
++  return c;
++}
++// bytes = 1, 2, 4 or 8 of data, low byte first
++template <uint32_t poly, int bytes>
++ALWAYS_INLINE static uint32_t CrcData(uint32_t c, uint64_t d) {
++  c = CrcByte<poly>(c, d);
++  if (bytes > 1) c = CrcByte<poly>(c, d >> 8);
++  if (bytes > 2) { c = CrcByte<poly>(c, d >> 16); c = CrcByte<poly>(c, d >> 24); }
++  if (bytes > 4) {
++    c = CrcByte<poly>(c, d >> 32); c = CrcByte<poly>(c, d >> 40);
++    c = CrcByte<poly>(c, d >> 48); c = CrcByte<poly>(c, d >> 56);
++  }
++  return c;
++}
++
++template <typename S, uint32_t poly, int bytes>
++DEF_SEM(CRC32, R32W dst, R32 acc, S data) {
++  uint32_t crc = CrcData<poly, bytes>(Read(acc), static_cast<uint64_t>(Read(data)));   // WriteZExt is a macro: no comma inside its argument
++  WriteZExt(dst, crc);
++  return memory;
++}
++
++}  // namespace
++
++DEF_ISEL(CRC32B_32C_DP_2SRC) = CRC32<R32, 0xEDB88320u, 1>;
++DEF_ISEL(CRC32H_32C_DP_2SRC) = CRC32<R32, 0xEDB88320u, 2>;
++DEF_ISEL(CRC32W_32C_DP_2SRC) = CRC32<R32, 0xEDB88320u, 4>;
++DEF_ISEL(CRC32X_64C_DP_2SRC) = CRC32<R64, 0xEDB88320u, 8>;
++DEF_ISEL(CRC32CB_32C_DP_2SRC) = CRC32<R32, 0x82F63B78u, 1>;
++DEF_ISEL(CRC32CH_32C_DP_2SRC) = CRC32<R32, 0x82F63B78u, 2>;
++DEF_ISEL(CRC32CW_32C_DP_2SRC) = CRC32<R32, 0x82F63B78u, 4>;
++DEF_ISEL(CRC32CX_64C_DP_2SRC) = CRC32<R64, 0x82F63B78u, 8>;
+diff --git a/lib/Arch/AArch64/Semantics/MISC.cpp b/lib/Arch/AArch64/Semantics/MISC.cpp
+index 187252b..587cead 100644
+--- a/lib/Arch/AArch64/Semantics/MISC.cpp
++++ b/lib/Arch/AArch64/Semantics/MISC.cpp
+@@ -27,3 +27,4 @@ DEF_ISEL(HINT_1) = DoNOP;
+ DEF_ISEL(HINT_2) = DoNOP;
+ DEF_ISEL(HINT_3) = DoNOP;
+ DEF_ISEL(NOP_HI_SYSTEM) = DoNOP;
++DEF_ISEL(YIELD_HI_SYSTEM) = DoNOP;
+diff --git a/lib/Arch/AArch64/Semantics/SIMD.cpp b/lib/Arch/AArch64/Semantics/SIMD.cpp
+index bfae8be..73404f4 100644
+--- a/lib/Arch/AArch64/Semantics/SIMD.cpp
++++ b/lib/Arch/AArch64/Semantics/SIMD.cpp
+@@ -845,12 +845,11 @@ DEF_SEM(EXT, V128W dst, T src1, T src2, I32 src3) {
+   auto lsb = Read(src3);
+   auto vn = UReadV8(src1);
+   auto vm = UReadV8(src2);
++  // Vd = (Vm:Vn) >> (8 * lsb), Vn the low bytes: byte k is Vn[k + lsb], or Vm[k + lsb - count] past the end (the former
++  // code indexed the result backwards and swapped bytes inside each half)
+   uint8v16_t result = {};
+-  _Pragma("unroll") for (size_t i = 0, max_i = count; i + lsb < max_i; ++i) {
+-    result.elems[count - 1 - i] = UExtractV8(vm, i + lsb);
+-  }
+-  _Pragma("unroll") for (size_t i = lsb; i < count; ++i) {
+-    result.elems[count - 1 - i] = UExtractV8(vn, i - lsb);
++  _Pragma("unroll") for (size_t k = 0; k < count; ++k) {
++    result.elems[k] = (k + lsb < count) ? UExtractV8(vn, k + lsb) : UExtractV8(vm, k + lsb - count);
+   }
+   UWriteV8(dst, result);
+   return memory;
+-- 
+2.56.0
+
