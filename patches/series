@@ -40,3 +40,4 @@
 0059-aot-lift-ahead-of-time-recompilation-of-aarch64.patch
 0060-tests-aot-runtime-atomics-and-barriers-ldxr-stxr.patch
 0061-aot-jit-dynarmic-as-the-jit-fallback-of-the-aot.patch
+0062-aot-real-gcc-output-as-a-test-scalar-float-memor.patch
