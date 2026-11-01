@@ -1,0 +1,297 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 14:55:03 +0100
+Subject: [PATCH] aot: real GCC output as a test, scalar float memory
+ intrinsics, a linker-message reader that handles French
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+test_aot_realistic.py compiles realistic_sample.c (own C) with aarch64-linux-gnu-gcc and compares the AOT
+and AOT+JIT results with Unicorn: loops, memory, byte loads, 128-bit multiplies, float comparisons and
+32/64-bit exclusive loops are identical. It pins what does not work yet: a jump table is an explicit error
+in AOT-only and one JIT entry per dispatch with the JIT; six of twenty functions (vector and scalar FP
+Remill cannot lift, byte and halfword exclusives) and the nine mnemonics behind them are listed.
+The runtime gets __remill_read/write_memory_f32/f64 (found missing by compiled code). aot_lift.missing_symbols
+reads the linker's complaint in English and French (the « name » of the French one has a space inside).
+
+Upstream-Status: pending
+Reason: tests and fixes of the AArch64 -> x86_64 recompilation (NX2Linux); nothing in the host, loader or shader chain changes
+Issue: none yet (NX2Linux, branch feat/teo-t4-jit-secours)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/aot_lift.py                 |   7 +-
+ dm/tools/aot_runtime.cpp             |   1 +
+ dm/tools/tests/realistic_sample.c    |  51 +++++++++++++
+ dm/tools/tests/test_aot_lift_unit.py |  20 +++++
+ dm/tools/tests/test_aot_memory.py    |  20 +++++
+ dm/tools/tests/test_aot_realistic.py | 109 +++++++++++++++++++++++++++
+ 6 files changed, 207 insertions(+), 1 deletion(-)
+ create mode 100644 dm/tools/tests/realistic_sample.c
+ create mode 100644 dm/tools/tests/test_aot_lift_unit.py
+ create mode 100644 dm/tools/tests/test_aot_realistic.py
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index cb8f148..f05b067 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -14,6 +14,11 @@ RET = 0xD65F03C0
+ STATS = ('indirect_calls', 'indirect_jumps', 'fallback_requests', 'reads', 'writes', 'regions', 'jit_entries', 'jit_to_aot', 'jit_invalidations', 'jit_pages')
+ 
+ 
++def missing_symbols(linker_stderr):
++    """The symbols a failed link reports as undefined, in the linker's English or French wording (« name » has a space inside the quotes)"""
++    return sorted(set(re.findall(r'(?:undefined reference to|référence indéfinie vers)[\s«`\'"]*([A-Za-z_0-9]+)', linker_stderr)))
++
++
+ class LiftError(Exception):
+     pass
+ 
+@@ -125,7 +130,7 @@ class Aot:
+             cmd = ['clang++', '-shared', '-std=c++17', *base, str(HERE / 'aot_runtime.cpp'), table, *lls, '-o', so, '-Wl,--no-undefined']
+         r = subprocess.run(cmd, capture_output=True, text=True)
+         if r.returncode:
+-            missing = sorted(set(re.findall(r'(?:undefined reference to|référence indéfinie vers) [«`\'"]*([A-Za-z_0-9]+)', r.stderr)))
++            missing = missing_symbols(r.stderr)
+             if missing: raise LinkError('the runtime does not define: ' + ', '.join(missing) + ' (an instruction class not translated yet)')
+             raise LinkError('build failed:\n' + r.stderr[-2000:])
+         self.lib = ctypes.CDLL(so)
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index fb6abfa..53e4a6f 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -79,6 +79,7 @@ COMPARE(eq) COMPARE(neq) COMPARE(slt) COMPARE(sle) COMPARE(sgt) COMPARE(sge) COM
+     T __remill_read_memory_##N(Memory *, uint64_t a) { T v; memcpy(&v, guest(a, sizeof(T), "read"), sizeof v); count(S_READS); return v; } \
+     Memory *__remill_write_memory_##N(Memory *m, uint64_t a, T v) { memcpy(guest(a, sizeof(T), "write"), &v, sizeof v); count(S_WRITES); if (aot_write_hook) aot_write_hook(a, sizeof(T)); return m; }
+ ACCESS(8, uint8_t) ACCESS(16, uint16_t) ACCESS(32, uint32_t) ACCESS(64, uint64_t)
++ACCESS(f32, float) ACCESS(f64, double)   // scalar floating-point loads and stores (ldr s0, str d0...)
+ 
+ // Atomics. An exclusive store (stxr, stlxr) is a compare-and-swap against the value the exclusive load read (the Remill patch keeps it in MONITOR_VALUE), so it fails when another thread wrote
+ // the location in between. The access must be naturally aligned, as the hardware requires of an exclusive access: otherwise an explicit error.
+diff --git a/dm/tools/tests/realistic_sample.c b/dm/tools/tests/realistic_sample.c
+new file mode 100644
+index 0000000..6385ff4
+--- /dev/null
++++ b/dm/tools/tests/realistic_sample.c
+@@ -0,0 +1,51 @@
++#include <stdint.h>
++#include <stddef.h>
++typedef struct { float x, y, z, w; } v4;
++typedef struct { int id; double mass; struct { int a, b; } p; char name[24]; } Obj;
++static int g_lock; static uint64_t g_counter; static volatile int g_flag;
++int sw(int x, int y) { switch (x) { case 0: return y + 1; case 1: return y * 3; case 2: return y ^ 0x55; case 3: return y - 9; case 4: return y << 3; case 5: return y >> 2; case 6: return -y; default: return y; } }
++float dot(const v4 *a, const v4 *b) { return a->x*b->x + a->y*b->y + a->z*b->z + a->w*b->w; }
++void scale(v4 *v, float s, int n) { for (int i = 0; i < n; i++) { v[i].x *= s; v[i].y *= s; v[i].z *= s; v[i].w *= s; } }
++double norm(const double *p, int n) { double s = 0; for (int i = 0; i < n; i++) s += p[i]*p[i]; return s; }
++void vadd(float *restrict a, const float *restrict b, const float *restrict c, int n) { for (int i = 0; i < n; i++) a[i] = b[i] + c[i] * 2.0f; }
++int cmpf(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
++void sort(int *a, int n) { for (int i = 1; i < n; i++) { int k = a[i], j = i - 1; while (j >= 0 && a[j] > k) { a[j+1] = a[j]; j--; } a[j+1] = k; } }
++uint64_t mul128(uint64_t a, uint64_t b, uint64_t *hi) { __uint128_t r = (__uint128_t)a * b; *hi = r >> 64; return (uint64_t)r; }
++void lock(void) { while (__atomic_exchange_n(&g_lock, 1, __ATOMIC_ACQUIRE)) while (__atomic_load_n(&g_lock, __ATOMIC_RELAXED)) ; }
++void unlock(void) { __atomic_store_n(&g_lock, 0, __ATOMIC_RELEASE); }
++uint64_t inc(void) { return __atomic_fetch_add(&g_counter, 1, __ATOMIC_SEQ_CST); }
++int cas(int *p, int e, int n) { return __atomic_compare_exchange_n(p, &e, n, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
++uint8_t inc8(uint8_t *p) { return __atomic_fetch_add(p, 1, __ATOMIC_RELAXED); }
++uint16_t cas16(uint16_t *p, uint16_t e, uint16_t n) { __atomic_compare_exchange_n(p, &e, n, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); return e; }
++void objcopy(Obj *d, const Obj *s) { *d = *s; }
++int strlen_(const char *s) { int n = 0; while (s[n]) n++; return n; }
++uint32_t hash(const uint8_t *p, size_t n) { uint32_t h = 2166136261u; for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u; return h; }
++int64_t conv(double d, float f) { return (int64_t)d + (int64_t)f + (int)(d > f ? 1 : 0); }
++uint32_t bits(uint32_t x) { return __builtin_clz(x) + __builtin_ctz(x) + __builtin_popcount(x) + __builtin_bswap32(x); }
++int callback(int (*f)(int), int x) { return f(x) + f(x + 1); }
++
++int sw2(int x, int y) {
++  switch (x) {
++    case 0: return y * 3 + 0;
++    case 1: return y * 4 + 4;
++    case 2: return y * 5 + 8;
++    case 3: return y * 6 + 1;
++    case 4: return y * 7 + 5;
++    case 5: return y * 8 + 9;
++    case 6: return y * 9 + 2;
++    case 7: return y * 10 + 6;
++    case 8: return y * 11 + 10;
++    case 9: return y * 12 + 3;
++    case 10: return y * 13 + 7;
++    case 11: return y * 14 + 0;
++    case 12: return y * 15 + 4;
++    case 13: return y * 16 + 8;
++    case 14: return y * 17 + 1;
++    case 15: return y * 18 + 5;
++    case 16: return y * 19 + 9;
++    case 17: return y * 20 + 2;
++    case 18: return y * 21 + 6;
++    case 19: return y * 22 + 10;
++    default: return -1;
++  }
++}
+diff --git a/dm/tools/tests/test_aot_lift_unit.py b/dm/tools/tests/test_aot_lift_unit.py
+new file mode 100644
+index 0000000..ac5f1a7
+--- /dev/null
++++ b/dm/tools/tests/test_aot_lift_unit.py
+@@ -0,0 +1,20 @@
++"""aot_lift.py without Remill: the way it reads a linker's complaint about missing symbols (the English and the French wording; the French one has a space inside « »)."""
++import sys, unittest
++from pathlib import Path
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import aot_lift
++
++
++class MissingSymbols(unittest.TestCase):
++    def test_english(self):
++        self.assertEqual(aot_lift.missing_symbols("x.o: in function `f':\nundefined reference to `__remill_read_memory_f32'\nundefined reference to `__remill_error'"), ['__remill_error', '__remill_read_memory_f32'])
++
++    def test_french(self):
++        self.assertEqual(aot_lift.missing_symbols("lifted_code:(.text+0x1a) : référence indéfinie vers « __remill_read_memory_f32 »\nlifted_code:(.text+0x4e) : référence indéfinie vers « __remill_read_memory_f32 »"), ['__remill_read_memory_f32'])
++
++    def test_nothing_missing(self):
++        self.assertEqual(aot_lift.missing_symbols("warning: overriding the module target triple"), [])
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/dm/tools/tests/test_aot_memory.py b/dm/tools/tests/test_aot_memory.py
+index 041feec..92c8b57 100644
+--- a/dm/tools/tests/test_aot_memory.py
++++ b/dm/tools/tests/test_aot_memory.py
+@@ -102,3 +102,23 @@ class Memory(unittest.TestCase):
+ 
+ if __name__ == '__main__':
+     unittest.main()
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD (a Remill build folder), clang++ and unicorn')
++class FloatMemory(unittest.TestCase):
++    def test_scalar_float_loads_and_stores_equal_the_reference(self):
++        """ldr s0 / str s0 and ldr d0 / str d0 copy 4 and 8 bytes through a vector register: the runtime's f32 and f64 intrinsics (missing at first, found by compiled code)"""
++        import capstone
++        md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
++        for ld, st, text in ((0xBD400000, 0xBD000800, ('ldr s0, [x0]', 'str s0, [x0, #8]')), (0xFD400000, 0xFD000800, ('ldr d0, [x0]', 'str d0, [x0, #0x10]'))):
++            for w, want in zip((ld, st), text):
++                i = next(md.disasm(struct.pack('<I', w), ADDR)); self.assertEqual(f'{i.mnemonic} {i.op_str}'.strip(), want)
++            code = struct.pack('<3I', ld, st, RET)
++            aot = aot_lift.Aot([(ADDR, code)])
++            try:
++                for b, data in MEM.items(): aot.map(b, len(data), data)
++                for addr in (DATA + 0x40, DATA + 0x43):
++                    regs = {'x0': addr}
++                    want = ref.run_image(bytes(ADDR) + code, ADDR, [(regs, 0, SP)], MEM)[0]
++                    aot.reset(); same(self, aot.run(ADDR, dict(regs, x30=ref.STOP), 0, SP), want, f'{text[0]} at {addr:#x}')
++            finally: aot.close()
+diff --git a/dm/tools/tests/test_aot_realistic.py b/dm/tools/tests/test_aot_realistic.py
+new file mode 100644
+index 0000000..5efa5e8
+--- /dev/null
++++ b/dm/tools/tests/test_aot_realistic.py
+@@ -0,0 +1,109 @@
++"""Code a real compiler made (GCC for AArch64, from realistic_sample.c: my own C, no game data), lifted and run, against the Unicorn reference. It pins what works and, as important, what does not yet:
++  · loops, memory, byte loads, 128-bit multiplies, float comparisons and exclusive loops (32 and 64 bits) equal the reference;
++  · a switch compiled to a jump table fails in AOT-only (explicit error) and works through the JIT, one JIT entry per dispatch: the ratio the success criteria want limited;
++  · the instructions Remill cannot lift today (vector and some scalar FP, byte and halfword exclusives) are listed, so that a Remill change that fixes one shows up here.
++Needs aarch64-linux-gnu-gcc, REMILL_BUILD, DYNARMIC_DIR, clang++ and unicorn; skipped otherwise."""
++import os, shutil, struct, subprocess, sys, tempfile, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_ref as ref
++from test_aot_t3 import DATA, SP, MEM, same
++from test_aot_jit import READY as JIT_READY
++
++GCC = shutil.which('aarch64-linux-gnu-gcc')
++BASE, RODATA = 0x10000, 0x12000
++GLOBALS = {0x2F000: bytes(0x2000)}   # the sample's .bss (g_lock, g_counter, g_flag at 0x2ffe8..0x30000), mapped for the AOT code and the reference alike
++MEM_ALL = {**MEM, **GLOBALS}
++NAMES = ('sw', 'sw2', 'hash', 'sort', 'strlen_', 'mul128', 'cmpf', 'lock', 'unlock', 'inc', 'cas')
++LIFTS_NOT = {'scale', 'vadd', 'inc8', 'cas16', 'objcopy', 'conv', 'bits'}           # whole functions Remill cannot lift
++INSNS_NOT = {'fmul', 'str', 'stp', 'fcvtzs', 'cnt', 'ldxrb', 'stxrb', 'ldaxrh', 'stlxrh'}   # the mnemonics behind them
++
++
++def build(tmp):
++    elf = os.path.join(tmp, 'sample.elf'); flat = os.path.join(tmp, 'flat.bin')
++    subprocess.run([GCC, '-O2', '-ffreestanding', '-fno-stack-protector', '-fno-pic', '-march=armv8-a', '-mno-outline-atomics', '-nostdlib', '-static', f'-Wl,-Ttext={BASE:#x}',
++                    f'-Wl,--section-start=.rodata={RODATA:#x}', '-Wl,-e,sw', '-o', elf, str(HERE / 'realistic_sample.c')], check=True, capture_output=True)
++    subprocess.run([GCC.replace('gcc', 'objcopy'), '-O', 'binary', '--gap-fill=0', '-j', '.text', '-j', '.rodata', elf, flat], check=True)
++    nm = subprocess.run([GCC.replace('gcc', 'nm'), '-n', elf], check=True, capture_output=True, text=True).stdout.split('\n')
++    syms = sorted((int(l.split()[0], 16), l.split()[2]) for l in nm if len(l.split()) == 3 and l.split()[1] == 'T')
++    text_end = BASE + int(subprocess.run([GCC.replace('gcc', 'readelf'), '-S', '-W', elf], check=True, capture_output=True, text=True).stdout.split('.text')[1].split()[3], 16)   # the .text section's size
++    ends = [a for a, _ in syms[1:]] + [text_end]
++    return Path(flat).read_bytes(), {n: (a, e) for (a, n), e in zip(syms, ends)}, text_end
++
++
++@unittest.skipUnless(GCC and aot_lift.lifter(), 'needs aarch64-linux-gnu-gcc and REMILL_BUILD')
++class Realistic(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp = tempfile.TemporaryDirectory()
++        cls.flat, cls.fn, cls.text_end = build(cls.tmp.name)
++        cls.image = bytes(BASE) + cls.flat
++
++    @classmethod
++    def tearDownClass(cls): cls.tmp.cleanup()
++
++    def code(self, n): a, e = self.fn[n]; return a, self.flat[a - BASE:e - BASE]
++
++    def test_which_functions_and_instructions_lift(self):
++        import capstone
++        md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
++        no, ll = set(), os.path.join(self.tmp.name, 'f.ll')
++        for n in self.fn:
++            try: aot_lift.lift_function(self.code(n)[1], self.code(n)[0], ll)
++            except aot_lift.LiftError: no.add(n)
++        self.assertEqual(no, LIFTS_NOT, 'the set of functions Remill cannot lift changed: update LIFTS_NOT (a fix is good news)')
++        bad = set()
++        for off in range(0, self.text_end - BASE, 4):
++            w = struct.unpack_from('<I', self.flat, off)[0]
++            try: aot_lift.lift(w, ll, 0x1000)
++            except aot_lift.LiftError: bad.add(next(md.disasm(struct.pack('<I', w), 0)).mnemonic)
++        self.assertEqual(bad, INSNS_NOT)
++
++    def aot(self, jit):
++        a = aot_lift.Aot([self.code(n) for n in NAMES], jit=jit)
++        for b, d in MEM_ALL.items(): a.map(b, len(d), d)
++        a.map(BASE, 0x3000, self.flat.ljust(0x3000, b'\0'))
++        return a
++
++    def compare(self, a, name, cases, expect_errors=0):
++        want = ref.run_image(self.image, self.fn[name][0], [(r, 0, SP) for r in cases], MEM_ALL)
++        errors = 0
++        for r, w in zip(cases, want):
++            self.assertNotIn('fault', w)
++            a.reset(); got = a.run(self.fn[name][0], dict(r, x30=ref.STOP), 0, SP)
++            if 'fault' in got: errors += 1; self.assertIn('indirect jump', got['fault']); continue
++            same(self, got, w, f'{name}({r})')
++        self.assertEqual(errors, expect_errors, name)
++
++    def check_all(self, a, sw2_errors):
++        self.compare(a, 'sw2', [{'x0': x, 'x1': 7} for x in range(-1, 23)], sw2_errors)
++        self.compare(a, 'sw', [{'x0': x, 'x1': 5} for x in range(-1, 10)])
++        self.compare(a, 'hash', [{'x0': DATA + 3, 'x1': n} for n in (0, 1, 5, 100)])
++        self.compare(a, 'sort', [{'x0': DATA + 8, 'x1': n} for n in (0, 1, 2, 17)])
++        self.compare(a, 'strlen_', [{'x0': DATA + o} for o in (0, 1, 9)])
++        self.compare(a, 'mul128', [{'x0': x, 'x1': y, 'x2': DATA + 16} for x, y in ((3, 5), (2 ** 63, 2 ** 63), (2 ** 64 - 1, 2 ** 64 - 1))])
++        self.compare(a, 'cmpf', [{'x0': DATA + o, 'x1': DATA + o + 8} for o in (0, 4, 40)])
++        self.compare(a, 'cas', [{'x0': DATA + 32, 'x1': e, 'x2': 9} for e in (0, 5)])
++        self.compare(a, 'inc', [{}])
++
++    def test_aot_only_equals_the_reference_except_jump_tables(self):
++        a = self.aot(False)
++        try:
++            self.check_all(a, sw2_errors=20)   # 20 of the 24 inputs reach the table: an explicit error each, never a wrong answer
++            self.assertEqual(a.stat('fallback_requests'), 20)
++        finally: a.close()
++
++    @unittest.skipUnless(JIT_READY, 'needs DYNARMIC_DIR')
++    def test_with_the_jit_everything_equals_the_reference_but_every_switch_enters_the_jit(self):
++        a = self.aot(True)
++        try:
++            self.check_all(a, sw2_errors=0)
++            self.assertEqual(a.stat('jit_entries'), 20, 'one JIT entry per jump-table dispatch: jump tables must be resolved at translation time before real code runs')
++        finally: a.close()
++
++
++if __name__ == '__main__':
++    unittest.main()

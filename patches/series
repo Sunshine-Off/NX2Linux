@@ -33,3 +33,14 @@
 0051-nsp-shell-framework.patch
 0053-runtime-profile-every-site.patch
 0054-front-mac-start-with-the-pointer-hidden-when-the.patch
+0055-arm64-survey-a-read-only-survey-of-a-module-s-aa.patch
+0056-tests-arith-lifted-by-remill-and-compiled-to-x86.patch
+0057-tests-26-flag-instructions-lifted-by-remill-matc.patch
+0058-tests-adc-and-adcs-join-the-instructions-checked.patch
+0059-aot-lift-ahead-of-time-recompilation-of-aarch64.patch
+0060-tests-aot-runtime-atomics-and-barriers-ldxr-stxr.patch
+0061-aot-jit-dynarmic-as-the-jit-fallback-of-the-aot.patch
+0062-aot-real-gcc-output-as-a-test-scalar-float-memor.patch
+0063-aot-stub-for-functions-the-translator-cannot-lif.patch
+0064-aot-svc-reaches-the-horizon-service-handler-thre.patch
+0065-aot-elf-modules-and-a-manifest-instead-of-the-ma.patch

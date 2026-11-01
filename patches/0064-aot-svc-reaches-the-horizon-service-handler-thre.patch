@@ -1,0 +1,850 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 15:17:26 +0100
+Subject: [PATCH] aot: svc reaches the Horizon service handler, thread
+ pointers, services that map memory, cross-thread JIT invalidation (T5)
+
+svc lifts (Remill patch 0003 kept in the fork) and calls aot_svc_handler with the shape of svc_dispatch, from AOT
+code and from JIT code. tpidr_el0/tpidrro_el0 are per-run inputs. Guest regions can be added and removed while
+guest threads run. A write by any thread invalidates every Jit that compiled from the page; a tight JIT loop is
+sliced so that it sees the request. 14 tests against the Unicorn reference, including 8 concurrent host threads.
+
+Upstream-Status: pending
+Reason: svc, thread state and threading of the AArch64 -> x86_64 recompilation (NX2Linux); the host, loader and shader chain are untouched
+Issue: none yet (NX2Linux, branch feat/teo-t5-svc-etat-invite)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/aot_jit.cpp            | 104 ++++++++++++--
+ dm/tools/aot_lift.py            |  35 ++++-
+ dm/tools/aot_runtime.cpp        |  78 +++++++++--
+ dm/tools/aot_runtime.h          |   6 +-
+ dm/tools/tests/arm64_ref.py     |  26 +++-
+ dm/tools/tests/test_aot_jit.py  |   4 +-
+ dm/tools/tests/test_aot_stub.py |  14 +-
+ dm/tools/tests/test_aot_svc.py  | 234 ++++++++++++++++++++++++++++++++
+ dm/tools/tests/test_aot_t3.py   |  11 +-
+ 9 files changed, 456 insertions(+), 56 deletions(-)
+ create mode 100644 dm/tools/tests/test_aot_svc.py
+
+diff --git a/dm/tools/aot_jit.cpp b/dm/tools/aot_jit.cpp
+index 951f277..d0fcca2 100644
+--- a/dm/tools/aot_jit.cpp
++++ b/dm/tools/aot_jit.cpp
+@@ -6,7 +6,8 @@
+ //   · hands control back to the AOT code when the JIT'd code branches to an AOT function's entry (that entry is refused as code, which stops the run), then resumes at x30 when it returns;
+ //   · drops the code it compiled from a page when the guest writes to that page (AOT stores, JIT stores, aot_poke): generated code that changes is recompiled;
+ //   · counts and logs every entry and every transition, and stops with an explicit error on: an entry budget, a cycle budget, a nesting depth, no code at an address, an access outside guest memory,
+-//     an instruction dynarmic cannot translate, an exception, an `svc` (Horizon's services come in T5).
++//     an instruction dynarmic cannot translate, an exception. An `svc` goes to the same Horizon service handler as in AOT code (aot_svc_handler), with the registers in and out;
++//   · invalidates across threads: every Jit that compiled code from a page is told when ANY thread writes to it (or runs `ic ivau`/`ic ialluis`), halts, and recompiles (hypotheses.md H15).
+ // One Jit per host thread (dynarmic's Run is not reentrant); the exclusive monitor is shared by up to 64 of them. A callback never longjmps (dynarmic's state would be left mid-run): it records the
+ // fault, halts the Jit, and the error is raised once Run has returned.
+ #include "aot_runtime.h"
+@@ -23,6 +24,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <set>
++#include <vector>
+ 
+ using namespace Dynarmic;
+ 
+@@ -36,6 +38,15 @@ std::map<std::pair<uint64_t, const char *>, LogRow> g_log;   // (target, kind) -
+ uint64_t g_seq;
+ 
+ enum Stop { NONE, RETURN, TO_AOT, FAULT };
++constexpr uint64_t kSlice = 1 << 18;
++
++struct Cpu;
++// Which Jits compiled code from which 4 KiB page, so that a write by any thread reaches them all. g_filter counts the registered pages per hash bucket: a write to a page whose bucket is 0 (nearly every
++// write) costs one atomic load and takes no lock.
++std::mutex g_pages_mu;
++std::map<uint64_t, std::set<Cpu *>> g_owners;
++std::atomic<uint32_t> g_filter[4096];
++inline unsigned bucket(uint64_t pg) { return (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 52); }
+ 
+ struct Cpu final : A64::UserCallbacks {
+     std::unique_ptr<A64::Jit> jit;
+@@ -43,7 +54,10 @@ struct Cpu final : A64::UserCallbacks {
+     uint64_t tpidr = 0, tpidrro = 0, ticks_left = 0, stop_pc = 0, ret_addr = 0;   // ret_addr: where this run ends, the caller's x30
+     Stop stop = NONE;
+     char fault[300] = {0};
+-    std::set<uint64_t> code_pages;   // 4 KiB pages some compiled code was read from
++    std::set<uint64_t> code_pages;   // 4 KiB pages some compiled code was read from (this Cpu's own thread only)
++    std::mutex pending_mu;
++    std::vector<uint64_t> pending;   // pages other threads wrote to: this thread drops its compiled code from them (InvalidateCacheRange is not safe against its own Run)
++    uint32_t svc_num = 0;
+ 
+     explicit Cpu(size_t id_) : id(id_) {
+         A64::UserConfig c;
+@@ -55,6 +69,15 @@ struct Cpu final : A64::UserCallbacks {
+         jit = std::make_unique<A64::Jit>(c);
+     }
+ 
++    ~Cpu() {
++        std::lock_guard<std::mutex> g(g_pages_mu);
++        for (uint64_t pg : code_pages) unregister_page(pg);
++    }
++    void unregister_page(uint64_t pg) {   // g_pages_mu held
++        auto it = g_owners.find(pg);
++        if (it != g_owners.end() && it->second.erase(this)) { g_filter[bucket(pg)]--; if (it->second.empty()) g_owners.erase(it); }
++    }
++
+     void fail_with(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
+         if (stop == FAULT) return;   // the first fault is the one that explains the rest
+         va_list ap; va_start(ap, fmt); vsnprintf(fault, sizeof fault, fmt, ap); va_end(ap);
+@@ -66,7 +89,11 @@ struct Cpu final : A64::UserCallbacks {
+         if (a == ret_addr || aot_find(a)) return std::nullopt;   // not code to compile: the run ends or goes back to the AOT code (ExceptionRaised)
+         uint8_t *p = aot_guest_ptr(a, 4);
+         if (!p) return std::nullopt;
+-        if (code_pages.insert(a >> 12).second) aot_count(AOT_S_JIT_PAGES);
++        if (code_pages.insert(a >> 12).second) {
++            aot_count(AOT_S_JIT_PAGES);
++            std::lock_guard<std::mutex> g(g_pages_mu);
++            if (g_owners[a >> 12].insert(this).second) g_filter[bucket(a >> 12)]++;
++        }
+         uint32_t v; memcpy(&v, p, 4); return v;
+     }
+     template <class T> T rd(A64::VAddr a) {
+@@ -78,16 +105,42 @@ struct Cpu final : A64::UserCallbacks {
+         uint8_t *p = aot_guest_ptr(a, sizeof(T));
+         if (!p) { fail_with("JIT: write of %u bytes at %#llx is outside every mapped region", (unsigned)sizeof(T), (unsigned long long)a); return; }
+         memcpy(p, &v, sizeof v);
+-        written(a, sizeof(T), true);
++        written(this, a, sizeof(T));
++    }
++    // This thread's own compiled code from page pg is stale (in a callback InvalidateCacheRange halts the Jit; the run loop resumes it).
++    void drop(uint64_t pg) {
++        if (!code_pages.erase(pg)) return;
++        jit->InvalidateCacheRange(pg << 12, 0x1000);
++        aot_count(AOT_S_JIT_INVALIDATIONS);
+     }
+-    // The bytes [a, a+n) changed: the compiled code from any page they touch is stale. In a callback InvalidateCacheRange halts the Jit; the run loop resumes it.
+-    void written(uint64_t a, uint64_t n, bool in_callback) {
++    // Other threads wrote to some pages: take their notes. Called by the owner thread, outside Run.
++    void drain() {
++        std::vector<uint64_t> pgs;
++        { std::lock_guard<std::mutex> g(pending_mu); pgs.swap(pending); }
++        for (uint64_t pg : pgs) {
++            drop(pg);
++            std::lock_guard<std::mutex> g(g_pages_mu);
++            unregister_page(pg);
++        }
++    }
++    // The bytes [a, a+n) changed (by this thread, whichever it is): every Jit with code compiled from those pages drops it.
++    static void written(Cpu *self, uint64_t a, uint64_t n) {
+         for (uint64_t pg = a >> 12; pg <= (a + n - 1) >> 12; pg++) {
+-            if (!code_pages.erase(pg)) continue;
+-            jit->InvalidateCacheRange(pg << 12, 0x1000);
+-            aot_count(AOT_S_JIT_INVALIDATIONS);
++            if (!g_filter[bucket(pg)].load(std::memory_order_relaxed)) continue;
++            std::vector<Cpu *> others; bool mine = false;
++            {
++                std::lock_guard<std::mutex> g(g_pages_mu);
++                auto it = g_owners.find(pg);
++                if (it == g_owners.end()) continue;
++                for (Cpu *c : it->second) {
++                    if (c == self) { mine = true; continue; }
++                    { std::lock_guard<std::mutex> g2(c->pending_mu); c->pending.push_back(pg); }
++                    c->jit->HaltExecution(HaltReason::CacheInvalidation);   // callable from any thread: the other thread leaves Run, drains and recompiles
++                }
++                if (mine) self->unregister_page(pg);
++            }
++            if (mine) self->drop(pg);
+         }
+-        (void)in_callback;
+     }
+     uint8_t MemoryRead8(A64::VAddr a) override { return rd<uint8_t>(a); }
+     uint16_t MemoryRead16(A64::VAddr a) override { return rd<uint16_t>(a); }
+@@ -105,7 +158,7 @@ struct Cpu final : A64::UserCallbacks {
+         uint8_t *p = aot_guest_ptr(a, sizeof(T));
+         if (!p) { fail_with("JIT: exclusive write of %u bytes at %#llx is outside every mapped region", (unsigned)sizeof(T), (unsigned long long)a); return false; }
+         bool ok = __atomic_compare_exchange_n((T *)p, &expected, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+-        if (ok) written(a, sizeof(T), true);
++        if (ok) written(this, a, sizeof(T));
+         return ok;
+     }
+     bool MemoryWriteExclusive8(A64::VAddr a, uint8_t v, uint8_t e) override { return cas(a, v, e); }
+@@ -116,7 +169,14 @@ struct Cpu final : A64::UserCallbacks {
+ 
+     // ---- events ----
+     void InterpreterFallback(A64::VAddr pc, size_t n) override { fail_with("JIT: %zu instruction(s) at %#llx are not translated by dynarmic, which has no interpreter here", n, (unsigned long long)pc); }
+-    void CallSVC(uint32_t swi) override { fail_with("JIT: svc #%u executed by JIT code before %#llx: the Horizon services are connected in T5", swi, (unsigned long long)jit->GetPC()); }
++    // An svc ends the block (dynarmic's CheckHalt terminal): the run loop answers it outside Run, where the registers can be read and written safely, as emulators do
++    void CallSVC(uint32_t swi) override { svc_num = swi; jit->HaltExecution(HaltReason::UserDefined2); }
++    void InstructionCacheOperationRaised(A64::InstructionCacheOperation op, A64::VAddr value) override {
++        if (op == A64::InstructionCacheOperation::InvalidateByVAToPoU) { written(this, value & ~63ull, 64); return; }
++        std::vector<uint64_t> all;   // ic ialluis / iallu: every page any Jit compiled from
++        { std::lock_guard<std::mutex> g(g_pages_mu); for (auto &[pg, _] : g_owners) all.push_back(pg); }
++        for (uint64_t pg : all) written(this, pg << 12, 1);
++    }
+     void ExceptionRaised(A64::VAddr pc, A64::Exception e) override {
+         if (stop == FAULT) { jit->HaltExecution(); return; }   // a fault already recorded (a failed access) is what to report, not the return that follows it
+         if (e == A64::Exception::NoExecuteFault) {
+@@ -130,7 +190,9 @@ struct Cpu final : A64::UserCallbacks {
+         jit->HaltExecution();
+     }
+     void AddTicks(uint64_t t) override { ticks_left = t >= ticks_left ? 0 : ticks_left - t; }
+-    uint64_t GetTicksRemaining() override { return ticks_left; }
++    // Run is given at most kSlice cycles at a time: dynarmic checks the halt flag between linked blocks only when its cycle counter runs out, so a tight loop (`b .`) would never see a halt that another thread
++    // requested (a rewrite of its code). The run loop treats the end of a slice as a chance to look at what other threads asked for.
++    uint64_t GetTicksRemaining() override { return ticks_left < kSlice ? ticks_left : kSlice; }
+     uint64_t GetCNTPCT() override {
+         using namespace std::chrono;
+         return (uint64_t)((double)duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() * 0.0192);   // 19.2 MHz
+@@ -185,6 +247,7 @@ int run_jit(State *st, uint64_t pc, Memory *m, int is_jump, char *err, size_t er
+     Cpu &c = cpu();
+     const uint64_t outer_ret = c.ret_addr;   // this Cpu may be suspended in an outer run, waiting for an AOT function that entered the JIT again
+     c.ret_addr = st->gpr.x30.qword;
++    c.drain();
+     load(c, st);
+     c.jit->SetPC(pc);
+     c.ticks_left = g_cfg.ticks; c.stop = NONE; c.fault[0] = 0;
+@@ -203,7 +266,18 @@ int run_jit(State *st, uint64_t pc, Memory *m, int is_jump, char *err, size_t er
+             c.jit->SetPC(st->gpr.x30.qword);   // the AOT function returned: carry on after the call, where x30 says
+             continue;
+         }
+-        if (Dynarmic::Has(hr, HaltReason::CacheInvalidation)) { c.jit->ClearHalt(HaltReason::CacheInvalidation); continue; }   // the JIT'd code wrote to code it had compiled: go on, recompiling
++        if (Dynarmic::Has(hr, HaltReason::UserDefined2)) {   // svc: the number was recorded by CallSVC, the registers are the guest's
++            c.jit->ClearHalt(HaltReason::UserDefined2);
++            if (!aot_svc_handler) { snprintf(err, errn, "svc #%u at %#llx: no Horizon service handler is set", c.svc_num, (unsigned long long)c.jit->GetPC() - 4); rc = 1; break; }
++            aot_count(AOT_S_SVC);
++            uint64_t regs[31];
++            for (int i = 0; i < 31; i++) regs[i] = c.jit->GetRegister(i);
++            aot_svc_handler((int)c.svc_num, regs, c.jit->GetPC() - 4);
++            for (int i = 0; i < 31; i++) c.jit->SetRegister(i, regs[i]);
++            continue;
++        }
++        if (Dynarmic::Has(hr, HaltReason::CacheInvalidation)) { c.jit->ClearHalt(HaltReason::CacheInvalidation); c.drain(); continue; }   // code this Jit compiled changed (its own stores, or another thread's): recompile   // the JIT'd code wrote to code it had compiled: go on, recompiling
++        if (hr == HaltReason{} && c.ticks_left) { c.drain(); continue; }   // the end of a slice (see GetTicksRemaining)
+         if (c.ticks_left == 0) { snprintf(err, errn, "JIT budget exceeded: the code at %#llx ran more than %llu cycles without returning", (unsigned long long)pc, (unsigned long long)g_cfg.ticks); rc = 1; break; }
+         snprintf(err, errn, "JIT stopped for an unknown reason (halt %#x) at %#llx", (unsigned)hr, (unsigned long long)c.jit->GetPC()); rc = 1; break;
+     }
+@@ -226,7 +300,7 @@ Memory *fallback(State *st, uint64_t pc, Memory *m, int is_jump) {
+     return m;
+ }
+ 
+-void on_write(uint64_t a, uint64_t n) { if (t_cpu) t_cpu->written(a, n, false); }
++void on_write(uint64_t a, uint64_t n) { Cpu::written(t_cpu.get(), a, n); }
+ }  // namespace
+ 
+ extern "C" {
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index a85598b..ba8bc53 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -11,7 +11,7 @@ from pathlib import Path
+ 
+ HERE = Path(__file__).resolve().parent
+ RET = 0xD65F03C0
+-STATS = ('indirect_calls', 'indirect_jumps', 'fallback_requests', 'reads', 'writes', 'regions', 'jit_entries', 'jit_to_aot', 'jit_invalidations', 'jit_pages', 'unlifted_calls')
++STATS = ('indirect_calls', 'indirect_jumps', 'fallback_requests', 'reads', 'writes', 'regions', 'jit_entries', 'jit_to_aot', 'jit_invalidations', 'jit_pages', 'unlifted_calls', 'svc_calls')
+ 
+ 
+ def missing_symbols(linker_stderr):
+@@ -157,6 +157,8 @@ class Aot:
+         self.lib = ctypes.CDLL(so)
+         L = self.lib
+         L.aot_map.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
++        L.aot_try_map.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
++        L.aot_unmap.argtypes = [ctypes.c_uint64]
+         L.aot_poke.argtypes = [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
+         L.aot_peek.argtypes = [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
+         L.aot_stat.argtypes = [ctypes.c_int]; L.aot_stat.restype = ctypes.c_uint64
+@@ -174,7 +176,7 @@ class Aot:
+         return buf.value.decode()
+ 
+     class _Guest(ctypes.Structure):
+-        _fields_ = [('x', ctypes.c_uint64 * 31), ('sp', ctypes.c_uint64), ('nzcv', ctypes.c_uint64)]
++        _fields_ = [('x', ctypes.c_uint64 * 31), ('sp', ctypes.c_uint64), ('nzcv', ctypes.c_uint64), ('tpidr_el0', ctypes.c_uint64), ('tpidrro_el0', ctypes.c_uint64)]
+ 
+     def map(self, base, size, data=None):
+         self.lib.aot_map(base, size); self.regions.append((base, size, bytes(data) if data else bytes(size)))
+@@ -184,6 +186,26 @@ class Aot:
+         """Every region back to the contents it was mapped with (the guest memory is global: a run leaves its writes behind)"""
+         for b, _, data in self.regions: assert self.lib.aot_poke(b, data, len(data)) == 0
+ 
++    def try_map(self, base, size):
++        """Map zeroed guest memory while guest code may be running (what a MapMemory or SetHeapSize service does): True, or False when it overlaps a region. The reset() contents are not touched"""
++        return self.lib.aot_try_map(base, size) == 0
++
++    def unmap(self, base):
++        return self.lib.aot_unmap(base) == 0
++
++    SVC = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_int, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint64)
++
++    def set_svc_handler(self, fn):
++        """fn(num, regs, orig_addr), regs a list of x0..x30 that fn changes in place (the shape of svc_dispatch in hle_svc.c); None removes the handler"""
++        slot = ctypes.c_void_p.in_dll(self.lib, 'aot_svc_handler')
++        if fn is None: slot.value = None; self._svc = None; return
++        def cb(num, regs, orig):
++            r = list(regs[:31]); fn(num, r, orig)
++            for i in range(31): regs[i] = r[i] & (2 ** 64 - 1)
++            return 0
++        self._svc = self.SVC(cb)   # kept alive: the library holds only the raw pointer
++        slot.value = ctypes.cast(self._svc, ctypes.c_void_p).value
++
+     def peek(self, base, size):
+         buf = ctypes.create_string_buffer(size)
+         assert self.lib.aot_peek(base, buf, size) == 0
+@@ -191,15 +213,16 @@ class Aot:
+ 
+     def stat(self, name): return self.lib.aot_stat(STATS.index(name))
+ 
+-    def run(self, pc, regs=None, nzcv=0, sp=0):
+-        """Run the AOT function at pc. Returns {'x0'..'x30', 'sp', 'nzcv', 'mem': {base: bytes}} or {'fault': reason}"""
++    def run(self, pc, regs=None, nzcv=0, sp=0, tpidr_el0=0, tpidrro_el0=0):
++        """Run the AOT function at pc. Returns {'x0'..'x30', 'sp', 'nzcv', 'tpidr_el0', 'mem': {base: bytes}} or {'fault': reason}.
++        tpidr_el0, tpidrro_el0: the thread pointers this guest thread sees (on Horizon tpidrro_el0 points at the thread-local region)"""
+         g = self._Guest()
+         for k, v in (regs or {}).items(): g.x[int(k[1:])] = v & (2 ** 64 - 1)
+-        g.sp, g.nzcv = sp, nzcv
++        g.sp, g.nzcv, g.tpidr_el0, g.tpidrro_el0 = sp, nzcv, tpidr_el0, tpidrro_el0
+         err = ctypes.create_string_buffer(300)
+         rc = self.lib.aot_run(ctypes.byref(g), pc, err, 300)
+         if rc: return {'fault': err.value.decode()}
+-        out = {f'x{i}': g.x[i] for i in range(31)}; out['sp'] = g.sp; out['nzcv'] = g.nzcv
++        out = {f'x{i}': g.x[i] for i in range(31)}; out['sp'] = g.sp; out['nzcv'] = g.nzcv; out['tpidr_el0'] = g.tpidr_el0
+         out['mem'] = {b: self.peek(b, n) for b, n, _ in self.regions}
+         return out
+ 
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index 57ebf80..aeb86c2 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -12,15 +12,23 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ #include <vector>
+ 
+ struct AotEntry { uint64_t addr; AotFn fn; };
+ extern "C" const AotEntry aot_table[];   // generated by aot_lift.py, sorted by address
+ extern "C" const unsigned aot_table_n;
+ 
++#define XREGS(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30)
++
+ namespace {
+-struct Region { uint64_t base, size; uint8_t *host; };
+-std::vector<Region> g_regions;
++// Guest memory regions. Guest threads read the list at every access while a service (MapMemory, SetHeapSize...) may add or remove regions: the list is a fixed array, an entry is written before the count is
++// published, and a removed region only has its size set to 0 (its host memory is freed by aot_unmap_all, since a thread may still be inside an access to it).
++enum { MAX_REGIONS = 512 };
++struct Region { std::atomic<uint64_t> base, size; uint8_t *host; };
++Region g_regions[MAX_REGIONS];
++std::atomic<unsigned> g_nregions;
++std::mutex g_regions_mu;
+ thread_local jmp_buf *g_jb;
+ thread_local char g_err[300];
+ uint64_t g_stats[AOT_S_N];
+@@ -35,8 +43,10 @@ inline void count(int i) { __atomic_fetch_add(&g_stats[i], 1, __ATOMIC_RELAXED);
+ }
+ 
+ uint8_t *guest(uint64_t a, uint64_t n, const char *what) {
+-    for (const Region &r : g_regions)
+-        if (a >= r.base && n <= r.size && a - r.base <= r.size - n) return r.host + (a - r.base);
++    for (unsigned i = 0, e = g_nregions.load(std::memory_order_acquire); i < e; i++) {
++        const Region &r = g_regions[i]; const uint64_t base = r.base, size = r.size;
++        if (a >= base && n <= size && a - base <= size - n) return r.host + (a - base);
++    }
+     fail("guest %s of %llu bytes at %#llx is outside every mapped region", what, (unsigned long long)n, (unsigned long long)a);
+ }
+ 
+@@ -51,7 +61,10 @@ AotFn aot_find(uint64_t pc) {
+     return lo < aot_table_n && aot_table[lo].addr == pc ? aot_table[lo].fn : nullptr;
+ }
+ uint8_t *aot_guest_ptr(uint64_t a, uint64_t n) {
+-    for (const Region &r : g_regions) if (a >= r.base && n <= r.size && a - r.base <= r.size - n) return r.host + (a - r.base);
++    for (unsigned i = 0, e = g_nregions.load(std::memory_order_acquire); i < e; i++) {
++        const Region &r = g_regions[i]; const uint64_t base = r.base, size = r.size;
++        if (a >= base && n <= size && a - base <= size - n) return r.host + (a - base);
++    }
+     return nullptr;
+ }
+ void aot_fail(const char *fmt, ...) {
+@@ -116,6 +129,26 @@ Memory *__remill_jump(State &st, uint64_t pc, Memory *m) {   // br: a tail call,
+     fail("indirect jump to %#llx: not the entry of an AOT function (a jump table inside a function is not supported yet), and no JIT fallback yet", (unsigned long long)pc);
+ }
+ 
++// svc: Remill lifts it to an asynchronous hyper call carrying the number; the registers go to the Horizon service handler (the shape of svc_dispatch) and its results come back into them
++AotSvcHandler aot_svc_handler;
++Memory *__remill_async_hyper_call(State &st, uint64_t pc, Memory *m) {
++    if (st.hyper_call != AsyncHyperCall::kAArch64SupervisorCall)
++        fail("asynchronous hyper call %u at %#llx is not an svc", (unsigned)st.hyper_call, (unsigned long long)pc - 4);
++    const int num = (int)st.hyper_call_vector; const uint64_t at = pc - 4;
++    count(AOT_S_SVC);
++    if (!aot_svc_handler) fail("svc #%d at %#llx: no Horizon service handler is set", num, (unsigned long long)at);
++    uint64_t regs[31];
++#define X(i) regs[i] = st.gpr.x##i.qword;
++    XREGS(X)
++#undef X
++    aot_svc_handler(num, regs, at);
++#define X(i) st.gpr.x##i.qword = regs[i];
++    XREGS(X)
++#undef X
++    return m;
++}
++Memory *__remill_missing_block(State &, uint64_t pc, Memory *) { fail("control reached %#llx, which was not lifted as code (a call returned to an unexpected address)", (unsigned long long)pc); }
++
+ // The stub of a function the translator could not lift (generated by aot_lift.py): a direct `bl` to it still links, and runs the function through the JIT, or stops with the reason
+ Memory *aot_unlifted(State *st, uint64_t pc, Memory *m, const char *why) {
+     count(AOT_S_UNLIFTED); count(S_FALLBACK);
+@@ -124,13 +157,34 @@ Memory *aot_unlifted(State *st, uint64_t pc, Memory *m, const char *why) {
+ }
+ 
+ // ---- the harness side (ctypes) ----
+-struct Guest { uint64_t x[31]; uint64_t sp; uint64_t nzcv; };   // nzcv: N Z C V as bits 3..0
+-
++struct Guest { uint64_t x[31]; uint64_t sp; uint64_t nzcv; uint64_t tpidr_el0; uint64_t tpidrro_el0; };   // nzcv: N Z C V as bits 3..0
++
++// Map zeroed guest memory at base: 0, or 1 when it overlaps a region or the table is full (a service answers with an error code; the harness aborts)
++int aot_try_map(uint64_t base, uint64_t size) {
++    std::lock_guard<std::mutex> g(g_regions_mu);
++    unsigned n = g_nregions.load();
++    if (n == MAX_REGIONS || !size || size > UINT64_MAX - base) return 1;
++    for (unsigned i = 0; i < n; i++) { const uint64_t b = g_regions[i].base, z = g_regions[i].size; if (z && base < b + z && b < base + size) return 1; }
++    uint8_t *host = (uint8_t *)calloc(1, size);
++    if (!host) return 1;
++    g_regions[n].base = base; g_regions[n].size = size; g_regions[n].host = host;
++    g_nregions.store(n + 1, std::memory_order_release); g_stats[S_REGIONS]++;
++    return 0;
++}
+ void aot_map(uint64_t base, uint64_t size) {
+-    for (const Region &r : g_regions) if (base < r.base + r.size && r.base < base + size) { fprintf(stderr, "[RED] aot: region %#llx+%#llx overlaps another\n", (unsigned long long)base, (unsigned long long)size); abort(); }
+-    g_regions.push_back({base, size, (uint8_t *)calloc(1, size)}); g_stats[S_REGIONS]++;
++    if (aot_try_map(base, size)) { fprintf(stderr, "[RED] aot: region %#llx+%#llx overlaps another, is empty, or the region table is full\n", (unsigned long long)base, (unsigned long long)size); abort(); }
++}
++// Unmap the region that starts at base (0, or 1 when there is none). Its host memory stays until aot_unmap_all: a guest thread may be in the middle of an access to it.
++int aot_unmap(uint64_t base) {
++    std::lock_guard<std::mutex> g(g_regions_mu);
++    for (unsigned i = 0, n = g_nregions.load(); i < n; i++) if (g_regions[i].size && g_regions[i].base == base) { g_regions[i].size = 0; return 0; }
++    return 1;
++}
++void aot_unmap_all() {
++    std::lock_guard<std::mutex> g(g_regions_mu);
++    for (unsigned i = 0, n = g_nregions.load(); i < n; i++) { free(g_regions[i].host); g_regions[i].size = 0; g_regions[i].host = nullptr; }
++    g_nregions.store(0);
+ }
+-void aot_unmap_all() { for (Region &r : g_regions) free(r.host); g_regions.clear(); }
+ int aot_poke(uint64_t a, const uint8_t *src, uint64_t n) { jmp_buf jb; if (setjmp(jb)) return 1; g_jb = &jb; memcpy(guest(a, n, "poke"), src, n); g_jb = nullptr; if (aot_write_hook) aot_write_hook(a, n); return 0; }
+ int aot_peek(uint64_t a, uint8_t *dst, uint64_t n) { jmp_buf jb; if (setjmp(jb)) return 1; g_jb = &jb; memcpy(dst, guest(a, n, "peek"), n); g_jb = nullptr; return 0; }
+ uint64_t aot_stat(int i) { return g_stats[i]; }
+@@ -142,7 +196,7 @@ int aot_run(Guest *g, uint64_t pc, char *err, uint64_t errn) {
+ #define X(i) st.gpr.x##i.qword = g->x[i];
+     X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30)
+ #undef X
+-    st.gpr.sp.qword = g->sp;
++    st.gpr.sp.qword = g->sp; st.sr.tpidr_el0.qword = g->tpidr_el0; st.sr.tpidrro_el0.qword = g->tpidrro_el0;
+     st.sr.n = g->nzcv >> 3 & 1; st.sr.z = g->nzcv >> 2 & 1; st.sr.c = g->nzcv >> 1 & 1; st.sr.v = g->nzcv & 1;
+     jmp_buf jb; int rc = 0;
+     if (setjmp(jb)) rc = 1;
+@@ -156,7 +210,7 @@ int aot_run(Guest *g, uint64_t pc, char *err, uint64_t errn) {
+ #define X(i) g->x[i] = st.gpr.x##i.qword;
+     X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30)
+ #undef X
+-    g->sp = st.gpr.sp.qword; g->nzcv = st.sr.n << 3 | st.sr.z << 2 | st.sr.c << 1 | st.sr.v;
++    g->sp = st.gpr.sp.qword; g->tpidr_el0 = st.sr.tpidr_el0.qword; g->nzcv = st.sr.n << 3 | st.sr.z << 2 | st.sr.c << 1 | st.sr.v;
+     if (rc) snprintf(err, errn, "%s", g_err); else if (errn) err[0] = 0;
+     return rc;
+ }
+diff --git a/dm/tools/aot_runtime.h b/dm/tools/aot_runtime.h
+index 26e7036..c8d4e22 100644
+--- a/dm/tools/aot_runtime.h
++++ b/dm/tools/aot_runtime.h
+@@ -6,7 +6,7 @@
+ typedef Memory *(*AotFn)(State *, uint64_t, Memory *);
+ // Statistics, in the order aot_lift.py names them (STATS)
+ enum { AOT_S_CALLS, AOT_S_JUMPS, AOT_S_FALLBACK, AOT_S_READS, AOT_S_WRITES, AOT_S_REGIONS,
+-       AOT_S_JIT_ENTRIES, AOT_S_JIT_TO_AOT, AOT_S_JIT_INVALIDATIONS, AOT_S_JIT_PAGES, AOT_S_UNLIFTED, AOT_S_N };
++       AOT_S_JIT_ENTRIES, AOT_S_JIT_TO_AOT, AOT_S_JIT_INVALIDATIONS, AOT_S_JIT_PAGES, AOT_S_UNLIFTED, AOT_S_SVC, AOT_S_N };
+ 
+ extern "C" {
+ AotFn aot_find(uint64_t pc);                                  // the AOT function whose entry is pc, or null
+@@ -19,6 +19,10 @@ int aot_try_call(AotFn f, State *st, uint64_t pc, Memory *m, char *err, uint64_t
+ // The JIT fallback: when an indirect call or jump targets no AOT function, aot_fallback (if set) runs it. is_jump: a `br` (a tail call) rather than a `blr`.
+ typedef Memory *(*AotFallback)(State *, uint64_t pc, Memory *, int is_jump);
+ extern AotFallback aot_fallback;
++// The Horizon service handler, with the signature of svc_dispatch (hle_svc.c): svc number, x0..x30 in regs (the handler writes its results back there, x0 first), the address of the svc instruction.
++// Its return value is not used: a service answers in the registers, as on the console. Without a handler an svc is an explicit error.
++typedef uint64_t (*AotSvcHandler)(int num, uint64_t *regs, uint64_t orig_addr);
++extern AotSvcHandler aot_svc_handler;
+ // Called after any write to guest memory by AOT code or the harness, so that the JIT can drop the code it compiled from those bytes
+ typedef void (*AotWriteHook)(uint64_t addr, uint64_t n);
+ extern AotWriteHook aot_write_hook;
+diff --git a/dm/tools/tests/arm64_ref.py b/dm/tools/tests/arm64_ref.py
+index 06f7702..1051949 100644
+--- a/dm/tools/tests/arm64_ref.py
++++ b/dm/tools/tests/arm64_ref.py
+@@ -67,24 +67,42 @@ def run_words(words, cases, steps=100):
+     return out
+ 
+ 
+-def run_image(code, entry, cases, mem=None, steps=1000000, stop=STOP):
++def run_image(code, entry, cases, mem=None, steps=1000000, stop=STOP, svc=None):
+     """Run the function at `entry` of `code` (mapped at address 0) once per case on one Unicorn core, with the memory regions {base: bytes} (a size that is a whole number of pages) restored before each case.
+-    A case is (registers {'x0': v, ...}, nzcv in, sp). Returns, per case, {'x0'..'x30', 'sp', 'nzcv', 'mem': {base: bytes}}, or {'fault': reason} when the core raised (a fetch, read or write outside the regions)."""
++    A case is (registers {'x0': v, ...}, nzcv in, sp); the registers may also hold 'tpidr_el0' and 'tpidrro_el0'. svc: a factory svc(uc) returning the handler handler(num, regs, orig_addr) (regs: list x0..x30 it changes
++    in place, the shape of svc_dispatch), called once per case; its reset(uc) method, when it has one, runs after the case (to drop what the services mapped). Returns, per case, {'x0'..'x30', 'sp', 'nzcv', 'mem': {base: bytes}}, or {'fault': reason} when the core raised (a fetch, read or write outside the regions)."""
+     from unicorn import Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM
+     from unicorn.arm64_const import UC_ARM64_REG_X0, UC_ARM64_REG_X30, UC_ARM64_REG_SP, UC_ARM64_REG_NZCV
+     uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+     uc.mem_map(0, (len(code) + 0xFFF) & ~0xFFF); uc.mem_write(0, code); uc.mem_map(stop, 0x1000)
+     for b, data in (mem or {}).items(): uc.mem_map(b, len(data))
++    from unicorn import UC_HOOK_INTR
++    from unicorn.arm64_const import UC_ARM64_REG_TPIDR_EL0, UC_ARM64_REG_TPIDRRO_EL0, UC_ARM64_REG_PC
++    handler = [None]
++    def on_intr(u, intno, _):
++        if intno != 2 or not handler[0]: return
++        pc = u.reg_read(UC_ARM64_REG_PC)
++        for at in (pc - 4, pc):   # Unicorn reports the svc with PC at the next instruction or at the svc, depending on its version
++            w = int.from_bytes(u.mem_read(at, 4), 'little')
++            if w & 0xFFE0001F == 0xD4000001: break
++        else: raise RuntimeError(f'svc interrupt with no svc at {pc:#x}')
++        r = [u.reg_read(xreg(i)) for i in range(31)]
++        handler[0]((w >> 5) & 0xFFFF, r, at)
++        for i in range(31): u.reg_write(xreg(i), r[i] & MASK)
++    if svc: uc.hook_add(UC_HOOK_INTR, on_intr)
+     out = []
+     for regs, nzcv, sp in cases:
++        handler[0] = svc(uc) if svc else None
++        uc.reg_write(UC_ARM64_REG_TPIDR_EL0, regs.get('tpidr_el0', 0)); uc.reg_write(UC_ARM64_REG_TPIDRRO_EL0, regs.get('tpidrro_el0', 0))
+         for b, data in (mem or {}).items(): uc.mem_write(b, data)
+         for i in range(31): uc.reg_write(xreg(i), regs.get(f'x{i}', 0) & MASK)
+         uc.reg_write(UC_ARM64_REG_X30, regs.get('x30', stop) & MASK); uc.reg_write(UC_ARM64_REG_SP, sp); uc.reg_write(UC_ARM64_REG_NZCV, nzcv << 28)
+         try: uc.emu_start(entry, stop, count=steps)
+         except UcError as e:
+-            out.append({'fault': str(e)}); continue
++            out.append({'fault': str(e)}); getattr(handler[0], 'reset', lambda u: None)(uc); continue
+         r = {f'x{i}': uc.reg_read(xreg(i)) for i in range(31)}
+-        r['sp'] = uc.reg_read(UC_ARM64_REG_SP); r['nzcv'] = uc.reg_read(UC_ARM64_REG_NZCV) >> 28
++        r['sp'] = uc.reg_read(UC_ARM64_REG_SP); r['nzcv'] = uc.reg_read(UC_ARM64_REG_NZCV) >> 28; r['tpidr_el0'] = uc.reg_read(UC_ARM64_REG_TPIDR_EL0)
+         r['mem'] = {b: bytes(uc.mem_read(b, len(data))) for b, data in (mem or {}).items()}
+         out.append(r)
++        getattr(handler[0], 'reset', lambda u: None)(uc)
+     return out
+diff --git a/dm/tools/tests/test_aot_jit.py b/dm/tools/tests/test_aot_jit.py
+index 2c361c6..6893036 100644
+--- a/dm/tools/tests/test_aot_jit.py
++++ b/dm/tools/tests/test_aot_jit.py
+@@ -162,9 +162,9 @@ class Jit(unittest.TestCase):
+         got = self.run_aot(self.aot, {'x1': BADREAD, 'x2': RETONLY, 'x4': 0x5000})
+         self.assertIn('JIT: read of 8 bytes at 0x5000', got['fault'])
+ 
+-    def test_svc_in_jit_code_is_an_explicit_error_until_t5(self):
++    def test_svc_in_jit_code_without_a_handler_is_an_explicit_error(self):
+         got = self.run_aot(self.aot, {'x1': SVC5, 'x2': RANGES['branch'][0]})
+-        self.assertIn('svc #5', got['fault']); self.assertIn('T5', got['fault'])
++        self.assertIn('svc #5', got['fault']); self.assertIn('no Horizon service handler', got['fault'])
+ 
+     def test_threads_use_the_jit_at_once(self):
+         a = make(('indirect',))
+diff --git a/dm/tools/tests/test_aot_stub.py b/dm/tools/tests/test_aot_stub.py
+index a505ec2..4cca9fd 100644
+--- a/dm/tools/tests/test_aot_stub.py
++++ b/dm/tools/tests/test_aot_stub.py
+@@ -1,7 +1,7 @@
+ """A function the translator cannot lift no longer stops the build of its callers (known blocker 1, fork en cours/blocages-connus.md).
+   · by default it is still an explicit error: LiftError for the instruction, LinkError for the caller whose callee is missing;
+   · with stub_unliftable it gets a stub `sub_<address>`: a direct `bl` to it links and runs it through the JIT, or stops naming the function and the reason when there is no JIT;
+-  · a function whose code needs a runtime symbol that is not defined (`svc`) is stubbed the same way;
++  · a function whose code needs a runtime symbol that is not defined (fadd needs the FPU exception intrinsics) is stubbed the same way;
+   · with the JIT the result equals the Unicorn ARM64 reference.
+ Needs REMILL_BUILD, DYNARMIC_DIR, clang++ and unicorn; skipped otherwise."""
+ import os, struct, sys, unittest
+@@ -17,7 +17,7 @@ from test_aot_t3 import MEM, SP, READY, same
+ 
+ READY = READY and os.path.exists(os.path.join(os.environ.get('DYNARMIC_DIR', '/nonexistent'), 'build/src/dynarmic/libdynarmic.a'))
+ RET = aot_lift.RET
+-G, F, H, K, D, P = 0x100, 0x200, 0x300, 0x400, 0x500, 0x600   # G: not liftable (ccmn, register form); F calls G; H: svc; K calls H; D: fadd, which lifts but needs runtime symbols; P calls D
++G, F, D, P = 0x100, 0x200, 0x500, 0x600   # G: not liftable (ccmn, register form); F calls G; D: fadd, which lifts but needs runtime symbols; P calls D
+ 
+ 
+ def code():
+@@ -25,8 +25,6 @@ def code():
+     def put(at, ws): img[at:at + 4 * len(ws)] = struct.pack('<%dI' % len(ws), *ws)
+     put(G, [0xBA408000, fx.ADDR(0, 0, 1), 0x9A9F57E2, RET])                     # ccmn x0, x1, #0, hi ; add x0, x0, x1 ; cset x2, mi
+     put(F, [STP_PRE(29, 30, 31, -16), fx.BL(F + 4, G), LDP_POST(29, 30, 31, 16), RET])
+-    put(H, [fx.SVC(1), RET])
+-    put(K, [STP_PRE(29, 30, 31, -16), fx.BL(K + 4, H), LDP_POST(29, 30, 31, 16), RET])
+     put(D, [0x1E612800, RET])                                                  # fadd d0, d0, d1
+     put(P, [STP_PRE(29, 30, 31, -16), fx.BL(P + 4, D), LDP_POST(29, 30, 31, 16), RET])
+     return bytes(img)
+@@ -85,14 +83,6 @@ class Stub(unittest.TestCase):
+             self.assertNotIn('fault', r); self.assertEqual(a.stat('jit_entries'), 1)
+         finally: a.close()
+ 
+-    def test_svc_is_stubbed_and_the_jit_refuses_it_until_t5(self):
+-        a = mapped(aot_lift.Aot([fn(K, 4), fn(H, 2)], jit=True, stub_unliftable=True))
+-        try:
+-            self.assertEqual(list(a.unlifted), [H]); self.assertIn('svc #1', a.unlifted[H])
+-            r = a.run(K, {'x30': ref.STOP}, 0, SP)
+-            self.assertIn('svc #1', r['fault'])   # the JIT's refusal, until the Horizon services are connected (T5)
+-        finally: a.close()
+-
+     def test_a_callee_nobody_gave_stays_an_error_even_in_stub_mode(self):
+         with self.assertRaisesRegex(aot_lift.LinkError, 'sub_100'): aot_lift.Aot([fn(F, 4)], stub_unliftable=True)
+ 
+diff --git a/dm/tools/tests/test_aot_svc.py b/dm/tools/tests/test_aot_svc.py
+new file mode 100644
+index 0000000..4cb53a9
+--- /dev/null
++++ b/dm/tools/tests/test_aot_svc.py
+@@ -0,0 +1,234 @@
++"""T5: `svc` reaches the Horizon service handler, and the guest CPU state (thread pointers, guest memory, threads) is right.
++  · an svc in AOT code and in JIT code calls the handler with the number, x0..x30 and the address of the svc, and the registers it writes come back: equal to the Unicorn ARM64 reference running the same handler;
++  · a service can change the guest memory while code runs (the MapMemory / SetHeapSize shape): the memory it maps is read and written by the guest at once;
++  · tpidr_el0, tpidrro_el0 (the Horizon thread-local region pointer) and x18 reach the guest, per thread;
++  · host threads run guest threads concurrently, each with its own registers, thread pointers and service calls;
++  · code one thread rewrites is recompiled by every other thread's JIT, also when that thread is in the middle of running it (hypotheses.md H15).
++Needs REMILL_BUILD (with the SVC and TPIDRRO patch), DYNARMIC_DIR, clang++ and unicorn; skipped otherwise."""
++import os, struct, sys, threading, time, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_fixture as fx
++import arm64_ref as ref
++from nso_asm import STP_PRE, LDP_POST, LDRX, STRX
++from test_aot_t3 import MEM, SP, READY, same
++
++JIT_READY = READY and os.path.exists(os.path.join(os.environ.get('DYNARMIC_DIR', '/nonexistent'), 'build/src/dynarmic/libdynarmic.a'))
++RET, M = aot_lift.RET, ref.MASK
++HEAP = 0x300000
++ECHO, HEAPFN, TWICE, RETONLY, CALLER, SPIN, STORE, SLOT, UNKNOWN = 0x240, 0x260, 0x2A0, 0x2E0, 0x300, 0x380, 0x3C0, 0x3E0, 0x400
++
++
++def image():
++    words, ranges, _ = fx.text_layout()
++    img = bytearray(0x1000)
++    def put(at, ws): img[at:at + 4 * len(ws)] = struct.pack('<%dI' % len(ws), *ws)
++    put(0, words)
++    put(ECHO, [fx.SVC(0x2A), RET])
++    put(HEAPFN, [fx.SVC(1), STRX(2, 1, 1), LDRX(0, 1, 1), RET])                                   # x0: size; the service maps it at x1; store x2 at [x1+8] and read it back
++    put(TWICE, [fx.SVC(1), fx.MOV(4, 0), fx.MOVZ(0, 0x1000), fx.SVC(1), fx.MOV(5, 0), RET])        # the second mapping overlaps the first: the service refuses
++    put(RETONLY, [RET])
++    put(CALLER, [STP_PRE(29, 30, 31, -16), fx.BL(CALLER + 4, ECHO), fx.BL(CALLER + 8, ECHO), LDP_POST(29, 30, 31, 16), RET])
++    put(SPIN, [fx.B(SPIN, SPIN)])
++    put(STORE, [0xB9000001, RET])                                                                  # str w1, [x0]
++    put(SLOT, [fx.MOVZ(0, 1), RET])
++    put(UNKNOWN, [fx.SVC(99), RET])
++    return bytes(img), ranges
++
++
++IMG, RANGES = image()
++MEM_AOT = {**MEM, 0: IMG}
++
++
++class Horizon:
++    """The services of the tests: 0x2A mixes the registers, 1 maps memory at HEAP (the shape of SetHeapSize), anything else is InvalidSvc. `mapper(base, size)` -> bool maps guest memory"""
++    def __init__(self, mapper, unmapper=lambda b: None):
++        self.mapper, self.unmapper, self.log, self.mapped = mapper, unmapper, [], []
++        self.lock = threading.Lock()
++
++    def __call__(self, num, r, orig):
++        with self.lock: self.log.append((num, orig, r[0]))
++        if num == 0x2A: r[0] = (r[0] * 3 + r[1] + 7) & M; r[1] = num
++        elif num == 1:
++            size = (r[0] + 0xFFF) & ~0xFFF
++            ok = size > 0 and self.mapper(HEAP, size)
++            if ok: self.mapped.append(HEAP)
++            r[0], r[1] = (0, HEAP) if ok else (0xD001, 0)
++        else: r[0] = 0xF001
++
++    def reset(self, _=None):
++        for b in self.mapped: self.unmapper(b)
++        self.mapped = []
++
++
++def reference(entry, cases, horizon_log):
++    """Unicorn running the same handler; the handler's log is collected in horizon_log, per case"""
++    def factory(uc):
++        def mapper(base, size):
++            try: uc.mem_map(base, size); return True
++            except Exception: return False
++        h = Horizon(mapper, lambda b: uc.mem_unmap(b, next(s for bb, s in sizes if bb == b)))
++        sizes = []
++        real = h.mapper
++        h.mapper = lambda b, s: (real(b, s) and (sizes.append((b, s)) or True))
++        h.log = []; horizon_log.append(h.log)
++        return h
++    return ref.run_image(IMG, entry, cases, MEM, svc=factory)
++
++
++def aot_lib(names, jit=False, **kw):
++    funcs = [(RANGES[n][0], IMG[RANGES[n][0]:RANGES[n][1]]) if isinstance(n, str) else (n, IMG[n:n + 4 * k]) for n, k in
++             [(x, 0) if isinstance(x, str) else x for x in names]]
++    a = aot_lift.Aot(funcs, jit=jit, **kw)
++    for b, data in MEM_AOT.items(): a.map(b, len(data), data)
++    h = Horizon(a.try_map, a.unmap)
++    a.set_svc_handler(h)
++    return a, h
++
++
++def run(a, h, entry, regs, nz=0, **kw):
++    a.reset(); h.reset(); h.log.clear()
++    return a.run(entry, dict(regs, x30=ref.STOP), nz, SP, **kw)
++
++
++def eq_tls(t, got, want, what):
++    same(t, got, want, what)
++    if 'fault' not in want: t.assertEqual(got['tpidr_el0'], want['tpidr_el0'], f'{what}: tpidr_el0')
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++ and unicorn')
++class Svc(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.a, cls.h = aot_lib([(ECHO, 2), (HEAPFN, 4), (TWICE, 6), (CALLER, 5), (STORE, 2), (UNKNOWN, 2), 'tls'])
++
++    @classmethod
++    def tearDownClass(cls): cls.a.close()
++
++    def compare(self, entry, cases):
++        logs = []
++        want = reference(entry, [(r, n, SP) for r, n in cases], logs)
++        for (regs, nz), w, wl in zip(cases, want, logs):
++            self.assertNotIn('fault', w)
++            tls = {k: regs[k] for k in ('tpidr_el0', 'tpidrro_el0') if k in regs}
++            got = run(self.a, self.h, entry, {k: v for k, v in regs.items() if k not in tls}, nz, **tls)
++            eq_tls(self, got, w, f'{regs} nzcv={nz:04b}')
++            self.assertEqual(self.h.log, wl, f'{regs}: the handler saw other calls than under the reference')
++
++    def test_svc_registers_in_and_out_equal_the_reference(self):
++        self.compare(ECHO, [({'x0': x, 'x1': y, 'x5': 0x55, 'x18': 0x1818}, nz) for x in (0, 1, 7, M, 1 << 63) for y in (0, 9) for nz in (0, 6)])
++        self.assertGreater(self.a.stat('svc_calls'), 0)
++
++    def test_the_handler_gets_the_number_and_the_address_of_the_svc(self):
++        run(self.a, self.h, ECHO, {'x0': 5})
++        self.assertEqual(self.h.log, [(0x2A, ECHO, 5)])
++
++    def test_two_svc_through_a_nested_call_equal_the_reference(self):
++        self.compare(CALLER, [({'x0': x, 'x1': 3}, 0) for x in (0, 4, M)])
++        run(self.a, self.h, CALLER, {'x0': 1}); self.assertEqual([c[:2] for c in self.h.log], [(0x2A, ECHO)] * 2)
++
++    def test_an_unknown_service_answers_with_its_error_code(self):
++        self.compare(UNKNOWN, [({'x0': 1}, 0), ({'x0': M}, 0)])
++        self.assertEqual(run(self.a, self.h, UNKNOWN, {'x0': 1})['x0'], 0xF001)
++
++    def test_a_service_maps_memory_the_guest_then_uses(self):
++        self.compare(HEAPFN, [({'x0': size, 'x2': v}, 0) for size in (0x1000, 0x1800, 0x10000) for v in (0, 0x1234567890ABCDEF)])
++        got = run(self.a, self.h, HEAPFN, {'x0': 0x2000, 'x2': 0xCAFE})
++        self.assertEqual((got['x1'], got['x0']), (HEAP, 0xCAFE))
++        self.assertEqual(self.a.peek(HEAP + 8, 8), struct.pack('<Q', 0xCAFE))   # it is in guest memory: the harness reads the same bytes
++
++    def test_a_second_mapping_that_overlaps_is_refused_by_the_service(self):
++        self.compare(TWICE, [({'x0': 0x1000}, 0), ({'x0': 0x4000}, 0)])
++
++    def test_unmapped_memory_is_an_explicit_error_again(self):
++        run(self.a, self.h, HEAPFN, {'x0': 0x1000, 'x2': 1})
++        self.assertEqual(self.a.run(STORE, {'x0': HEAP, 'x1': 1, 'x30': ref.STOP}, 0, SP).get('fault'), None)   # mapped by the service
++        self.assertTrue(self.a.unmap(HEAP)); self.assertFalse(self.a.unmap(HEAP))
++        got = self.a.run(STORE, {'x0': HEAP, 'x1': 1, 'x30': ref.STOP}, 0, SP)
++        self.assertIn('outside every mapped region', got['fault'])
++
++    def test_thread_pointers_and_x18_reach_the_guest(self):
++        tls = RANGES['tls'][0]
++        self.compare(tls, [({'tpidr_el0': a, 'tpidrro_el0': b, 'x18': c}, 0) for a, b, c in ((0, 0, 0), (0x1000, 0x2000, 0x3000), (M, M - 1, 1 << 63))])
++
++    def test_host_threads_run_guest_threads_with_their_own_state(self):
++        results, lock = {}, threading.Lock()
++        def worker(i):
++            for k in range(50):
++                got = self.a.run(ECHO, {'x0': i * 1000 + k, 'x1': i, 'x30': ref.STOP}, 0, SP)
++                tls = self.a.run(RANGES['tls'][0], {'x18': i, 'x30': ref.STOP}, 0, SP, tpidr_el0=0x1000 * i, tpidrro_el0=0x77000 + i)
++                with lock: results[i, k] = (got['x0'], got['x1'], tls['x0'], tls['x3'], tls['x1'])
++        before = self.a.stat('svc_calls'); self.h.log.clear()
++        ts = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
++        for t in ts: t.start()
++        for t in ts: t.join()
++        for (i, k), r in results.items():
++            self.assertEqual(r, (((i * 1000 + k) * 3 + i + 7) & M, 0x2A, 0x1000 * i, 0x77000 + i, i), f'thread {i} call {k}')
++        self.assertEqual(self.a.stat('svc_calls') - before, 8 * 50)
++
++
++@unittest.skipUnless(JIT_READY, 'needs REMILL_BUILD, DYNARMIC_DIR, clang++ and unicorn')
++class JitSvc(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.a, cls.h = aot_lib(['indirect', (STORE, 2)], jit=True)   # ECHO, CALLER... are not AOT here: the JIT runs them
++
++    @classmethod
++    def tearDownClass(cls): cls.a.close()
++
++    def indirect(self, regs, nz=0):
++        return run(self.a, self.h, RANGES['indirect'][0], regs, nz)
++
++    def test_svc_in_jit_code_equals_the_reference(self):
++        cases = [({'x0': x, 'x1': ECHO, 'x2': RETONLY, 'x5': 3}, nz) for x in (0, 1, 9, M) for nz in (0, 9)]
++        logs = []
++        want = reference(RANGES['indirect'][0], [(r, n, SP) for r, n in cases], logs)
++        for (regs, nz), w, wl in zip(cases, want, logs):
++            same(self, self.indirect(regs, nz), w, f'{regs}')
++            self.assertEqual(self.h.log, wl)
++        self.assertGreaterEqual(self.a.stat('jit_entries'), len(cases))
++
++    def test_svc_in_jit_code_that_maps_memory(self):
++        got = self.indirect({'x0': 0x1000, 'x2': RETONLY, 'x1': HEAPFN, 'x3': 0xBEEF})   # HEAPFN stores x2 (the tail target) at [x1+8] and loads it back
++        self.assertEqual((got['x1'], got['x0']), (HEAP, RETONLY))
++
++    def test_a_pending_service_with_no_handler_is_an_explicit_error(self):
++        self.a.set_svc_handler(None)
++        try: got = self.indirect({'x1': ECHO, 'x2': RETONLY})
++        finally: self.a.set_svc_handler(self.h)
++        self.assertIn('svc #42', got['fault']); self.assertIn('no Horizon service handler', got['fault'])
++
++    def test_code_rewritten_by_another_thread_is_recompiled(self):
++        """thread A runs the code at SLOT in its JIT (movz x0,#1), thread B rewrites it by an AOT store, A runs it again and gets the new code"""
++        res, go, done = {}, threading.Event(), threading.Event()
++        def thread_a():
++            res['first'] = self.indirect({'x1': SLOT, 'x2': RETONLY})['x0']
++            done.set(); go.wait(10)
++            res['second'] = self.a.run(RANGES['indirect'][0], {'x1': SLOT, 'x2': RETONLY, 'x30': ref.STOP}, 0, SP)['x0']   # not run(): its reset() would put the old code back
++        t = threading.Thread(target=thread_a); t.start()
++        done.wait(10)
++        b = self.a.run(STORE, {'x0': SLOT, 'x1': fx.MOVZ(0, 7), 'x30': ref.STOP}, 0, SP)   # this thread is B: it has no JIT at all
++        self.assertNotIn('fault', b)
++        go.set(); t.join(10)
++        self.assertEqual((res['first'], res['second']), (1, 7))
++        self.assertGreaterEqual(self.a.stat('jit_invalidations'), 1)
++        self.a.reset()
++
++    def test_a_thread_spinning_in_jit_code_is_stopped_by_a_rewrite(self):
++        """A spins in `b .`; B replaces the branch by `ret`: A's compiled loop is halted and recompiled, so A returns (it would spin for ever otherwise)"""
++        res = {}
++        t = threading.Thread(target=lambda: res.update(self.indirect({'x1': SPIN, 'x2': RETONLY, 'x0': 5})))
++        t.daemon = True; t.start()
++        time.sleep(0.5)
++        self.assertTrue(t.is_alive(), 'the spin loop ended by itself')
++        self.a.run(STORE, {'x0': SPIN, 'x1': RET, 'x30': ref.STOP}, 0, SP)
++        t.join(10)
++        self.assertFalse(t.is_alive(), 'the spinning thread did not see the rewritten code')
++        self.assertNotIn('fault', res); self.assertEqual(res['x0'], 5)
++        self.a.reset()
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_aot_t3.py b/dm/tools/tests/test_aot_t3.py
+index 04e1c70..c3137f1 100644
+--- a/dm/tools/tests/test_aot_t3.py
++++ b/dm/tools/tests/test_aot_t3.py
+@@ -102,11 +102,14 @@ class Functions(unittest.TestCase):
+         got = self.aot.run(self.ranges['indirect'][0], {'x1': self.ranges['branch'][0], 'x2': mid, 'x30': ref.STOP}, 0, SP)
+         self.assertIn(f'indirect jump to {mid:#x}', got['fault']); self.assertIn('not the entry', got['fault'])
+ 
+-    def test_svc_is_not_translated_until_t5(self):
+-        """Remill has no semantics for `svc`: the function is refused with the instruction named, never run. T5 maps svc to the Horizon services"""
++    def test_svc_without_a_service_handler_is_an_explicit_error(self):
++        """`svc` lifts (Remill patch 0003); with no Horizon service handler set it stops naming the number and the address of the instruction. test_aot_svc.py connects the services"""
+         s, e = self.ranges['svc_setheap']
+-        with self.assertRaises(aot_lift.LiftError) as c: aot_lift.Aot([(s, self.code[s:e])])
+-        self.assertIn('svc #1', str(c.exception)); self.assertIn(f'{s:#x}', str(c.exception))
++        a = aot_lift.Aot([(s, self.code[s:e])])
++        try:
++            got = a.run(s, {'x30': ref.STOP}, 0, SP)
++            self.assertIn('svc #1', got['fault']); self.assertIn(f'{s:#x}', got['fault']); self.assertIn('no Horizon service handler', got['fault'])
++        finally: a.close()
+ 
+ 
+ if __name__ == '__main__':

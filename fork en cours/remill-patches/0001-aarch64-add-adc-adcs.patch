@@ -1,0 +1,135 @@
+From 63b348ef95f0fa048384be8f02686a589f08d484 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 14:07:18 +0100
+Subject: [PATCH] AArch64: add ADC and ADCS (semantics and decoders)
+
+The semantics follow the Arm ARM's AddWithCarry(src1, src2, PSTATE.C), like SBC/SBCS next to them;
+ADCS sets N, Z, C and V through AddWithCarryNZCV. The decoders reuse the three-register decoder
+(TryDecodeLSLV_*_DP_2SRC) as SBC does, and the `return false` stubs in Decode.cpp go.
+Checked against Unicorn's AArch64 core on 81 pairs of edge values x 16 NZCV states, 32 and 64 bits.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ lib/Arch/AArch64/Arch.cpp             | 20 ++++++++++++++++++++
+ lib/Arch/AArch64/Decode.cpp           | 12 ------------
+ lib/Arch/AArch64/Semantics/BINARY.cpp | 22 ++++++++++++++++++++++
+ 3 files changed, 42 insertions(+), 12 deletions(-)
+
+diff --git a/lib/Arch/AArch64/Arch.cpp b/lib/Arch/AArch64/Arch.cpp
+index c99a538..d11ff51 100644
+--- a/lib/Arch/AArch64/Arch.cpp
++++ b/lib/Arch/AArch64/Arch.cpp
+@@ -2670,6 +2670,26 @@ bool TryDecodeSBCS_64_ADDSUB_CARRY(const InstData &data, Instruction &inst) {
+   return TryDecodeSBC_64_ADDSUB_CARRY(data, inst);
+ }
+ 
++// ADC  <Wd>, <Wn>, <Wm>
++bool TryDecodeADC_32_ADDSUB_CARRY(const InstData &data, Instruction &inst) {
++  return TryDecodeLSLV_32_DP_2SRC(data, inst);
++}
++
++// ADC  <Xd>, <Xn>, <Xm>
++bool TryDecodeADC_64_ADDSUB_CARRY(const InstData &data, Instruction &inst) {
++  return TryDecodeLSLV_64_DP_2SRC(data, inst);
++}
++
++// ADCS  <Wd>, <Wn>, <Wm>
++bool TryDecodeADCS_32_ADDSUB_CARRY(const InstData &data, Instruction &inst) {
++  return TryDecodeADC_32_ADDSUB_CARRY(data, inst);
++}
++
++// ADCS  <Xd>, <Xn>, <Xm>
++bool TryDecodeADCS_64_ADDSUB_CARRY(const InstData &data, Instruction &inst) {
++  return TryDecodeADC_64_ADDSUB_CARRY(data, inst);
++}
++
+ // UCVTF  <Hd>, <Wn>
+ bool TryDecodeUCVTF_H32_FLOAT2INT(const InstData &data, Instruction &inst) {
+   AddRegOperand(inst, kActionWrite, kRegH, kUseAsValue, data.Rd);
+diff --git a/lib/Arch/AArch64/Decode.cpp b/lib/Arch/AArch64/Decode.cpp
+index ed8c30b..4bbeb56 100644
+--- a/lib/Arch/AArch64/Decode.cpp
++++ b/lib/Arch/AArch64/Decode.cpp
+@@ -21844,9 +21844,6 @@ bool TryDecodeCASLH_C32_LDSTEXCL(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 0 sf       0
+ // ADCS  <Wd>, <Wn>, <Wm>
+-bool TryDecodeADCS_32_ADDSUB_CARRY(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // ADCS ADCS_64_addsub_carry:
+ //   0 x Rd       0
+@@ -21882,9 +21879,6 @@ bool TryDecodeADCS_32_ADDSUB_CARRY(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 1 sf       0
+ // ADCS  <Xd>, <Xn>, <Xm>
+-bool TryDecodeADCS_64_ADDSUB_CARRY(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRINTZ FRINTZ_H_floatdp1:
+ //   0 x Rd       0
+@@ -36780,9 +36774,6 @@ bool TryDecodeSTSETLB_32S_MEMOP(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 0 sf       0
+ // ADC  <Wd>, <Wn>, <Wm>
+-bool TryDecodeADC_32_ADDSUB_CARRY(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // ADC ADC_64_addsub_carry:
+ //   0 x Rd       0
+@@ -36818,9 +36809,6 @@ bool TryDecodeADC_32_ADDSUB_CARRY(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 1 sf       0
+ // ADC  <Xd>, <Xn>, <Xm>
+-bool TryDecodeADC_64_ADDSUB_CARRY(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // BFM BFC_BFM_32M_bitfield:
+ //   0 x Rd       0
+diff --git a/lib/Arch/AArch64/Semantics/BINARY.cpp b/lib/Arch/AArch64/Semantics/BINARY.cpp
+index 81ac042..f7d3b11 100644
+--- a/lib/Arch/AArch64/Semantics/BINARY.cpp
++++ b/lib/Arch/AArch64/Semantics/BINARY.cpp
+@@ -184,6 +184,22 @@ DEF_ISEL(MSUB_64A_DP_3SRC) = MSUB<R64W, R64>;
+ 
+ namespace {
+ 
++// ADC and ADCS: dst = src1 + src2 + C (the Arm ARM's AddWithCarry(src1, src2, PSTATE.C)); ADCS also sets N, Z, C and V
++template <typename D, typename S>
++DEF_SEM(ADC, D dst, S src1, S src2) {
++  auto carry = ZExtTo<S>(Unsigned(FLAG_C));
++  WriteZExt(dst, UAdd(UAdd(Read(src1), Read(src2)), carry));
++  return memory;
++}
++
++template <typename D, typename S>
++DEF_SEM(ADCS, D dst, S src1, S src2) {
++  auto carry = ZExtTo<S>(Unsigned(FLAG_C));
++  auto res = AddWithCarryNZCV(state, Read(src1), Read(src2), Read(src2), carry);
++  WriteZExt(dst, res);
++  return memory;
++}
++
+ template <typename D, typename S>
+ DEF_SEM(SBC, D dst, S src1, S src2) {
+   auto carry = ZExtTo<S>(Unsigned(FLAG_C));
+@@ -202,6 +218,12 @@ DEF_SEM(SBCS, D dst, S src1, S src2) {
+ 
+ }  // namespace
+ 
++DEF_ISEL(ADC_32_ADDSUB_CARRY) = ADC<R32W, R32>;
++DEF_ISEL(ADC_64_ADDSUB_CARRY) = ADC<R64W, R64>;
++
++DEF_ISEL(ADCS_32_ADDSUB_CARRY) = ADCS<R32W, R32>;
++DEF_ISEL(ADCS_64_ADDSUB_CARRY) = ADCS<R64W, R64>;
++
+ DEF_ISEL(SBC_32_ADDSUB_CARRY) = SBC<R32W, R32>;
+ DEF_ISEL(SBC_64_ADDSUB_CARRY) = SBC<R64W, R64>;
+ 
+-- 
+2.56.0
+

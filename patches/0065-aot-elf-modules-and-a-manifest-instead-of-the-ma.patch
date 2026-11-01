@@ -1,0 +1,951 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 15:30:25 +0100
+Subject: [PATCH] aot: ELF modules and a manifest instead of the Mach-O
+ loader's inputs; imports; JIT entry from the harness (T6)
+
+elf_module.py turns an NSO into an ELF plus a manifest derived from it (segments, dynamic section, exports,
+imports, relocations, every function entry including PLT stubs the unwind data omits), checks a manifest
+against its ELF, relocates modules (RELATIVE, ABS64, GLOB_DAT, JUMP_SLOT), binds symbols to loaded modules,
+then host functions, and runs them through aot_lift. Imports are guest addresses that run host functions.
+Tests use synthetic modules with PLT/GOT, relocated pointer tables, init_array and weak symbols, equal to
+Unicorn running the same image.
+
+Upstream-Status: pending
+Reason: replaces the Mach-O-only module inputs for the AArch64 -> x86_64 recompilation (NX2Linux); host/loader.c and the shader chain are untouched
+Issue: none yet (NX2Linux, branch feat/teo-t6-manifeste-elf)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/aot_lift.py              |  17 +-
+ dm/tools/aot_runtime.cpp          |  57 +++++-
+ dm/tools/aot_runtime.h            |   6 +-
+ dm/tools/elf_module.py            | 276 ++++++++++++++++++++++++++++++
+ dm/tools/nso2elf.py               |  13 +-
+ dm/tools/tests/arm64_fixture.py   |  25 +--
+ dm/tools/tests/arm64_ref.py       |  15 +-
+ dm/tools/tests/module_fixture.py  | 150 ++++++++++++++++
+ dm/tools/tests/test_aot_stub.py   |   6 +-
+ dm/tools/tests/test_elf_module.py | 189 ++++++++++++++++++++
+ 10 files changed, 729 insertions(+), 25 deletions(-)
+ create mode 100644 dm/tools/elf_module.py
+ create mode 100644 dm/tools/tests/module_fixture.py
+ create mode 100644 dm/tools/tests/test_elf_module.py
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index ba8bc53..2733e8e 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -11,7 +11,7 @@ from pathlib import Path
+ 
+ HERE = Path(__file__).resolve().parent
+ RET = 0xD65F03C0
+-STATS = ('indirect_calls', 'indirect_jumps', 'fallback_requests', 'reads', 'writes', 'regions', 'jit_entries', 'jit_to_aot', 'jit_invalidations', 'jit_pages', 'unlifted_calls', 'svc_calls')
++STATS = ('indirect_calls', 'indirect_jumps', 'fallback_requests', 'reads', 'writes', 'regions', 'jit_entries', 'jit_to_aot', 'jit_invalidations', 'jit_pages', 'unlifted_calls', 'svc_calls', 'import_calls')
+ 
+ 
+ def missing_symbols(linker_stderr):
+@@ -206,6 +206,21 @@ class Aot:
+         self._svc = self.SVC(cb)   # kept alive: the library holds only the raw pointer
+         slot.value = ctypes.cast(self._svc, ctypes.c_void_p).value
+ 
++    IMPORT = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p)
++
++    def register_import(self, addr, fn, name):
++        """A host function at a guest address (the GOT of a loaded module points at it): fn(regs) gets x0..x30 as a list and changes it in place. fn None: an unresolved import, whose call stops naming it.
++        Returns 0, or 1 when the address is taken"""
++        L = self.lib
++        L.aot_register_import.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
++        cb = None
++        if fn is not None:
++            def call(regs, _):
++                r = list(regs[:31]); fn(r)
++                for i in range(31): regs[i] = r[i] & (2 ** 64 - 1)
++            cb = self.IMPORT(call); self._imports = getattr(self, '_imports', []) + [cb]   # kept alive: the library holds only the raw pointer
++        return L.aot_register_import(addr, ctypes.cast(cb, ctypes.c_void_p).value if cb else None, None, name.encode())
++
+     def peek(self, base, size):
+         buf = ctypes.create_string_buffer(size)
+         assert self.lib.aot_peek(base, buf, size) == 0
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index aeb86c2..898d333 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -52,13 +52,43 @@ uint8_t *guest(uint64_t a, uint64_t n, const char *what) {
+ 
+ }  // namespace
+ 
++// Imports: an open-addressing table on the address, filled under a mutex and read without one (the address is published last)
++struct ImportEnt { std::atomic<uint64_t> addr; AotImportFn fn; void *ctx; char name[64]; };
++enum { IMPORT_CAP = 8192 };
++ImportEnt g_imports[IMPORT_CAP];
++std::mutex g_imports_mu;
++unsigned g_nimports;
++inline unsigned import_slot(uint64_t a) { return (unsigned)(((a >> 2) * 0x9E3779B97F4A7C15ull) >> (64 - 13)); }
++ImportEnt *import_find(uint64_t a) {
++    for (unsigned i = import_slot(a);; i = (i + 1) & (IMPORT_CAP - 1)) {
++        uint64_t v = g_imports[i].addr.load(std::memory_order_acquire);
++        if (v == a) return &g_imports[i];
++        if (!v) return nullptr;
++    }
++}
+ extern "C" {
++Memory *import_call(State *st, uint64_t pc, Memory *m);
+ AotFallback aot_fallback;
+ AotWriteHook aot_write_hook;
+ AotFn aot_find(uint64_t pc) {
+     unsigned lo = 0, hi = aot_table_n;
+     while (lo < hi) { unsigned m = (lo + hi) / 2; if (aot_table[m].addr < pc) lo = m + 1; else hi = m; }
+-    return lo < aot_table_n && aot_table[lo].addr == pc ? aot_table[lo].fn : nullptr;
++    if (lo < aot_table_n && aot_table[lo].addr == pc) return aot_table[lo].fn;
++    return import_find(pc) ? import_call : nullptr;
++}
++int aot_register_import(uint64_t addr, AotImportFn fn, void *ctx, const char *name) {
++    std::lock_guard<std::mutex> g(g_imports_mu);
++    if (!addr || g_nimports >= IMPORT_CAP / 2 || import_find(addr)) return 1;
++    unsigned i = import_slot(addr);
++    while (g_imports[i].addr.load()) i = (i + 1) & (IMPORT_CAP - 1);
++    g_imports[i].fn = fn; g_imports[i].ctx = ctx; snprintf(g_imports[i].name, sizeof g_imports[i].name, "%s", name ? name : "?");
++    g_imports[i].addr.store(addr, std::memory_order_release); g_nimports++;
++    return 0;
++}
++void aot_unregister_imports() {   // the tests reuse a library: its import table is emptied with its regions
++    std::lock_guard<std::mutex> g(g_imports_mu);
++    for (ImportEnt &e : g_imports) e.addr.store(0);
++    g_nimports = 0;
+ }
+ uint8_t *aot_guest_ptr(uint64_t a, uint64_t n) {
+     for (unsigned i = 0, e = g_nregions.load(std::memory_order_acquire); i < e; i++) {
+@@ -149,6 +179,23 @@ Memory *__remill_async_hyper_call(State &st, uint64_t pc, Memory *m) {
+ }
+ Memory *__remill_missing_block(State &, uint64_t pc, Memory *) { fail("control reached %#llx, which was not lifted as code (a call returned to an unexpected address)", (unsigned long long)pc); }
+ 
++// A call of an import: pc is the address the guest branched to, which names the import
++Memory *import_call(State *st, uint64_t pc, Memory *m) {
++    ImportEnt *e = import_find(pc);
++    if (!e) fail("import at %#llx vanished", (unsigned long long)pc);
++    count(AOT_S_IMPORTS);
++    if (!e->fn) fail("call to the unresolved import %s (%#llx): no host function implements it", e->name, (unsigned long long)pc);
++    uint64_t regs[31];
++#define X(i) regs[i] = st->gpr.x##i.qword;
++    XREGS(X)
++#undef X
++    e->fn(regs, e->ctx);
++#define X(i) st->gpr.x##i.qword = regs[i];
++    XREGS(X)
++#undef X
++    return m;
++}
++
+ // The stub of a function the translator could not lift (generated by aot_lift.py): a direct `bl` to it still links, and runs the function through the JIT, or stops with the reason
+ Memory *aot_unlifted(State *st, uint64_t pc, Memory *m, const char *why) {
+     count(AOT_S_UNLIFTED); count(S_FALLBACK);
+@@ -180,7 +227,9 @@ int aot_unmap(uint64_t base) {
+     for (unsigned i = 0, n = g_nregions.load(); i < n; i++) if (g_regions[i].size && g_regions[i].base == base) { g_regions[i].size = 0; return 0; }
+     return 1;
+ }
++void aot_unregister_imports();
+ void aot_unmap_all() {
++    aot_unregister_imports();
+     std::lock_guard<std::mutex> g(g_regions_mu);
+     for (unsigned i = 0, n = g_nregions.load(); i < n; i++) { free(g_regions[i].host); g_regions[i].size = 0; g_regions[i].host = nullptr; }
+     g_nregions.store(0);
+@@ -203,8 +252,10 @@ int aot_run(Guest *g, uint64_t pc, char *err, uint64_t errn) {
+     else {
+         g_jb = &jb;
+         AotFn f = aot_find(pc);
+-        if (!f) fail("no AOT function at %#llx", (unsigned long long)pc);
+-        f(&st, pc, reinterpret_cast<Memory *>(&g_stats));   // the Memory token is never dereferenced: the regions are global
++        Memory *token = reinterpret_cast<Memory *>(&g_stats);   // the Memory token is never dereferenced: the regions are global
++        if (f) f(&st, pc, token);
++        else if (aot_fallback) { count(S_FALLBACK); aot_fallback(&st, pc, token, 0); }   // an entry the translator did not lift (a stub, a module's init function) runs in the JIT
++        else fail("no AOT function at %#llx", (unsigned long long)pc);
+     }
+     g_jb = nullptr;
+ #define X(i) g->x[i] = st.gpr.x##i.qword;
+diff --git a/dm/tools/aot_runtime.h b/dm/tools/aot_runtime.h
+index c8d4e22..0784979 100644
+--- a/dm/tools/aot_runtime.h
++++ b/dm/tools/aot_runtime.h
+@@ -6,7 +6,7 @@
+ typedef Memory *(*AotFn)(State *, uint64_t, Memory *);
+ // Statistics, in the order aot_lift.py names them (STATS)
+ enum { AOT_S_CALLS, AOT_S_JUMPS, AOT_S_FALLBACK, AOT_S_READS, AOT_S_WRITES, AOT_S_REGIONS,
+-       AOT_S_JIT_ENTRIES, AOT_S_JIT_TO_AOT, AOT_S_JIT_INVALIDATIONS, AOT_S_JIT_PAGES, AOT_S_UNLIFTED, AOT_S_SVC, AOT_S_N };
++       AOT_S_JIT_ENTRIES, AOT_S_JIT_TO_AOT, AOT_S_JIT_INVALIDATIONS, AOT_S_JIT_PAGES, AOT_S_UNLIFTED, AOT_S_SVC, AOT_S_IMPORTS, AOT_S_N };
+ 
+ extern "C" {
+ AotFn aot_find(uint64_t pc);                                  // the AOT function whose entry is pc, or null
+@@ -23,6 +23,10 @@ extern AotFallback aot_fallback;
+ // Its return value is not used: a service answers in the registers, as on the console. Without a handler an svc is an explicit error.
+ typedef uint64_t (*AotSvcHandler)(int num, uint64_t *regs, uint64_t orig_addr);
+ extern AotSvcHandler aot_svc_handler;
++// Imports of a loaded module (elf_module.py): an address in guest space that is no code but a host function, as the GOT of a module points at the HLE functions of the real loader. Calling it
++// (blr, br, or a call from JIT code) runs fn(regs, ctx) with x0..x30 (it writes its answers back there); fn null: the import is unresolved and calling it is an explicit error naming it.
++typedef void (*AotImportFn)(uint64_t *regs, void *ctx);
++int aot_register_import(uint64_t addr, AotImportFn fn, void *ctx, const char *name);   // 0, or 1 when addr is taken or the table is full
+ // Called after any write to guest memory by AOT code or the harness, so that the JIT can drop the code it compiled from those bytes
+ typedef void (*AotWriteHook)(uint64_t addr, uint64_t n);
+ extern AotWriteHook aot_write_hook;
+diff --git a/dm/tools/elf_module.py b/dm/tools/elf_module.py
+new file mode 100644
+index 0000000..67154af
+--- /dev/null
++++ b/dm/tools/elf_module.py
+@@ -0,0 +1,276 @@
++#!/usr/bin/env python3
++"""ELF modules for the recompiled runtime (NX2Linux T6): what the Mach-O loader (host/loader.c) got from Mach-O sections, `<name>.patched.bin`, `<name>.fixups.tsv` and `nro.tsv` is now an ELF and a manifest.
++  · convert_nso(nso, out_dir, name) writes `<name>.elf` (nso2elf.py: the NSO's memory layout as PT_LOAD/PT_DYNAMIC/PT_GNU_EH_FRAME) and `<name>.manifest.json`, which lists what the recompiler and the loader need
++    and would otherwise rediscover: segments, the dynamic section, exports, imports, relocations, and every function entry (unwind data, exported functions, the targets of direct calls and of function
++    pointers in the data). The manifest is *derived from the ELF*: load_manifest regenerates it and refuses a manifest that does not match its ELF (SHA-256 and content).
++  · ModuleSet(manifests, hle) maps the modules at bases of its own, applies the relocations as loader.c relocate() does (RELATIVE, ABS64, GLOB_DAT, JUMP_SLOT), binds each symbol to a loaded module's export, then to a
++    host function in `hle` (an *import*: an address in guest space that runs a Python/C function, aot_runtime.cpp), then to 0 for a weak one, and otherwise to an import that stops with its name when called. Nothing is
++    bound silently. build() lifts every function with aot_lift.Aot; functions Remill cannot lift run in the JIT.
++  · what the Mach-O build needed for the iOS/Apple kernel is not needed here and is not produced: the patch area (x18, TLS register and svc rewrites: the recompiled code handles those itself, T3/T5), the key page
++    (pthread TSD slots), the 16K re-mapping, signed code segments, the embedded NRO table (the manifest per module replaces it).
++Usage: elf_module.py <module.nso> <out_dir> <name>"""
++import hashlib, json, os, struct, sys
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++import nso2elf, nso_code
++
++FORMAT = 'nx2linux-module/1'
++PAGE = 0x1000
++PT_LOAD, PT_DYNAMIC, PT_GNU_EH_FRAME = 1, 2, 0x6474e550
++DT = {2: 'PLTRELSZ', 5: 'STRTAB', 6: 'SYMTAB', 7: 'RELA', 8: 'RELASZ', 9: 'RELAENT', 10: 'STRSZ', 11: 'SYMENT', 12: 'INIT', 13: 'FINI', 20: 'PLTREL', 23: 'JMPREL', 25: 'INIT_ARRAY', 27: 'INIT_ARRAYSZ'}
++R_ABS64, R_GLOB_DAT, R_JUMP_SLOT, R_RELATIVE = 257, 1025, 1026, 1027
++RNAME = {R_ABS64: 'ABS64', R_GLOB_DAT: 'GLOB_DAT', R_JUMP_SLOT: 'JUMP_SLOT', R_RELATIVE: 'RELATIVE'}
++STOP = 0xFFFF0000   # the x30 the harness gives a function it calls: never executed
++
++
++class ModuleError(Exception):
++    pass
++
++
++def page(x): return (x + PAGE - 1) & ~(PAGE - 1)
++
++
++# ---- reading an ELF module ----
++def parse_elf(data):
++    """(loads, dynamic vaddr, eh_frame_hdr vaddr) of an ELF64 AArch64 shared object; ModuleError names what is wrong"""
++    if len(data) < 0x40 or data[:4] != b'\x7fELF' or data[4] != 2 or data[5] != 1: raise ModuleError('not a little-endian ELF64 file')
++    etype, machine = struct.unpack_from('<HH', data, 16)
++    if etype != 3 or machine != 183: raise ModuleError(f'ELF type {etype} machine {machine}: a shared object (3) for AArch64 (183) is needed')
++    phoff, phentsize, phnum = struct.unpack_from('<QxxxxxxxxxxxxxxHH', data, 32)[0], *struct.unpack_from('<HH', data, 54)
++    loads, dyn, eh = [], None, None
++    for i in range(phnum):
++        t, flags, off, va, _, filesz, memsz, _ = struct.unpack_from('<IIQQQQQQ', data, phoff + i * phentsize)
++        if t == PT_LOAD:
++            if off + filesz > len(data) or filesz > memsz: raise ModuleError(f'PT_LOAD {i} runs past the file or its memory size')
++            loads.append(dict(vaddr=va, offset=off, filesz=filesz, memsz=memsz, flags=flags))
++        elif t == PT_DYNAMIC: dyn = va
++        elif t == PT_GNU_EH_FRAME: eh = va
++    if not loads: raise ModuleError('no PT_LOAD segment')
++    return loads, dyn, eh
++
++
++def image_of(data, loads):
++    """The module's memory (bss included) as the loader lays it out at base 0"""
++    size = max(s['vaddr'] + s['memsz'] for s in loads)
++    img = bytearray(size)
++    for s in loads: img[s['vaddr']:s['vaddr'] + s['filesz']] = data[s['offset']:s['offset'] + s['filesz']]
++    return img
++
++
++def read_dynamic(img, dyn):
++    if dyn is None: raise ModuleError('no PT_DYNAMIC')
++    out, o = {}, dyn
++    while True:
++        tag, val = struct.unpack_from('<qQ', img, o); o += 16
++        if tag == 0: return out
++        if tag in DT: out[DT[tag]] = val
++        if o > len(img) - 16: raise ModuleError('the dynamic section has no end')
++
++
++def read_symbols(img, dynamic):
++    """[(name, binding, type, defined, value, size)], index 0 being the null symbol. The count is (strtab - symtab) / 24, as host/loader.c has it: the table must end where the string table begins"""
++    if 'SYMTAB' not in dynamic or 'STRTAB' not in dynamic: return []
++    sym, st = dynamic['SYMTAB'], dynamic['STRTAB']
++    if st < sym or (st - sym) % 24: raise ModuleError('the symbol table does not end where the string table begins (host/loader.c relies on that too)')
++    out = []
++    for i in range((st - sym) // 24):
++        name, info, _, shndx, value, size = struct.unpack_from('<IBBHQQ', img, sym + 24 * i)
++        end = img.index(b'\0', st + name)
++        out.append((bytes(img[st + name:end]).decode(), info >> 4, info & 15, shndx != 0, value, size))
++    return out
++
++
++def read_relocs(img, dynamic):
++    """[(offset, type, symbol index, addend, table)] from DT_RELA and DT_JMPREL"""
++    out = []
++    for key, size_key, table in (('RELA', 'RELASZ', 'rela'), ('JMPREL', 'PLTRELSZ', 'plt')):
++        if key not in dynamic: continue
++        n = dynamic.get(size_key, 0) // 24
++        for i in range(n):
++            off, info, add = struct.unpack_from('<QQq', img, dynamic[key] + 24 * i)
++            out.append((off, info & 0xFFFFFFFF, info >> 32, add, table))
++    return out
++
++
++def find_functions(img, text_end, symbols, relocs):
++    """{start: (end, how)}: every function entry the recompiler must know. how: 'fde' (unwind data), 'export' (an exported function without one), 'call' (the target of a direct bl or b outside every known
++    function: the PLT stubs and tail-called code the unwind data does not describe) or 'pointer' (a function pointer a RELATIVE relocation stores). A discovered entry runs to the next known entry and is scanned
++    up to its first unconditional branch, so the data after a stub is not mistaken for code"""
++    import capstone
++    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM); md.detail = True
++    try: fde = [(s, e) for s, e in nso_code.fde_ranges(img) if 0 <= s < e <= text_end]
++    except (AssertionError, ValueError, IndexError, struct.error) as e: raise ModuleError(f'cannot read the function boundaries from the unwind data: {e}') from e
++    funcs = {s: [e, 'fde'] for s, e in fde}
++    def covered(a): return any(s <= a < v[0] for s, v in funcs.items())
++    def add(a, how):
++        if a % 4 or not 0 <= a < text_end or covered(a): return False
++        nxt = min([s for s in funcs if s > a] + [text_end])
++        funcs[a] = [nxt, how]
++        for s, v in funcs.items():   # an earlier entry that ran over the new one ends where it starts
++            if s < a < v[0]: v[0] = a
++        return True
++    queue = []
++    for name, _, typ, defined, value, _ in symbols:
++        if defined and typ == 2 and add(value, 'export'): queue.append(value)
++    for off, t, _, addend, _ in relocs:
++        if t == R_RELATIVE and add(addend, 'pointer'): queue.append(addend)
++    queue += [s for s in funcs if funcs[s][1] == 'fde']
++    seen = set()
++    while queue:
++        s = queue.pop()
++        if s in seen: continue
++        seen.add(s)
++        e, how = funcs[s]
++        for a in range(s, e, 4):
++            ins = next(md.disasm(bytes(img[a:a + 4]), a), None)
++            if ins is None: continue
++            m = ins.mnemonic
++            if m in ('b', 'bl'):
++                t = int(ins.op_str.rsplit('#', 1)[1], 0)
++                if not (s <= t < funcs[s][0]) and add(t, 'call'): queue.append(t)
++            if how != 'fde' and (m in ('b', 'br', 'ret') or m == 'blr' and False): break
++    return {s: (v[0], v[1]) for s, v in sorted(funcs.items())}
++
++
++def describe(data, name, elf_name, build_id=''):
++    """The manifest of an ELF module (a dict, JSON-able). Everything but name, elf and build_id is derived from the ELF alone"""
++    loads, dyn, eh = parse_elf(data)
++    img = image_of(data, loads)
++    dynamic = read_dynamic(img, dyn)
++    syms, relocs = read_symbols(img, dynamic), read_relocs(img, dynamic)
++    text = next((s for s in loads if s['flags'] & 1), None)
++    if text is None: raise ModuleError('no executable PT_LOAD')
++    funcs = find_functions(img, text['vaddr'] + text['filesz'], syms, relocs)
++    counts = {}
++    for _, t, *_ in relocs: counts[RNAME.get(t, str(t))] = counts.get(RNAME.get(t, str(t)), 0) + 1
++    return dict(format=FORMAT, name=name, elf=elf_name, build_id=build_id, sha256=hashlib.sha256(data).hexdigest(),
++                segments=[dict(vaddr=s['vaddr'], filesz=s['filesz'], memsz=s['memsz'], perms=('r' if s['flags'] & 4 else '-') + ('w' if s['flags'] & 2 else '-') + ('x' if s['flags'] & 1 else '-')) for s in loads],
++                size=len(img), dynamic=dynamic, eh_frame_hdr=eh,
++                functions=[dict(start=s, end=e, how=h) for s, (e, h) in funcs.items()],
++                exports=[dict(name=n, addr=v, type='func' if t == 2 else 'object' if t == 1 else str(t), size=z) for n, b, t, d, v, z in syms[1:] if d],
++                imports=[dict(name=n, weak=b == 2) for n, b, t, d, v, z in syms[1:] if not d],
++                relocations=counts)
++
++
++def convert_nso(nso_path, out_dir, name):
++    """NSO -> `<name>.elf` + `<name>.manifest.json` in out_dir; returns both paths"""
++    import nso
++    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
++    elf, man = out / f'{name}.elf', out / f'{name}.manifest.json'
++    nso2elf.convert(str(nso_path), str(elf))
++    m = describe(elf.read_bytes(), name, elf.name, nso.cli_read(str(nso_path)).build_id.hex())
++    man.write_text(json.dumps(m, indent=1, sort_keys=True) + '\n')
++    return elf, man
++
++
++def load_manifest(path):
++    """(manifest, ELF bytes), after checking that the manifest describes that ELF: its SHA-256 and everything derived from it"""
++    path = Path(path)
++    try: m = json.loads(path.read_text())
++    except (OSError, ValueError) as e: raise ModuleError(f'{path}: {e}') from None
++    if m.get('format') != FORMAT: raise ModuleError(f'{path}: format {m.get("format")!r}, not {FORMAT!r}')
++    elf = path.parent / m['elf']
++    try: data = elf.read_bytes()
++    except OSError as e: raise ModuleError(f'{path}: {e}') from None
++    if hashlib.sha256(data).hexdigest() != m['sha256']: raise ModuleError(f'{path}: {elf.name} is not the ELF this manifest was made from (SHA-256 differs)')
++    want = describe(data, m['name'], m['elf'], m['build_id'])
++    for k in want:
++        if want[k] != m.get(k): raise ModuleError(f'{path}: "{k}" does not match what the ELF says')
++    return m, data
++
++
++# ---- the loader ----
++class Loaded:
++    def __init__(self, manifest, data, base):
++        self.m, self.name, self.base = manifest, manifest['name'], base
++        loads, _, _ = parse_elf(data)
++        self.image = image_of(data, loads)
++        self.size = page(len(self.image))
++        self.exports = {e['name']: base + e['addr'] for e in manifest['exports']}
++        self.functions = [(base + f['start'], base + f['end']) for f in manifest['functions']]
++        self.relocs = read_relocs(self.image, manifest['dynamic'])
++        self.symbols = read_symbols(self.image, manifest['dynamic'])
++
++
++class ModuleSet:
++    BASE, GAP = 0x08000000, 0x10000
++    STACK, STACK_SIZE = 0x01000000, 0x10000
++    IMPORT_BASE = 0x70000000
++
++    def __init__(self, manifests, hle=None, base=BASE):
++        """manifests: paths of `<name>.manifest.json` in load order. hle: {symbol name: fn(regs) or None}, the host functions an import can reach; fn gets x0..x30 as a list and changes it in place"""
++        self.hle, self.modules, self.imports, self.aot = dict(hle or {}), [], {}, None
++        for p in manifests:
++            m, data = load_manifest(p)
++            if any(x.name == m['name'] for x in self.modules): raise ModuleError(f'module {m["name"]} loaded twice')
++            self.modules.append(Loaded(m, data, base)); base += page(len(self.modules[-1].image)) + self.GAP
++        self.exports = {}
++        for mod in self.modules:
++            for n, a in mod.exports.items(): self.exports.setdefault(n, a)   # the first definition wins, as in loaded_sym (loader.c)
++        self.log = []
++        for mod in self.modules: self._relocate(mod)
++
++    def _import_address(self, name):
++        if name not in self.imports: self.imports[name] = self.IMPORT_BASE + 16 * len(self.imports)
++        return self.imports[name]
++
++    def _resolve(self, sym, rel_off, mod):
++        name, binding, _, defined, value, _ = sym
++        if defined and name not in self.exports: return mod.base + value
++        if name in self.exports: return self.exports[name]
++        if name in self.hle: return self._import_address(name)
++        if binding == 2: self.log.append(f'{mod.name}: undefined weak {name} bound to 0'); return 0
++        self.log.append(f'{mod.name}: {name} is not defined by any module nor by the host: its calls stop with its name'); return self._import_address(name)
++
++    def _relocate(self, mod):
++        n = len(mod.image)
++        for off, t, si, add, _ in mod.relocs:
++            if off % 8 or off + 8 > n: raise ModuleError(f'{mod.name}: relocation at {off:#x} is outside the module or not aligned')
++            if t == R_RELATIVE: v = mod.base + add
++            elif t in (R_ABS64, R_GLOB_DAT, R_JUMP_SLOT):
++                if si >= len(mod.symbols): raise ModuleError(f'{mod.name}: relocation at {off:#x} names symbol {si}, past the table')
++                v = self._resolve(mod.symbols[si], off, mod) + (add if t != R_JUMP_SLOT else 0)
++            else: raise ModuleError(f'{mod.name}: relocation type {t} at {off:#x} is not translated (only RELATIVE, ABS64, GLOB_DAT, JUMP_SLOT)')
++            struct.pack_into('<Q', mod.image, off, v & (2 ** 64 - 1))
++
++    def symbol(self, name):
++        if name not in self.exports: raise ModuleError(f'no loaded module defines {name}')
++        return self.exports[name]
++
++    def build(self, jit=False, **kw):
++        """Lift every function, map the modules, the stack and the imports; returns the aot_lift.Aot"""
++        import aot_lift
++        funcs = [(a, bytes(mod.image[a - mod.base:e - mod.base])) for mod in self.modules for a, e in mod.functions]
++        self.aot = aot_lift.Aot(funcs, jit=jit, stub_unliftable=True, **kw)
++        for mod in self.modules: self.aot.map(mod.base, mod.size, bytes(mod.image) + bytes(mod.size - len(mod.image)))
++        self.aot.map(self.STACK, self.STACK_SIZE)
++        for name, addr in self.imports.items():
++            if self.aot.register_import(addr, self.hle.get(name), name): raise ModuleError(f'import {name} at {addr:#x} could not be registered')
++        return self.aot
++
++    def call(self, name_or_addr, regs=None, **kw):
++        """Run an exported function (or an address) on the harness stack; the result of Aot.run"""
++        a = name_or_addr if isinstance(name_or_addr, int) else self.symbol(name_or_addr)
++        return self.aot.run(a, dict(regs or {}, x30=STOP), 0, self.STACK + self.STACK_SIZE, **kw)
++
++    def run_inits(self):
++        """DT_INIT, then each DT_INIT_ARRAY entry of each module in load order (host/loader.c run_module_inits); the first fault is returned, else None"""
++        for mod in self.modules:
++            d = mod.m['dynamic']
++            todo = [mod.base + d['INIT']] if 'INIT' in d else []
++            if 'INIT_ARRAY' in d:
++                for i in range(d.get('INIT_ARRAYSZ', 0) // 8):
++                    (a,) = struct.unpack_from('<Q', mod.image, d['INIT_ARRAY'] + 8 * i)
++                    if a not in (0, 2 ** 64 - 1): todo.append(a)
++            for a in todo:
++                r = self.call(a)
++                if 'fault' in r: return f'{mod.name}: init at {a:#x}: {r["fault"]}'
++        return None
++
++
++if __name__ == '__main__':
++    if len(sys.argv) != 4: sys.exit(__doc__)
++    elf, man = convert_nso(*sys.argv[1:4])
++    print(elf, man)
+diff --git a/dm/tools/nso2elf.py b/dm/tools/nso2elf.py
+index b347321..8a0a817 100644
+--- a/dm/tools/nso2elf.py
++++ b/dm/tools/nso2elf.py
+@@ -14,8 +14,8 @@ def load(path):
+     m = nso.cli_read(path)
+     return bytes(m.image), list(m.segments), m.bss, m.build_id
+ 
+-def main():
+-    src, dst = sys.argv[1:3]
++def convert(src, dst):
++    """Write the ELF of the NSO/NRO src to dst; returns the summary line main prints"""
+     img, (text, ro, data), bss, build_id = load(src)
+     mod0 = struct.unpack_from('<I', img, 4)[0]
+     if img[mod0:mod0 + 4] != b'MOD0': sys.exit('no MOD0 header')
+@@ -35,8 +35,11 @@ def main():
+                      for t, f, va, fsz, msz in ph)
+     out = bytearray(HDR + len(img)); out[0:len(ehdr)] = ehdr; out[0x40:0x40 + len(phdrs)] = phdrs
+     out[HDR:] = img
+-    open(dst, 'wb').write(out)
+-    print('%s: text %#x+%#x ro %#x+%#x data %#x+%#x bss %#x dyn %d entries eh_frame_hdr %s build_id %s'
+-          % (dst, *text, *ro, *data, bss, n, '%#x' % eh_s if eh_e > eh_s else 'none', build_id.hex()))
++    with open(dst, 'wb') as f: f.write(out)
++    return ('%s: text %#x+%#x ro %#x+%#x data %#x+%#x bss %#x dyn %d entries eh_frame_hdr %s build_id %s'
++            % (dst, *text, *ro, *data, bss, n, '%#x' % eh_s if eh_e > eh_s else 'none', build_id.hex()))
++
++def main():
++    print(convert(*sys.argv[1:3]))
+ 
+ if __name__ == '__main__': main()
+diff --git a/dm/tools/tests/arm64_fixture.py b/dm/tools/tests/arm64_fixture.py
+index 6d5627d..1629e24 100644
+--- a/dm/tools/tests/arm64_fixture.py
++++ b/dm/tools/tests/arm64_fixture.py
+@@ -57,19 +57,13 @@ def text_layout():
+ def _uleb_pad(b, to): return b + bytes(to - len(b))
+ 
+ 
+-def build(words=None):
+-    """The fixture NSO file (bytes, uncompressed, segment hash flags cleared as a modified main has them) and {name: (start, end)}. words replaces the text words (a test corrupts one)."""
+-    text_words, ranges, has_fde = text_layout()
+-    text_words = list(words) if words is not None else text_words
+-    text = bytearray(struct.pack('<%dI' % len(text_words), *text_words))
+-    ro_off = (len(text) + PAGE - 1) & ~(PAGE - 1)
+-    mod0, cie_at = 0, 0x40   # ro: MOD0 at 0, the .eh_frame at 0x40
+-    # .eh_frame: a CIE (zR, code align 4, data align -8, return register x30, FDE pointers pc-relative sdata4) and one FDE per function that has unwind data
++def eh_frame(fdes, ro_off, cie_at=0x40):
++    """(.eh_frame, .eh_frame_hdr, offset of the hdr in ro) for the functions [(start, end)] of a module whose ro starts at ro_off and holds the .eh_frame at cie_at:
++    a CIE (zR, code align 4, data align -8, return register x30, FDE pointers pc-relative sdata4) and one FDE per function, and the binary search table of the hdr"""
+     eh = bytearray()
+     eh += struct.pack('<IIB', 20, 0, 1) + b'zR\0' + bytes([4, 0x78, 30, 1, 0x1b, 0x0c, 31, 0]); eh = bytearray(_uleb_pad(bytes(eh), 24))
+     table = []   # (function start, FDE offset) for the binary search table
+-    for name, (s, e) in sorted(ranges.items(), key=lambda kv: kv[1]):
+-        if not has_fde[name]: continue
++    for s, e in sorted(fdes):
+         fde = ro_off + cie_at + len(eh)
+         pos = fde + 8   # where pc_begin is stored; the encoding is relative to it
+         eh += _uleb_pad(struct.pack('<IIiiB', 20, (fde + 4) - (ro_off + cie_at), s - pos, e - s, 0), 24)
+@@ -79,6 +73,17 @@ def build(words=None):
+     ehs = ro_off + hdr_at
+     hdr = struct.pack('<BBBBi', 1, 0x1b, 0x03, 0x3b, (ro_off + cie_at) - (ehs + 4)) + struct.pack('<I', len(table))   # version, eh_frame_ptr pcrel sdata4, count udata4, table datarel sdata4
+     hdr += b''.join(struct.pack('<ii', s - ehs, f - ehs) for s, f in table)
++    return bytes(eh), hdr, hdr_at
++
++
++def build(words=None):
++    """The fixture NSO file (bytes, uncompressed, segment hash flags cleared as a modified main has them) and {name: (start, end)}. words replaces the text words (a test corrupts one)."""
++    text_words, ranges, has_fde = text_layout()
++    text_words = list(words) if words is not None else text_words
++    text = bytearray(struct.pack('<%dI' % len(text_words), *text_words))
++    ro_off = (len(text) + PAGE - 1) & ~(PAGE - 1)
++    mod0, cie_at = 0, 0x40   # ro: MOD0 at 0, the .eh_frame at 0x40
++    eh, hdr, hdr_at = eh_frame([ranges[n] for n in sorted(ranges, key=lambda n: ranges[n]) if has_fde[n]], ro_off, cie_at)
+     ro = bytearray(hdr_at + len(hdr)); ro[cie_at:cie_at + len(eh)] = eh; ro[hdr_at:] = hdr
+     # MOD0: magic, dynamic (none: an empty one is at the end of ro), bss start/end, eh_frame_hdr start/end (relative to MOD0), library name offset
+     dyn_at = (len(ro) + 15) & ~15; ro += bytes(dyn_at + 16 - len(ro))
+diff --git a/dm/tools/tests/arm64_ref.py b/dm/tools/tests/arm64_ref.py
+index 1051949..9ee272c 100644
+--- a/dm/tools/tests/arm64_ref.py
++++ b/dm/tools/tests/arm64_ref.py
+@@ -67,9 +67,9 @@ def run_words(words, cases, steps=100):
+     return out
+ 
+ 
+-def run_image(code, entry, cases, mem=None, steps=1000000, stop=STOP, svc=None):
++def run_image(code, entry, cases, mem=None, steps=1000000, stop=STOP, svc=None, imports=None):
+     """Run the function at `entry` of `code` (mapped at address 0) once per case on one Unicorn core, with the memory regions {base: bytes} (a size that is a whole number of pages) restored before each case.
+-    A case is (registers {'x0': v, ...}, nzcv in, sp); the registers may also hold 'tpidr_el0' and 'tpidrro_el0'. svc: a factory svc(uc) returning the handler handler(num, regs, orig_addr) (regs: list x0..x30 it changes
++    A case is (registers {'x0': v, ...}, nzcv in, sp); the registers may also hold 'tpidr_el0' and 'tpidrro_el0'. imports: {address: fn(regs)}, host functions at addresses a loaded module's GOT points at: the address holds a `ret`; a hook on it runs fn on the registers as a list, then the `ret` returns to x30. svc: a factory svc(uc) returning the handler handler(num, regs, orig_addr) (regs: list x0..x30 it changes
+     in place, the shape of svc_dispatch), called once per case; its reset(uc) method, when it has one, runs after the case (to drop what the services mapped). Returns, per case, {'x0'..'x30', 'sp', 'nzcv', 'mem': {base: bytes}}, or {'fault': reason} when the core raised (a fetch, read or write outside the regions)."""
+     from unicorn import Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM
+     from unicorn.arm64_const import UC_ARM64_REG_X0, UC_ARM64_REG_X30, UC_ARM64_REG_SP, UC_ARM64_REG_NZCV
+@@ -90,6 +90,17 @@ def run_image(code, entry, cases, mem=None, steps=1000000, stop=STOP, svc=None):
+         handler[0]((w >> 5) & 0xFFFF, r, at)
+         for i in range(31): u.reg_write(xreg(i), r[i] & MASK)
+     if svc: uc.hook_add(UC_HOOK_INTR, on_intr)
++    if imports:   # each import address holds a `ret`, and a hook on that instruction runs the host function first; the `ret` then returns to x30
++        from unicorn import UC_HOOK_CODE
++        lo, hi = min(imports) & ~0xFFF, (max(imports) + 0x1000) & ~0xFFF
++        uc.mem_map(lo, hi - lo); uc.mem_write(lo, b'\xc0\x03\x5f\xd6' * ((hi - lo) // 4))
++        def on_import(u, addr, size, _):
++            fn = imports.get(addr)
++            if fn is None: return
++            r = [u.reg_read(xreg(i)) for i in range(31)]
++            fn(r)
++            for i in range(31): u.reg_write(xreg(i), r[i] & MASK)
++        uc.hook_add(UC_HOOK_CODE, on_import, begin=lo, end=hi)
+     out = []
+     for regs, nzcv, sp in cases:
+         handler[0] = svc(uc) if svc else None
+diff --git a/dm/tools/tests/module_fixture.py b/dm/tools/tests/module_fixture.py
+new file mode 100644
+index 0000000..5634b68
+--- /dev/null
++++ b/dm/tools/tests/module_fixture.py
+@@ -0,0 +1,150 @@
++"""Synthetic Switch modules with a dynamic section (NX2Linux T6): functions that reach a host function through a PLT stub and a GOT slot, a table of function pointers that only a relocation fills in, exported
++data, an init_array entry, an undefined weak symbol and an import nobody implements. Built from a spec, so a test can make as many modules as it needs; no game data. The result is an NSO (uncompressed, segment
++hash flags cleared as in arm64_fixture.py) that nso2elf.py turns into the ELF the loader reads.
++  spec = dict(name='a', funcs=[Fn(name, export, asm)], imports=[(name, weak, 'plt' | 'got')], data=[(name, export, value | [('func', fname), ...])], inits=[fname], bss=0x100)
++asm(c, me) returns the function's words; c.fn(name), c.got(import) and c.data(name) are addresses (0 on the sizing pass)."""
++import hashlib, struct, sys, os
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++import arm64_fixture as fx
++from nso_asm import B, NOP, ADRP, ADDI, BR, BLR, LDRX, STP_PRE, LDP_POST
++
++PAGE = 0x1000
++R_ABS64, R_GLOB_DAT, R_JUMP_SLOT, R_RELATIVE = 257, 1025, 1026, 1027
++DT = dict(NULL=0, PLTRELSZ=2, STRTAB=5, SYMTAB=6, RELA=7, RELASZ=8, RELAENT=9, STRSZ=10, SYMENT=11, INIT=12, PLTREL=20, JMPREL=23, INIT_ARRAY=25, INIT_ARRAYSZ=27)
++RET = fx.RET
++
++
++class Fn:
++    def __init__(self, name, export, asm, fde=True): self.name, self.export, self.asm, self.fde = name, export, asm, fde
++
++
++def page(x): return (x + PAGE - 1) & ~(PAGE - 1)
++
++
++class _Ctx:
++    def __init__(self, fns=None, gots=None, datas=None): self._f, self._g, self._d = fns or {}, gots or {}, datas or {}
++    def fn(self, n): return self._f.get(n, 0)
++    def got(self, n): return self._g.get(n, 0)
++    def data(self, n): return self._d.get(n, 0)
++
++
++def plt(name):
++    """The classic stub: adrp x16, GOT page; ldr x17, [x16, #slot]; add x16, x16, #slot; br x17"""
++    def asm(c, me):
++        g = c.got(name)
++        return [ADRP(16, me, g), LDRX(17, 16, (g & 0xFFF) // 8), ADDI(16, 16, g & 0xFFF), BR(17)]
++    return asm
++
++
++def build(spec):
++    """(NSO bytes, info) with info = dict(name, text/ro/data offsets, fn {name: (start, end)}, got {import: address}, data {name: address}, bss)"""
++    funcs, imports, data, inits, bss = spec['funcs'], spec.get('imports', []), spec.get('data', []), spec.get('inits', []), spec.get('bss', 0x100)
++    def assemble(c):
++        ws, at, o = [], {}, 0x10
++        sizes = {}
++        for f in funcs:
++            w = f.asm(c, c.fn(f.name) or o); sizes[f.name] = len(w) * 4; at[f.name] = o; o += sizes[f.name]
++            ws.append(w)
++        return ws, at, sizes
++    ws, at, sizes = assemble(_Ctx())                                  # sizing pass
++    text_len = 0x10 + sum(sizes.values()); ro_off = page(text_len)
++    ranges = {f.name: (at[f.name], at[f.name] + sizes[f.name]) for f in funcs}
++    # data layout: GOT slots, then the data symbols (each as many words as it has), then the init_array
++    d, got, dsym = 0, {}, {}
++    for n, _, _ in imports: got[n] = d; d += 8
++    for n, _, v in data: dsym[n] = d; d += 8 * (len(v) if isinstance(v, list) else 1)
++    init_at = d; d += 8 * len(inits)
++    data_len = d
++    # ro: MOD0, .eh_frame + hdr, dynsym, dynstr, rela.dyn, rela.plt, dynamic
++    eh, hdr, hdr_at = fx.eh_frame([ranges[f.name] for f in funcs if f.fde], ro_off)
++    names = [n for n, _, _ in imports] + [f.name for f in funcs if f.export] + [n for n, e, _ in data if e]
++    strtab = b'\0'; stroff = {}
++    for n in names: stroff[n] = len(strtab); strtab += n.encode() + b'\0'
++    nsym = 1 + len(names)
++    sym_at = (hdr_at + len(hdr) + 7) & ~7; str_at = sym_at + 24 * nsym
++    rela_at = (str_at + len(strtab) + 7) & ~7
++    # data_off needs the ro size, which needs the relocation counts only (not the addresses): two passes over the addresses
++    n_dyn = sum(1 for n, _, k in imports if k == 'got') + sum(len(v) if isinstance(v, list) else 0 for _, _, v in data) + len(inits)
++    n_plt = sum(1 for n, _, k in imports if k == 'plt')
++    plt_at = rela_at + 24 * n_dyn; dyn_at = (plt_at + 24 * n_plt + 15) & ~15
++    n_tags = 11 + (1 if inits else 0) * 2
++    ro_len = dyn_at + 16 * n_tags
++    data_off = ro_off + page(ro_len)
++    A = lambda ro_rel: ro_off + ro_rel
++    ctx = _Ctx({f.name: at[f.name] for f in funcs}, {n: data_off + o for n, o in got.items()}, {n: data_off + o for n, o in dsym.items()})
++    ws, at, sizes = assemble(ctx)
++    assert len(ws) == len(funcs) and all(len(w) * 4 == sizes[f.name] for w, f in zip(ws, funcs))
++    text = [B(0, 0x10), ro_off, NOP, NOP] + [x for w in ws for x in w]
++    textb = bytearray(struct.pack('<%dI' % len(text), *text)); textb += bytes(ro_off - len(textb))
++    ro = bytearray(ro_len)
++    # MOD0: magic, dynamic, bss start and end (relative to MOD0, which is at ro_off), eh_frame_hdr start and end, library name
++    struct.pack_into('<4siiiiii', ro, 0, b'MOD0', dyn_at, data_off + data_len - ro_off, data_off + data_len + bss - ro_off, hdr_at, hdr_at + len(hdr), 0)
++    ro[0x40:0x40 + len(eh)] = eh; ro[hdr_at:hdr_at + len(hdr)] = hdr
++    # symbols: null, imports (undefined), exports (defined)
++    syms = [struct.pack('<IBBHQQ', 0, 0, 0, 0, 0, 0)]
++    for n, weak, _ in imports: syms.append(struct.pack('<IBBHQQ', stroff[n], ((2 if weak else 1) << 4) | 2, 0, 0, 0, 0))
++    for f in funcs:
++        if f.export: syms.append(struct.pack('<IBBHQQ', stroff[f.name], (1 << 4) | 2, 0, 1, at[f.name], sizes[f.name]))
++    for n, e, v in data:
++        if e: syms.append(struct.pack('<IBBHQQ', stroff[n], (1 << 4) | 1, 0, 2, data_off + dsym[n], 8 * (len(v) if isinstance(v, list) else 1)))
++    ro[sym_at:sym_at + 24 * nsym] = b''.join(syms); ro[str_at:str_at + len(strtab)] = strtab
++    symidx = {n: i + 1 for i, n in enumerate(names)}
++    dyn_rel = [(data_off + got[n], R_GLOB_DAT, symidx[n], 0) for n, _, k in imports if k == 'got']
++    for n, _, v in data:
++        if isinstance(v, list):
++            for i, (kind, fname) in enumerate(v): assert kind == 'func'; dyn_rel.append((data_off + dsym[n] + 8 * i, R_RELATIVE, 0, at[fname]))
++    for i, fname in enumerate(inits): dyn_rel.append((data_off + init_at + 8 * i, R_RELATIVE, 0, at[fname]))
++    plt_rel = [(data_off + got[n], R_JUMP_SLOT, symidx[n], 0) for n, _, k in imports if k == 'plt']
++    for base, rows in ((rela_at, dyn_rel), (plt_at, plt_rel)):
++        for i, (off, t, si, add) in enumerate(rows): struct.pack_into('<QQq', ro, base + 24 * i, off, (si << 32) | t, add)
++    tags = [(DT['PLTRELSZ'], 24 * n_plt), (DT['JMPREL'], A(plt_at)), (DT['PLTREL'], 7), (DT['RELA'], A(rela_at)), (DT['RELASZ'], 24 * n_dyn), (DT['RELAENT'], 24),
++            (DT['STRTAB'], A(str_at)), (DT['SYMTAB'], A(sym_at)), (DT['STRSZ'], len(strtab)), (DT['SYMENT'], 24)]
++    if inits: tags += [(DT['INIT_ARRAY'], data_off + init_at), (DT['INIT_ARRAYSZ'], 8 * len(inits))]
++    tags.append((DT['NULL'], 0))
++    assert len(tags) <= n_tags, (len(tags), n_tags)
++    for i, (t, v) in enumerate(tags): struct.pack_into('<qQ', ro, dyn_at + 16 * i, t, v)
++    datab = bytearray(data_len)
++    for n, _, v in data:
++        if not isinstance(v, list): struct.pack_into('<Q', datab, dsym[n], v)
++    hdr_nso = bytearray(0x100); hdr_nso[:4] = b'NSO0'; hdr_nso[0x40:0x60] = hashlib.sha256(b'nx2linux-module-' + spec['name'].encode()).digest()
++    struct.pack_into('<I', hdr_nso, 0x3c, bss)
++    body, fo = b'', 0x100
++    for i, (seg, mo) in enumerate(((bytes(textb), 0), (bytes(ro), ro_off), (bytes(datab), data_off))):
++        struct.pack_into('<III', hdr_nso, 0x10 + 0x10 * i, fo + len(body), mo, len(seg)); struct.pack_into('<I', hdr_nso, 0x60 + 4 * i, len(seg))
++        hdr_nso[0xa0 + 0x20 * i:0xc0 + 0x20 * i] = hashlib.sha256(seg).digest(); body += seg
++    info = dict(name=spec['name'], ro_off=ro_off, data_off=data_off, fn={n: (a, a + sizes[n]) for n, a in at.items()}, got={n: data_off + o for n, o in got.items()},
++                data={n: data_off + o for n, o in dsym.items()}, init_array=data_off + init_at, bss=bss, data_len=data_len)
++    return bytes(hdr_nso + body), info
++
++
++# ---- the two modules of the tests ----
++def module_a():
++    """Exports mod_entry (x0 -> hle_add(x0, 5) + 1), mod_table_call (x0 = index, x1 = argument: calls fa or fb through a table the relocations fill in), mod_value_get, mod_init (init_array: sets mod_value),
++    mod_weak_get (the GOT slot of an undefined weak symbol), mod_calls_missing (an import nobody implements)"""
++    def mod_entry(c, me): return [STP_PRE(29, 30, 31, -16), fx.MOVZ(1, 5), fx.BL(me + 8, c.fn('plt_hle_add')), ADDI(0, 0, 1), LDP_POST(29, 30, 31, 16), RET]
++    def mod_table_call(c, me):
++        t = c.data('mod_table')
++        return [STP_PRE(29, 30, 31, -16), ADRP(2, me + 4, t), ADDI(2, 2, t & 0xFFF), 0xF8607843, fx.MOV(0, 1), BLR(3), LDP_POST(29, 30, 31, 16), RET]   # ldr x3, [x2, x0, lsl #3]
++    def mod_value_get(c, me): v = c.data('mod_value'); return [ADRP(0, me, v), LDRX(0, 0, (v & 0xFFF) // 8), RET]
++    def mod_init(c, me): v = c.data('mod_value'); return [ADRP(0, me, v), fx.MOVZ(1, 0x1234), 0xF9000001 | (((v & 0xFFF) // 8) << 10), RET]   # str x1, [x0, #lo]
++    def mod_weak_get(c, me): g = c.got('weak_fn'); return [ADRP(0, me, g), LDRX(0, 0, (g & 0xFFF) // 8), RET]
++    def mod_calls_missing(c, me): return [STP_PRE(29, 30, 31, -16), fx.BL(me + 4, c.fn('plt_missing_fn')), LDP_POST(29, 30, 31, 16), RET]
++    return dict(name='a', funcs=[
++        Fn('plt_hle_add', False, plt('hle_add'), fde=False), Fn('plt_missing_fn', False, plt('missing_fn'), fde=False),
++        Fn('mod_entry', True, mod_entry), Fn('mod_table_call', True, mod_table_call),
++        Fn('fa', False, lambda c, me: [fx.ADDR(0, 0, 0), RET]), Fn('fb', False, lambda c, me: [ADDI(0, 0, 100), RET]),
++        Fn('mod_value_get', True, mod_value_get), Fn('mod_init', True, mod_init), Fn('mod_weak_get', True, mod_weak_get), Fn('mod_calls_missing', True, mod_calls_missing)],
++        imports=[('hle_add', False, 'plt'), ('missing_fn', False, 'plt'), ('weak_fn', True, 'got')],
++        data=[('mod_value', True, 0x1111), ('mod_table', False, [('func', 'fa'), ('func', 'fb')])], inits=['mod_init'])
++
++
++def module_b():
++    """Imports mod_entry from module a: its call goes to a's function, not to a host function"""
++    def b_call(c, me): return [STP_PRE(29, 30, 31, -16), fx.BL(me + 4, c.fn('plt_mod_entry')), ADDI(0, 0, 1000), LDP_POST(29, 30, 31, 16), RET]
++    return dict(name='b', funcs=[Fn('plt_mod_entry', False, plt('mod_entry'), fde=False), Fn('b_call', True, b_call)], imports=[('mod_entry', False, 'plt')])
++
++
++def module_c():
++    """c_main starts with a register-form ccmn, which Remill cannot lift: it runs in the JIT, and its call through the PLT reaches the host function from there"""
++    def c_main(c, me): return [STP_PRE(29, 30, 31, -16), 0xBA408000, fx.ADDR(0, 0, 1), fx.MOVZ(1, 3), fx.BL(me + 16, c.fn('plt_hle_add')), LDP_POST(29, 30, 31, 16), RET]
++    return dict(name='c', funcs=[Fn('plt_hle_add', False, plt('hle_add'), fde=False), Fn('c_main', True, c_main)], imports=[('hle_add', False, 'plt')])
+diff --git a/dm/tools/tests/test_aot_stub.py b/dm/tools/tests/test_aot_stub.py
+index 4cca9fd..20d6830 100644
+--- a/dm/tools/tests/test_aot_stub.py
++++ b/dm/tools/tests/test_aot_stub.py
+@@ -66,11 +66,11 @@ class Stub(unittest.TestCase):
+             self.assertEqual(a.stat('unlifted_calls'), len(cases)); self.assertEqual(a.stat('jit_entries'), len(cases))
+         finally: a.close()
+ 
+-    def test_an_indirect_call_to_the_unliftable_function_goes_to_the_jit_too(self):
++    def test_entering_the_unliftable_function_directly_goes_to_the_jit_too(self):
+         a = mapped(aot_lift.Aot([fn(G, 4)], jit=True, stub_unliftable=True))
+         try:
+-            r = a.run(G, {'x0': 4, 'x1': 5, 'x30': ref.STOP}, 0, SP)   # aot_run starts at an AOT entry: G is not one, so it is no AOT function
+-            self.assertIn('fault', r)
++            r = a.run(G, {'x0': 4, 'x1': 5, 'x30': ref.STOP}, 0, SP)   # G is no AOT function: the harness entry falls back to the JIT, as an indirect call does
++            self.assertNotIn('fault', r); self.assertEqual((r['x0'], a.stat('jit_entries')), (9, 1))
+         finally: a.close()
+ 
+     def test_a_function_that_lifts_but_needs_an_undefined_runtime_symbol_is_stubbed(self):
+diff --git a/dm/tools/tests/test_elf_module.py b/dm/tools/tests/test_elf_module.py
+new file mode 100644
+index 0000000..078b706
+--- /dev/null
++++ b/dm/tools/tests/test_elf_module.py
+@@ -0,0 +1,189 @@
++"""T6: ELF modules and a manifest instead of the Mach-O loader's inputs. A synthetic module (module_fixture.py: a PLT stub and GOT slot reaching a host function, a function-pointer table only relocations fill in,
++exported data, an init_array entry, an undefined weak symbol, an import nobody implements) goes NSO -> ELF + manifest -> relocated and mapped -> lifted -> run, and equals the Unicorn ARM64 reference running the
++same relocated image. The manifest is checked against its ELF; every kind of loading failure is an explicit error naming the module and the symbol or address.
++Needs REMILL_BUILD, clang++, unicorn and capstone; the JIT tests also DYNARMIC_DIR; skipped otherwise."""
++import json, os, struct, sys, tempfile, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_ref as ref
++import elf_module as em
++import module_fixture as mf
++from test_aot_t3 import READY, same
++
++try: import capstone  # noqa: F401
++except ImportError: capstone = None
++READY = READY and capstone
++JIT_READY = READY and os.path.exists(os.path.join(os.environ.get('DYNARMIC_DIR', '/nonexistent'), 'build/src/dynarmic/libdynarmic.a'))
++M = ref.MASK
++HLE = {'hle_add': lambda r: r.__setitem__(0, (r[0] + r[1]) & M)}
++
++
++def make_dir(*specs):
++    d = tempfile.TemporaryDirectory()
++    for sp in specs:
++        nso, info = mf.build(sp)
++        p = Path(d.name) / f'{sp["name"]}.nso'; p.write_bytes(nso); em.convert_nso(p, d.name, sp['name'])
++    return d, [str(Path(d.name) / f'{sp["name"]}.manifest.json') for sp in specs]
++
++
++def reference(ms, entry, regs_list):
++    """Unicorn on the relocated images of ms, with the same host functions at the same import addresses"""
++    mem = {m.base: bytes(m.image) + bytes(m.size - len(m.image)) for m in ms.modules}
++    mem[ms.STACK] = bytes(ms.STACK_SIZE)
++    imports = {a: ms.hle[n] for n, a in ms.imports.items() if ms.hle.get(n)}
++    return ref.run_image(b'\0' * 0x1000, entry, [(dict(r, x30=em.STOP), 0, ms.STACK + ms.STACK_SIZE) for r in regs_list], mem, stop=em.STOP, imports=imports)
++
++
++class Manifest(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.dir, cls.paths = make_dir(mf.module_a(), mf.module_b())
++
++    @classmethod
++    def tearDownClass(cls): cls.dir.cleanup()
++
++    def test_manifest_lists_what_the_loader_needs(self):
++        m = json.loads(Path(self.paths[0]).read_text())
++        self.assertEqual(m['format'], em.FORMAT)
++        self.assertEqual([s['perms'] for s in m['segments']], ['r-x', 'r--', 'rw-'])
++        self.assertEqual({e['name'] for e in m['exports']}, {'mod_entry', 'mod_table_call', 'mod_value_get', 'mod_init', 'mod_weak_get', 'mod_calls_missing', 'mod_value'})
++        self.assertEqual([(i['name'], i['weak']) for i in m['imports']], [('hle_add', False), ('missing_fn', False), ('weak_fn', True)])
++        self.assertEqual(m['relocations'], {'GLOB_DAT': 1, 'JUMP_SLOT': 2, 'RELATIVE': 3})
++        hows = {f['start']: f['how'] for f in m['functions']}
++        info = mf.build(mf.module_a())[1]
++        for stub in ('plt_hle_add', 'plt_missing_fn'): self.assertEqual(hows[info['fn'][stub][0]], 'call', stub)   # no unwind entry: found as call targets
++        self.assertEqual(hows[info['fn']['mod_entry'][0]], 'fde')
++        self.assertEqual(len(m['functions']), len(info['fn']))
++
++    def test_the_manifest_is_reproducible(self):
++        d2, p2 = make_dir(mf.module_a())
++        try: self.assertEqual(Path(self.paths[0]).read_text(), Path(p2[0]).read_text())
++        finally: d2.cleanup()
++
++    def test_a_manifest_that_does_not_match_its_elf_is_refused(self):
++        m = json.loads(Path(self.paths[0]).read_text())
++        for key, value, what in (('exports', m['exports'][:-1], 'exports'), ('functions', m['functions'][1:], 'functions'), ('size', 1, 'size')):
++            bad = Path(self.dir.name) / 'bad.manifest.json'
++            bad.write_text(json.dumps(dict(m, **{key: value})))
++            with self.assertRaisesRegex(em.ModuleError, f'"{what}" does not match'): em.load_manifest(bad)
++
++    def test_an_elf_that_changed_is_refused(self):
++        elf = Path(self.dir.name) / 'a.elf'; good = elf.read_bytes()
++        try:
++            elf.write_bytes(good[:-1] + bytes([good[-1] ^ 1]))
++            with self.assertRaisesRegex(em.ModuleError, 'SHA-256 differs'): em.load_manifest(self.paths[0])
++        finally: elf.write_bytes(good)
++
++    def test_files_that_are_not_modules_are_explicit_errors(self):
++        for data, why in ((b'', 'not a little-endian ELF64'), (b'\x7fELF\x02\x01' + bytes(100), 'shared object')):
++            with self.assertRaisesRegex(em.ModuleError, why): em.parse_elf(data)
++        junk = Path(self.dir.name) / 'junk.manifest.json'; junk.write_text('{"format": "other"}')
++        with self.assertRaisesRegex(em.ModuleError, 'format'): em.load_manifest(junk)
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++, unicorn and capstone')
++class Loading(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.dir, cls.paths = make_dir(mf.module_a(), mf.module_b())
++        cls.ms = em.ModuleSet(cls.paths, HLE)
++        cls.aot = cls.ms.build()
++
++    @classmethod
++    def tearDownClass(cls): cls.aot.close(); cls.dir.cleanup()
++
++    def run_both(self, name, cases):
++        entry = self.ms.symbol(name)
++        want = reference(self.ms, entry, cases)
++        for regs, w in zip(cases, want):
++            self.aot.reset()
++            self.assertNotIn('fault', w, f'{name} {regs}: the reference faulted: {w.get("fault")}')
++            same(self, self.ms.call(name, regs), w, f'{name} {regs}')
++
++    def test_nothing_needed_the_jit_or_the_stubs(self):
++        self.assertEqual(self.aot.unlifted, {})
++
++    def test_a_plt_stub_reaches_the_host_function(self):
++        self.run_both('mod_entry', [{'x0': x} for x in (0, 7, M, 1 << 63)])
++        self.aot.reset(); self.assertEqual(self.ms.call('mod_entry', {'x0': 7})['x0'], 13)
++        self.assertGreater(self.aot.stat('import_calls'), 0)
++
++    def test_relocated_function_pointers_are_called(self):
++        self.run_both('mod_table_call', [{'x0': i, 'x1': v} for i in (0, 1) for v in (0, 21, M)])
++        self.aot.reset(); self.assertEqual([self.ms.call('mod_table_call', {'x0': i, 'x1': 21})['x0'] for i in (0, 1)], [42, 121])
++
++    def test_exported_data_and_the_init_array(self):
++        self.run_both('mod_value_get', [{}])
++        self.aot.reset()
++        self.assertEqual(self.ms.call('mod_value_get')['x0'], 0x1111)
++        self.assertIsNone(self.ms.run_inits())
++        self.assertEqual(self.ms.call('mod_value_get')['x0'], 0x1234)   # mod_init ran from the init_array the RELATIVE relocation filled in
++        self.aot.reset()
++
++    def test_a_weak_symbol_nobody_defines_is_bound_to_zero(self):
++        self.run_both('mod_weak_get', [{}])
++        self.assertEqual(self.ms.call('mod_weak_get')['x0'], 0)
++        self.assertIn('a: undefined weak weak_fn bound to 0', self.ms.log)
++
++    def test_another_modules_export_is_bound_before_the_host(self):
++        """b imports mod_entry, which a defines: the GOT slot holds a's function, not an import address"""
++        b = self.ms.modules[1]
++        slot = mf.build(mf.module_b())[1]['got']['mod_entry']
++        self.assertEqual(struct.unpack_from('<Q', b.image, slot)[0], self.ms.symbol('mod_entry'))
++        self.run_both('b_call', [{'x0': x} for x in (0, 3, M)])
++        self.aot.reset(); self.assertEqual(self.ms.call('b_call', {'x0': 3})['x0'], 3 + 5 + 1 + 1000)
++
++    def test_an_import_nobody_implements_stops_with_its_name(self):
++        got = self.ms.call('mod_calls_missing')
++        self.assertIn('unresolved import missing_fn', got['fault'])
++        self.assertIn('missing_fn is not defined by any module nor by the host', ' '.join(self.ms.log))
++
++    def test_the_symbols_modules_define_are_the_first_definitions(self):
++        self.assertEqual(self.ms.symbol('mod_value'), self.ms.modules[0].base + 0x2018)
++        with self.assertRaisesRegex(em.ModuleError, 'no loaded module defines nothing_here'): self.ms.symbol('nothing_here')
++
++
++@unittest.skipUnless(JIT_READY, 'needs REMILL_BUILD, DYNARMIC_DIR, clang++, unicorn and capstone')
++class LoadingWithJit(unittest.TestCase):
++    def test_a_function_remill_cannot_lift_runs_in_the_jit_and_still_reaches_the_host_function(self):
++        d, paths = make_dir(mf.module_c())
++        try:
++            ms = em.ModuleSet(paths, HLE)
++            aot = ms.build(jit=True)
++            try:
++                entry = ms.symbol('c_main')
++                self.assertEqual(list(aot.unlifted), [entry]); self.assertIn('ccmn', aot.unlifted[entry])
++                cases = [{'x0': x, 'x1': y} for x in (0, 5, M) for y in (0, 1, 1 << 63)]
++                for regs, w in zip(cases, reference(ms, entry, cases)):
++                    aot.reset(); same(self, ms.call('c_main', regs), w, f'{regs}')
++                self.assertEqual(aot.stat('jit_entries'), len(cases)); self.assertGreaterEqual(aot.stat('import_calls'), len(cases))
++            finally: aot.close()
++        finally: d.cleanup()
++
++
++class Errors(unittest.TestCase):
++    def test_an_unsupported_relocation_type_is_an_explicit_error(self):
++        d, paths = make_dir(mf.module_a())
++        try:
++            elf = Path(d.name) / 'a.elf'; data = bytearray(elf.read_bytes())
++            m = json.loads(Path(paths[0]).read_text())
++            rela = m['dynamic']['RELA'] + 0x1000   # the file offset of the image is 0x1000 (nso2elf.HDR)
++            struct.pack_into('<Q', data, rela + 8, (0 << 32) | 1024)   # R_AARCH64_COPY in the first relocation
++            elf.write_bytes(data)
++            m['sha256'] = __import__('hashlib').sha256(bytes(data)).hexdigest(); m['relocations'] = {'1024': 1, 'GLOB_DAT': 0, 'JUMP_SLOT': 2, 'RELATIVE': 3}
++            m['relocations'] = em.describe(bytes(data), 'a', 'a.elf', m['build_id'])['relocations']
++            Path(paths[0]).write_text(json.dumps(m))
++            with self.assertRaisesRegex(em.ModuleError, 'relocation type 1024'): em.ModuleSet(paths, HLE)
++        finally: d.cleanup()
++
++    def test_two_modules_of_one_name_are_refused(self):
++        d, paths = make_dir(mf.module_a())
++        try:
++            with self.assertRaisesRegex(em.ModuleError, 'loaded twice'): em.ModuleSet(paths + paths, HLE)
++        finally: d.cleanup()
++
++
++if __name__ == '__main__': unittest.main()
