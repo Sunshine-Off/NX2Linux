@@ -26,6 +26,9 @@ int nx2linux_host_init(Nx2LinuxHost *host, const Nx2LinuxHostConfig *config)
     if (config->hidden) {
         flags |= SDL_WINDOW_HIDDEN;
     }
+    if (config->vulkan) {
+        flags |= SDL_WINDOW_VULKAN;
+    }
     host->window = SDL_CreateWindow(config->title != NULL ? config->title : "NX2Linux",
                                     config->width, config->height, flags);
     if (host->window == NULL) {

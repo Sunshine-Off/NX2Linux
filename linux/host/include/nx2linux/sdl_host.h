@@ -36,6 +36,7 @@ typedef struct Nx2LinuxHostConfig {
     int width;
     int height;
     bool hidden;
+    bool vulkan;
 } Nx2LinuxHostConfig;
 
 typedef struct Nx2LinuxHost {
