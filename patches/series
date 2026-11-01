@@ -39,3 +39,4 @@
 0058-tests-adc-and-adcs-join-the-instructions-checked.patch
 0059-aot-lift-ahead-of-time-recompilation-of-aarch64.patch
 0060-tests-aot-runtime-atomics-and-barriers-ldxr-stxr.patch
+0061-aot-jit-dynarmic-as-the-jit-fallback-of-the-aot.patch
