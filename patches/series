@@ -49,3 +49,4 @@
 0068-aot-floating-point-and-vector-memory-instruction.patch
 0069-aot-neon-coverage-blocker-3-closed-for-balatro-t.patch
 0070-aot-ext-crc32-and-yield-found-by-balatro-s-main.patch
+0071-aot-modules-laid-out-contiguously-cross-module-e.patch

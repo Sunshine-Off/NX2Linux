@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 22:58:26 +0100
+Subject: [PATCH] aot: modules laid out contiguously, cross-module entries,
+ tail calls and fall-through, thread-local region (S7: Balatro's main and sdk
+ run up to the SDK's first abort)
+
+Found booting a retail game's main and sdk (NX2Linux S7). Horizon's rtld places modules back to back, and a bl from main into sdk is encoded for that distance: the 64 KiB gap ModuleSet left between modules sent it to the wrong place, so the gap is 0. A bl or b into another module, and a bl into its own function's range, is an entry the module's own scan cannot know: both now split the function there. __remill_missing_block continued nowhere: a direct b out of a function is a tail call and a split function falls through, so it now continues at the AOT entry at that address (an address that is not an entry still stops with its name). The harness thread gets a ThreadLocalRegion with TLR[0x1f8] pointing at a thread object and TLR[0x110] its ID, as host/thread.c does; the SDK reads its thread through them.
+
+Result on Balatro: 61,468 entries (main and sdk) build, run to the SDK's init, and stop at svcBreak from nn::diag's abort (no Horizon service layer on Linux yet). Tests: test_aot_tailcall.py (3), the AOT and ELF module suites (81) pass.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: AArch64 -> x86_64 recompilation (NX2Linux S7): module layout, cross-module entries, tail calls and thread-local region found by booting a real game; tests use synthetic code
+Issue: none yet (NX2Linux, branch swann/jalon-s7-first-game)
+
+---
+ dm/tools/aot_runtime.cpp            |  7 ++++-
+ dm/tools/elf_module.py              | 38 +++++++++++++++++++++--
+ dm/tools/tests/test_aot_tailcall.py | 47 +++++++++++++++++++++++++++++
+ 3 files changed, 89 insertions(+), 3 deletions(-)
+ create mode 100644 dm/tools/tests/test_aot_tailcall.py
+
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index 6d90e85..de91bd3 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -188,7 +188,12 @@ Memory *__remill_async_hyper_call(State &st, uint64_t pc, Memory *m) {
+ #undef X
+     return m;
+ }
+-Memory *__remill_missing_block(State &, uint64_t pc, Memory *) { fail("control reached %#llx, which was not lifted as code (a call returned to an unexpected address)", (unsigned long long)pc); }
++// Control left the bytes lifted for one function: a direct `b` to another function (a tail call: the callee returns to our caller, as x30 is untouched) or a fall-through into the next entry
++// (a function split at an inner entry). Both continue at an AOT entry; anything else was never lifted
++Memory *__remill_missing_block(State &st, uint64_t pc, Memory *m) {
++    if (AotFn f = aot_find(pc)) { count(S_JUMPS); return f(&st, pc, m); }
++    fail("control reached %#llx, which was not lifted as code (a call returned to an unexpected address)", (unsigned long long)pc);
++}
+ 
+ // A call of an import: pc is the address the guest branched to, which names the import
+ Memory *import_call(State *st, uint64_t pc, Memory *m) {
+diff --git a/dm/tools/elf_module.py b/dm/tools/elf_module.py
+index c721ac6..d5a78b0 100644
+--- a/dm/tools/elf_module.py
++++ b/dm/tools/elf_module.py
+@@ -136,7 +136,7 @@ def find_functions(img, text_end, symbols, relocs):
+             m = ins.mnemonic
+             if m in ('b', 'bl'):
+                 t = int(ins.op_str.rsplit('#', 1)[1], 0)
+-                if not (s <= t < funcs[s][0]) and add(t, 'call'): queue.append(t)
++                if (m == 'bl' or not (s <= t < funcs[s][0])) and add(t, 'call'): queue.append(t)   # a bl into its own function's range is a call to a second entry (an outlined or merged body): it needs a symbol of its own
+             if how != 'fde' and m in ('b', 'br', 'ret'): break
+     return {s: (v[0], v[1]) for s, v in sorted(funcs.items())}
+ 
+@@ -211,8 +211,10 @@ class Loaded:
+ 
+ 
+ class ModuleSet:
+-    BASE, GAP = 0x08000000, 0x10000
++    BASE = 0x08000000
++    GAP = 0   # modules are contiguous, each starting where the previous one's bss ends (page aligned), as Horizon's rtld lays them out: a direct bl from main into sdk is encoded for that distance and lands in the wrong place with a gap
+     STACK, STACK_SIZE = 0x01000000, 0x10000
++    TLS, TLS_SIZE = 0x00100000, 0x10000   # the harness thread's thread-local region: tpidrro_el0 points at its start (Horizon's 0x200-byte region, then the thread object), tpidr_el0 a user TLS block after both
+     IMPORT_BASE = 0x70000000
+ 
+     def __init__(self, manifests, hle=None, base=BASE):
+@@ -255,14 +257,45 @@ class ModuleSet:
+         if name not in self.exports: raise ModuleError(f'no loaded module defines {name}')
+         return self.exports[name]
+ 
++    def _link_cross_module_calls(self):
++        """A direct bl or b from one module into another (main into sdk, laid out back to back as Horizon's rtld does) is encoded for that distance. Its target is an entry the other module's own scan
++        could not know: it lands inside a function, or on code its unwind data does not describe. Each such target becomes an entry (the function is split there, as find_functions does inside a module);
++        returns how many were added"""
++        import bisect, capstone
++        md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM); md.detail = False; md.skipdata = True
++        added = 0
++        for mod in self.modules:
++            targets = set()
++            for a, e in mod.functions:
++                for ins in md.disasm(bytes(mod.image[a - mod.base:e - mod.base]), a):
++                    if ins.mnemonic in ('b', 'bl'):
++                        t = int(ins.op_str.rsplit('#', 1)[1], 0)
++                        if not mod.base <= t < mod.base + mod.size: targets.add(t)
++            for t in sorted(targets):
++                other = next((m for m in self.modules if m is not mod and m.base <= t < m.base + len(m.image)), None)
++                if other is None or t % 4: continue   # outside every module: left to the linker's error, which names it
++                starts = [f[0] for f in other.functions]
++                i = bisect.bisect_right(starts, t) - 1
++                if i >= 0 and other.functions[i][0] == t: continue
++                if i >= 0 and t < other.functions[i][1]:
++                    a, e = other.functions[i]
++                    other.functions[i:i + 1] = [(a, t), (t, e)]
++                else: other.functions.insert(i + 1, (t, starts[i + 1] if i + 1 < len(starts) else t + 4))
++                added += 1
++        return added
++
+     def build(self, jit=False, **kw):
+         """Lift every function, map the modules, the stack and the imports; returns the aot_lift.Aot"""
+         import aot_lift
++        self.cross_entries = self._link_cross_module_calls()
+         funcs = [(a, bytes(mod.image[a - mod.base:e - mod.base])) for mod in self.modules for a, e in mod.functions]
+         funcs += [(a, bytes(mod.image[o - mod.base:e - mod.base]), o) for mod in self.modules for a, e, o in mod.jump_targets]   # the cases of a switch: lifted from their own address, with the function around them
+         self.aot = aot_lift.Aot(funcs, jit=jit, stub_unliftable=True, **kw)
+         for mod in self.modules: self.aot.map(mod.base, mod.size, bytes(mod.image) + bytes(mod.size - len(mod.image)))
+         self.aot.map(self.STACK, self.STACK_SIZE)
++        tls = bytearray(self.TLS_SIZE)   # what the kernel owns (host/thread.c): the ThreadLocalRegion, and right after it the current thread object that TLR[0x1f8] points at (the SDK reads its state through it)
++        struct.pack_into('<Q', tls, 0x1f8, self.TLS + 0x200); struct.pack_into('<Q', tls, 0x110, 1)   # TLR[0x110]: the thread's ID
++        self.aot.map(self.TLS, self.TLS_SIZE, bytes(tls))
+         for name, addr in self.imports.items():
+             if self.aot.register_import(addr, self.hle.get(name), name): raise ModuleError(f'import {name} at {addr:#x} could not be registered')
+         return self.aot
+@@ -270,6 +303,7 @@ class ModuleSet:
+     def call(self, name_or_addr, regs=None, **kw):
+         """Run an exported function (or an address) on the harness stack; the result of Aot.run"""
+         a = name_or_addr if isinstance(name_or_addr, int) else self.symbol(name_or_addr)
++        kw.setdefault('tpidrro_el0', self.TLS); kw.setdefault('tpidr_el0', self.TLS + 0x800)
+         return self.aot.run(a, dict(regs or {}, x30=STOP), 0, self.STACK + self.STACK_SIZE, **kw)
+ 
+     def run_inits(self):
+diff --git a/dm/tools/tests/test_aot_tailcall.py b/dm/tools/tests/test_aot_tailcall.py
+new file mode 100644
+index 0000000..75d20c6
+--- /dev/null
++++ b/dm/tools/tests/test_aot_tailcall.py
+@@ -0,0 +1,47 @@
++"""A direct `b` out of a function (a tail call) and a fall-through into the next entry (a function split at an inner entry) continue at the AOT entry there (NX2Linux S7: found on a real
++module, where sdk functions end in `b other` and `bl` into their own range splits them). Synthetic code, no game data. Needs REMILL_BUILD and clang++; skipped otherwise."""
++import struct, sys, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++from test_aot_t3 import READY
++
++RET = 0xD65F03C0
++STOP = 0xFFFF0000
++
++
++def words(*w): return struct.pack(f'<{len(w)}I', *w)
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++ and unicorn')
++class TailCall(unittest.TestCase):
++    def test_b_to_another_function_is_a_tail_call(self):
++        # f1: mov x0, #5 ; b f2          f2: add x0, x0, #1 ; ret
++        a = aot_lift.Aot([(0x1000, words(0xD28000A0, 0x140003FF)), (0x2000, words(0x91000400, RET))])
++        try:
++            r = a.run(0x1000, {'x30': STOP})
++            self.assertEqual(r.get('fault'), None)
++            self.assertEqual(r['x0'], 6)
++        finally: a.close()
++
++    def test_falling_through_into_the_next_entry_continues_there(self):
++        # f3: mov x0, #7 (no terminator)    f4 at the next word: add x0, x0, #1 ; ret
++        a = aot_lift.Aot([(0x3000, words(0xD28000E0)), (0x3004, words(0x91000400, RET))])
++        try:
++            r = a.run(0x3000, {'x30': STOP})
++            self.assertEqual(r.get('fault'), None)
++            self.assertEqual(r['x0'], 8)
++        finally: a.close()
++
++    def test_a_branch_to_nowhere_still_stops_with_its_address(self):
++        a = aot_lift.Aot([(0x1000, words(0xD28000A0, 0x140003FF))])   # f2 does not exist
++        try:
++            r = a.run(0x1000, {'x30': STOP})
++            self.assertIn('0x2000', r.get('fault', ''))
++        finally: a.close()
++
++
++if __name__ == '__main__':
++    unittest.main()
