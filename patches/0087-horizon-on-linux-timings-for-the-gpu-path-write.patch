@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 21:38:25 +0100
+Subject: [PATCH] Horizon on Linux: timings for the GPU path (write-back time,
+ NX2LINUX_GPU_PROFILE)
+
+The flush after each draw that writes a storage buffer costs 0.5 s in a 110 s run of Xenoblade
+Chronicles 2 (2382 write-backs): it is not what slows the frame, so it stays as it is. The log line
+now says how long write-backs took and which shaders force them, and NX2LINUX_GPU_PROFILE=1 prints a
+cProfile of the draw path while the run goes.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: timings and a profile switch for the Vulkan draw path
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/horizon_nvn.py | 11 ++++++++++-
+ dm/tools/nvn_gpu.py     | 12 ++++++++----
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+index 88f4d4a..67cb9ba 100644
+--- a/dm/tools/horizon_nvn.py
++++ b/dm/tools/horizon_nvn.py
+@@ -43,6 +43,10 @@ class Nvn:
+         self.shader_bytes = {}   # shader key -> (control section, code area)
+         self.gpu = None          # a nvn_gpu.GpuBackend: draws are rendered when it is set
+         self.gpu_errors, self.gpu_seconds = 0, 0.0
++        self.gpu_profile = None
++        if os.environ.get('NX2LINUX_GPU_PROFILE'):   # NX2LINUX_GPU_PROFILE=1: where the time of the draws goes (cProfile, printed when the run ends)
++            import cProfile
++            self.gpu_profile = cProfile.Profile()
+         self.input = None
+         self.draw_sink = None   # called with the described draw (describe_draw) of every draw at submit: the hook of a rendering backend
+         self.draw_log, self.draw_log_max = None, int(os.environ.get('NX2LINUX_DRAW_LOG_MAX', '2000'))
+@@ -171,10 +175,12 @@ class Nvn:
+         if prog: self.draw_programs.add(prog[0])
+         if self.gpu:
+             t0 = time.monotonic()
++            if self.gpu_profile: self.gpu_profile.enable()
+             try: self.gpu.draw(state, call)
+             except Exception as e:
+                 if not self.gpu_errors: self.hz.log(f'[nvn] gpu draw failed: {type(e).__name__}: {e}')
+                 self.gpu_errors += 1
++            if self.gpu_profile: self.gpu_profile.disable()
+             self.gpu_seconds += time.monotonic() - t0
+         want_log = self.draw_log is not None and self.stats['draws'] <= self.draw_log_max
+         if not want_log and self.draw_sink is None: return
+@@ -270,7 +276,10 @@ class Nvn:
+         self.input.poll()
+         if self.gpu and os.environ.get('NX2LINUX_GPU_DUMP') and self.stats['presents'] % 120 == 1:
+             import nvn_gpu; nvn_gpu.dump_targets(self.gpu, os.environ['NX2LINUX_GPU_DUMP'])
+-        if self.gpu and self.stats['presents'] % 60 == 1: self.hz.log(f'[nvn] gpu: {self.gpu.stats} gpu lib {self.gpu.gpu.stats()} errors {self.gpu_errors} gpu seconds {self.gpu_seconds:.1f} window frames {self.display.frames if self.display is not None else 0}')
++        if self.gpu_profile and self.stats['presents'] % 150 == 1 and self.stats['presents'] > 1:   # the run ends with os._exit: the profile is printed while it goes
++            import io, pstats
++            out = io.StringIO(); pstats.Stats(self.gpu_profile, stream=out).sort_stats('cumulative').print_stats('nvn_gpu|horizon_gpu|horizon_nvn|nvn_spirv|ctypes|struct|array', 30); self.hz.log('[nvn] gpu profile by cumulative time:\n' + out.getvalue())
++        if self.gpu and self.stats['presents'] % 60 == 1: self.hz.log(f'[nvn] gpu: {self.gpu.stats} gpu lib {self.gpu.gpu.stats()} errors {self.gpu_errors} gpu seconds {self.gpu_seconds:.1f} write-back {self.gpu.stats.get("write_back_seconds", 0)} s window frames {self.display.frames if self.display is not None else 0}')
+         if not w or not w['textures']: return
+         t = self.o.get(w['textures'][index % len(w['textures'])])
+         if not t or not t.get('w'): return
+diff --git a/dm/tools/nvn_gpu.py b/dm/tools/nvn_gpu.py
+index 5d83532..042731a 100644
+--- a/dm/tools/nvn_gpu.py
++++ b/dm/tools/nvn_gpu.py
+@@ -3,7 +3,7 @@ textures are read from the game's memory (block-linear, deswizzled by the GPU li
+ What is converted: formats (NVN to Vulkan, nvn_layout.py for sizes), blend, depth, cull and winding, samplers, vertex streams and indices (quads become triangles in the library), the constant
+ buffers, the textures named by the shader's handle slots. What is not yet: tessellation and geometry stages, compute, cube / array / 3D textures (the draw is skipped and counted), mip levels
+ above 0, stencil, multisampling, transform feedback. A draw it cannot make is counted in stats['skipped'] by reason, never faked."""
+-import ctypes, struct
++import ctypes, struct, time
+ from array import array
+ 
+ import horizon_gpu as hg
+@@ -433,7 +433,7 @@ class GpuBackend:
+         # resources
+         writeback = self.bind_resources(state, d, keep, [(NVN_STAGE[st], st, loaded[st][2]) for st in loaded], support)
+         self.gpu.draw(d)
+-        self.write_back(d, writeback)
++        self.write_back(d, writeback, 'draw ' + ','.join(by_stage.values()))
+         self.stats['draws'] += 1
+         for p in rts: self.target_draws[p] = self.target_draws.get(p, 0) + 1
+ 
+@@ -587,14 +587,18 @@ class GpuBackend:
+         if not ubo or off + 8 > ubo[1]: return (0, 0)
+         return struct.unpack('<Q', self.nvn.hz.rd(ubo[0] + off, 8))[0], 1 << 18
+ 
+-    def write_back(self, d, writeback):
++    def write_back(self, d, writeback, tag=''):
+         """What the shader wrote into storage buffers goes back into the game's memory (the GPU works on copies: a flush, then the ring is read)"""
+         if not writeback: return
++        t0 = time.monotonic()
+         self.gpu.flush()
+         for i, addr, size in writeback:
+             try: self.nvn.hz.wr(addr, self.gpu.ring_read(d.bufs[i].ring_offset, size))
+             except (AssertionError, hg.GpuError): self.count('write back failed')
+         self.stats['write_backs'] = self.stats.get('write_backs', 0) + 1
++        by = self.stats.setdefault('write_back_by', {}); k = f'{tag} {[(i, n) for i, a, n in writeback][:3]}'   # which shaders force a flush, and how big their buffers are (at most 64 kinds are kept)
++        if k in by or len(by) < 64: by[k] = by.get(k, 0) + 1
++        self.stats['write_back_seconds'] = round(self.stats.get('write_back_seconds', 0.0) + time.monotonic() - t0, 2)
+ 
+     def image_handle_of(self, state, stage, im):
+         """The image handle (a texture pool index) a shader image slot reads: slot r of the handle table sits at c2 word 72 + 2 r, or in a uniform buffer for a bindless read"""
+@@ -626,7 +630,7 @@ class GpuBackend:
+         d.cs = sid; d.groups[:] = groups
+         writeback = self.bind_resources(state, d, keep, [(5, 'cs', res)], SUPPORT)
+         self.gpu.dispatch(d)
+-        self.write_back(d, writeback)
++        self.write_back(d, writeback, 'cs ' + keys[0])
+         self.stats['dispatches'] = self.stats.get('dispatches', 0) + 1
+ 
+     def handle_of(self, state, stage, tx):
