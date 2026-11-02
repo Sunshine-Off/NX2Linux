@@ -68,3 +68,4 @@
 0087-horizon-on-linux-timings-for-the-gpu-path-write.patch
 0088-horizon-on-linux-constant-buffer-1-holds-the-sha.patch
 0089-horizon-on-linux-the-hot-nvn-calls-are-recorded.patch
+0090-horizon-on-linux-the-nvn-queue-runs-on-a-thread.patch

@@ -57,3 +57,11 @@ Mesuré pendant le jeu (cinématique d'ouverture, 2,4 images par seconde) :
 `linux/host/nvnrec.c` (dans `libnx2linux_gpu.so`) fournit en C les appels chauds : liaisons (uniform, storage, vertex, texture), viewport, scissor, programme, états liés, tableaux de sommets, dessins, cibles de rendu, pochoir, `GetTextureHandle`, `Barrier`, et les setters des objets d'état (modifiés en place dans la mémoire invitée). Le jeu les appelle sans passer par Python ; `nvn_rec.py` reprend le flux binaire de chaque tampon de commandes et le décode en tuples identiques à ceux de `rec`. Désactivable : `NX2LINUX_NVN_NATIVE=0`.
 
 Mesure (même scénario, 150 s) : **637 images contre 517** (+23 %). Le gain est modeste parce que le rejeu des dessins (étape 2) reste en Python. Les tests comparent C et Python sur des arguments aléatoires (`tests/test_nvn_rec.py`).
+
+## 6. Étape 2 : ce que la mesure a changé (patch 0090)
+
+Le chemin des dessins (rejeu, conversion, bibliothèque GPU) occupe ~52 % du temps du thread qui soumet ; sur ce chemin, **68 % est la conversion en Python (~0,26 ms par dessin) et 32 % la bibliothèque (~0,125 ms)**. Porter la conversion en C ne ferait gagner qu'environ ×1,5 de plus, parce que la bibliothèque et le reste du chemin restent. Le rejeu se faisait en plus **dans le thread du jeu qui soumet**, en série avec le travail du jeu.
+
+Fait : la file NVN tourne sur son propre thread (`nvn-queue`). Un `Submit`, un `FenceSync` et un `Present` y sont rejoués dans l'ordre ; les syncs sont signalés quand la file atteint la barrière ; une texture de fenêtre n'est redonnée qu'après la présentation de sa dernière image ; `QueueFinish` attend la file vide. `NX2LINUX_NVN_ASYNC=0` rétablit le rejeu synchrone.
+
+Mesure (150 s, même scénario) : **521 images contre 456** (+14 %), avec du bruit : deux anciens processus `horizon_run` d'une autre session tournaient encore sur la machine pendant les essais. Restent, par ordre de gain : copies évitables (les tampons du jeu sont lus par Python puis recopiés deux fois), conversion en C, coût de la bibliothèque par dessin (mutex global, tampons uniformes de 64 Ko recopiés à chaque dessin).
