@@ -6,6 +6,11 @@
  * Threads: every entry point takes one lock. */
 #include <vulkan/vulkan.h>
 
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+
+#include "nx2linux/sdl_host.h"
+
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -67,7 +72,7 @@ typedef struct { uint64_t key; VkPipeline pipe; VkPipelineLayout layout; VkDescr
 typedef struct { uint64_t key; VkSampler s; } Samp;
 
 static struct {
-    int open, clip_control;
+    int open, clip_control, have_swapchain;
     pthread_mutex_t mu;
     VkInstance inst; VkPhysicalDevice phys; VkDevice dev; VkQueue queue; uint32_t family;
     VkPhysicalDeviceMemoryProperties mem;
@@ -115,7 +120,17 @@ int nx2gpu_open(int prefer_software)
 {
     if (G.open) return 0;
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "NX2Linux", .apiVersion = VK_API_VERSION_1_3 };
-    VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
+    /* the window system integration, when the loader has it: a window may be opened later (nx2gpu_window_open), on the presenting thread, and its surface needs these on the instance */
+    const char *iexts[4]; uint32_t niexts = 0;
+    {
+        uint32_t nie = 0; vkEnumerateInstanceExtensionProperties(NULL, &nie, NULL);
+        VkExtensionProperties *ie = calloc(nie ? nie : 1, sizeof *ie); vkEnumerateInstanceExtensionProperties(NULL, &nie, ie);
+        static const char *want[] = { "VK_KHR_surface", "VK_KHR_xcb_surface", "VK_KHR_xlib_surface", "VK_KHR_wayland_surface" };
+        for (uint32_t w = 0; w < 4; w++) for (uint32_t i = 0; i < nie; i++) if (!strcmp(ie[i].extensionName, want[w])) { iexts[niexts++] = want[w]; break; }
+        free(ie);
+        if (!niexts || strcmp(iexts[0], "VK_KHR_surface")) niexts = 0;   /* without the base surface extension none of them is of use */
+    }
+    VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app, .enabledExtensionCount = niexts, .ppEnabledExtensionNames = iexts };
     VK(vkCreateInstance(&ici, NULL, &G.inst));
     uint32_t n = 0; vkEnumeratePhysicalDevices(G.inst, &n, NULL);
     VkPhysicalDevice devs[16]; if (n > 16) n = 16;
@@ -152,11 +167,13 @@ int nx2gpu_open(int prefer_software)
     f2.features.shaderTessellationAndGeometryPointSize = avail.shaderTessellationAndGeometryPointSize; f2.features.largePoints = avail.largePoints; f2.features.multiViewport = avail.multiViewport;
     f2.features.shaderImageGatherExtended = avail.shaderImageGatherExtended; f2.features.shaderStorageImageExtendedFormats = avail.shaderStorageImageExtendedFormats;
     f2.features.textureCompressionBC = avail.textureCompressionBC; f2.features.shaderClipDistance = avail.shaderClipDistance; f2.features.shaderCullDistance = avail.shaderCullDistance;
-    const char *exts[2] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME }; uint32_t next = 1;
+    const char *exts[3] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME }; uint32_t next = 1;
     uint32_t nde = 0; vkEnumerateDeviceExtensionProperties(G.phys, NULL, &nde, NULL);
     VkExtensionProperties *dep = calloc(nde ? nde : 1, sizeof *dep); vkEnumerateDeviceExtensionProperties(G.phys, NULL, &nde, dep);
     for (uint32_t i = 0; i < nde; i++) if (!strcmp(dep[i].extensionName, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)) G.clip_control = 1;
+    for (uint32_t i = 0; i < nde; i++) if (niexts && !strcmp(dep[i].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) G.have_swapchain = 1;
     free(dep);
+    if (G.have_swapchain) exts[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     VkPhysicalDeviceDepthClipControlFeaturesEXT clip = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, .depthClipControl = VK_TRUE };
     if (G.clip_control) { exts[next++] = VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME; f13.pNext = &clip; }
     VkDeviceCreateInfo di = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi, .enabledExtensionCount = next, .ppEnabledExtensionNames = exts };
@@ -203,13 +220,17 @@ static void end_rendering(void)
     barrier_all();
 }
 
-static int flush_locked(void)
+/* Submits what was recorded and waits for it. wait / signal: the semaphores of a present (acquire, render finished), or NULL */
+static int submit_locked(VkSemaphore wait, VkSemaphore signal)
 {
     if (!G.recording) { G.ring_off = 0; return 0; }
     end_rendering();
     VK(vkEndCommandBuffer(G.cb));
     VkCommandBufferSubmitInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = G.cb };
-    VkSubmitInfo2 si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi };
+    VkSemaphoreSubmitInfo ws = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
+    VkSemaphoreSubmitInfo ss = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
+    VkSubmitInfo2 si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = &ws, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi,
+                         .signalSemaphoreInfoCount = signal ? 1 : 0, .pSignalSemaphoreInfos = &ss };
     VK(vkQueueSubmit2(G.queue, 1, &si, G.fence));
     VkResult w = vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 8000000000ull);
     if (w != VK_SUCCESS) { G.open = 0; return fail(w == VK_TIMEOUT ? "the GPU did not finish in 8 s (hang), device dropped" : "vkWaitForFences", w); }
@@ -218,6 +239,8 @@ static int flush_locked(void)
     G.recording = 0; G.ring_off = 0; G.flushes++;
     return 0;
 }
+
+static int flush_locked(void) { return submit_locked(VK_NULL_HANDLE, VK_NULL_HANDLE); }
 
 int nx2gpu_flush(void)
 {
@@ -711,6 +734,118 @@ int nx2gpu_draw(const Nx2Draw *d)
         vkCmdDraw(G.cb, count, inst, (uint32_t)d->first, (uint32_t)d->base_instance);
     }
     G.draws++;
+    r = 0;
+out:
+    pthread_mutex_unlock(&G.mu);
+    return r;
+}
+
+/* ---- the window: a swapchain of this device, so a frame goes from the game's image to the screen on the GPU (no copy through the CPU) ---- */
+static struct {
+    Nx2LinuxHost host; int open; VkSurfaceKHR surface; VkSwapchainKHR sc; VkFormat format; VkExtent2D extent; uint32_t nimg; VkImage imgs[8]; int srgb;
+    VkSemaphore acquire, done; uint64_t frames;
+} W;
+
+static void window_drop_swapchain(void)
+{
+    if (W.sc) { vkDeviceWaitIdle(G.dev); vkDestroySwapchainKHR(G.dev, W.sc, NULL); W.sc = VK_NULL_HANDLE; }
+}
+
+static int window_make_swapchain(int srgb)
+{
+    VkSurfaceCapabilitiesKHR caps;
+    VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(G.phys, W.surface, &caps));
+    uint32_t nf = 0; vkGetPhysicalDeviceSurfaceFormatsKHR(G.phys, W.surface, &nf, NULL);
+    VkSurfaceFormatKHR fmts[32]; if (nf > 32) nf = 32;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(G.phys, W.surface, &nf, fmts);
+    VkSurfaceFormatKHR pick = { VK_FORMAT_UNDEFINED, 0 };
+    const VkFormat want[2][2] = { { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM }, { VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB } };
+    for (int k = 0; k < 2 && pick.format == VK_FORMAT_UNDEFINED; k++) for (uint32_t i = 0; i < nf; i++) if (fmts[i].format == want[srgb][k]) { pick = fmts[i]; break; }
+    if (pick.format == VK_FORMAT_UNDEFINED) { snprintf(G.err, sizeof G.err, "the surface has no 8-bit format"); return -1; }
+    VkExtent2D ext = caps.currentExtent;
+    if (ext.width == 0xFFFFFFFFu) { ext.width = 1280; ext.height = 720; }
+    window_drop_swapchain();
+    VkSwapchainCreateInfoKHR ci = { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = W.surface, .minImageCount = caps.minImageCount + 1 > 8 ? 8 : caps.minImageCount + 1, .imageFormat = pick.format, .imageColorSpace = pick.colorSpace,
+                                    .imageExtent = ext, .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                                    .preTransform = caps.currentTransform, .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE };
+    if (ci.minImageCount > caps.maxImageCount && caps.maxImageCount) ci.minImageCount = caps.maxImageCount;
+    VK(vkCreateSwapchainKHR(G.dev, &ci, NULL, &W.sc));
+    W.nimg = 8; VK(vkGetSwapchainImagesKHR(G.dev, W.sc, &W.nimg, W.imgs));
+    W.format = pick.format; W.extent = ext; W.srgb = srgb;
+    return 0;
+}
+
+/* Opens the window (on the calling thread: SDL wants events and window on one). 0, or -1 with nx2gpu_error */
+int nx2gpu_window_open(const char *title, int width, int height, int hidden)
+{
+    pthread_mutex_lock(&G.mu);
+    int r = -1;
+    if (!G.open || !G.have_swapchain) { snprintf(G.err, sizeof G.err, "this Vulkan device or loader has no window system integration"); goto out; }
+    if (W.open) { r = 0; goto out; }
+    const Nx2LinuxHostConfig cfg = { .title = title ? title : "NX2Linux", .width = width, .height = height, .hidden = hidden != 0, .vulkan = true };
+    if (nx2linux_host_init(&W.host, &cfg) != 0) { snprintf(G.err, sizeof G.err, "window: %s", SDL_GetError()); goto out; }
+    if (!SDL_Vulkan_CreateSurface(nx2linux_host_window(&W.host), G.inst, NULL, &W.surface)) { snprintf(G.err, sizeof G.err, "surface: %s", SDL_GetError()); nx2linux_host_shutdown(&W.host); goto out; }
+    VkBool32 ok = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(G.phys, G.family, W.surface, &ok);
+    if (!ok) { snprintf(G.err, sizeof G.err, "the graphics queue cannot present to this window"); goto out; }
+    VkSemaphoreCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    if (vkCreateSemaphore(G.dev, &si, NULL, &W.acquire) != VK_SUCCESS || vkCreateSemaphore(G.dev, &si, NULL, &W.done) != VK_SUCCESS) goto out;
+    W.open = 1; r = 0;
+out:
+    pthread_mutex_unlock(&G.mu);
+    return r;
+}
+
+/* The next input event as {type, key, window width, window height}; 0 when none is waiting */
+int nx2gpu_window_poll(int32_t out[4])
+{
+    Nx2LinuxInputEvent ev;
+    if (!W.open || nx2linux_host_poll_event(&W.host, &ev) != 1) return 0;
+    out[0] = ev.type; out[1] = ev.key; out[2] = (int32_t)ev.window_width; out[3] = (int32_t)ev.window_height;
+    return 1;
+}
+
+uint64_t nx2gpu_window_frames(void) { return W.frames; }
+
+/* Shows an image (level 0, layer 0 of a colour image) in the window, scaled to it by a blit: everything recorded so far runs first, in the same submission. 0, or -1 */
+int nx2gpu_present(uint32_t id)
+{
+    pthread_mutex_lock(&G.mu);
+    int r = -1;
+    if (!G.open || !W.open || id >= G.nimages || !G.images[id].live || is_depth_format(G.images[id].format)) goto out;
+    Image *im = &G.images[id];
+    int srgb = im->format == VK_FORMAT_R8G8B8A8_SRGB || im->format == VK_FORMAT_B8G8R8A8_SRGB;
+    if ((!W.sc || W.srgb != srgb) && window_make_swapchain(srgb)) goto out;
+    uint32_t idx = 0;
+    for (int attempt = 0;; attempt++) {
+        VkResult ar = vkAcquireNextImageKHR(G.dev, W.sc, UINT64_MAX, W.acquire, VK_NULL_HANDLE, &idx);
+        if (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) break;
+        if (ar != VK_ERROR_OUT_OF_DATE_KHR || attempt > 2 || window_make_swapchain(srgb)) { fail("vkAcquireNextImageKHR", ar); goto out; }
+        /* the acquire semaphore of a failed acquire is unsignalled: nothing to clean */
+    }
+    if (begin()) goto out;
+    end_rendering();
+    barrier_all();
+    VkImage dst = W.imgs[idx];
+    VkImageMemoryBarrier2 to_dst = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                     .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = dst,
+                                     .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_dst };
+    vkCmdPipelineBarrier2(G.cb, &dep);
+    VkImageBlit blit = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .srcOffsets = { { 0, 0, 0 }, { (int32_t)im->w, (int32_t)im->h, 1 } },
+                         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstOffsets = { { 0, 0, 0 }, { (int32_t)W.extent.width, (int32_t)W.extent.height, 1 } } };
+    vkCmdBlitImage(G.cb, im->image, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    VkImageMemoryBarrier2 to_present = to_dst;
+    to_present.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT; to_present.dstAccessMask = 0; to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    dep.pImageMemoryBarriers = &to_present;
+    vkCmdPipelineBarrier2(G.cb, &dep);
+    if (submit_locked(W.acquire, W.done)) goto out;
+    VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &W.done, .swapchainCount = 1, .pSwapchains = &W.sc, .pImageIndices = &idx };
+    VkResult pr = vkQueuePresentKHR(G.queue, &pi);
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) window_make_swapchain(srgb);   /* resized: the next frame uses the new one */
+    else if (pr != VK_SUCCESS) { fail("vkQueuePresentKHR", pr); goto out; }
+    W.frames++;
     r = 0;
 out:
     pthread_mutex_unlock(&G.mu);

@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 21:16:38 +0100
+Subject: [PATCH] Horizon on Linux: frames go from the GPU to the window
+ without a CPU readback
+
+The GPU library opens the window and a swapchain of its own device (the surface extensions are
+enabled on the instance, SDL makes the window on the presenting thread) and nx2gpu_present blits the
+game's image into it in the same submission as the frame's commands. Nvn.present no longer reads
+each frame back and uploads it through a second device: it reads back only for NX2LINUX_DUMP_FRAME,
+or when the window is the CPU one. horizon_run uses the GPU window when the GPU draws.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: present a frame from the GPU to the window without reading it back to the CPU
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/horizon_gpu.py            | 38 ++++++++++++++++++++++++++++++
+ dm/tools/horizon_nvn.py            | 26 ++++++++++++--------
+ dm/tools/horizon_run.py            |  4 +++-
+ dm/tools/tests/test_horizon_gpu.py | 11 +++++++++
+ 4 files changed, 68 insertions(+), 11 deletions(-)
+
+diff --git a/dm/tools/horizon_gpu.py b/dm/tools/horizon_gpu.py
+index be934ad..353e6e1 100644
+--- a/dm/tools/horizon_gpu.py
++++ b/dm/tools/horizon_gpu.py
+@@ -5,6 +5,7 @@ import os
+ from pathlib import Path
+ 
+ MAX_TARGETS = 8
++EVENTS = {1: 'quit', 2: 'resize', 3: 'key_down', 4: 'key_up', 5: 'pad_added', 6: 'pad_removed', 7: 'pad_down', 8: 'pad_up', 9: 'pad_axis'}   # as horizon_display.EVENTS
+ 
+ 
+ class GpuError(Exception): pass
+@@ -83,6 +84,10 @@ class Gpu:
+         L.nx2gpu_draw.argtypes = [C.POINTER(Draw)]
+         L.nx2gpu_dispatch.argtypes = [C.POINTER(Dispatch)]
+         L.nx2gpu_ring_read.argtypes = [C.c_uint64, C.c_void_p, C.c_uint64]
++        L.nx2gpu_window_open.argtypes = [C.c_char_p, C.c_int, C.c_int, C.c_int]
++        L.nx2gpu_window_poll.argtypes = [C.POINTER(C.c_int32)]
++        L.nx2gpu_window_frames.restype = C.c_uint64
++        L.nx2gpu_present.argtypes = [C.c_uint32]
+         L.nx2gpu_stats.argtypes = [C.POINTER(C.c_uint64)]
+         if L.nx2gpu_open(int(software)): raise GpuError(L.nx2gpu_error().decode())
+ 
+@@ -146,6 +151,39 @@ class Gpu:
+         self._check(self.lib.nx2gpu_ring_read(offset, out, nbytes), 'ring read')
+         return out.raw
+ 
++    def window_open(self, title, width, height, hidden=False):
++        """Opens a window on the calling thread; frames reach it with present() without leaving the GPU"""
++        self._check(self.lib.nx2gpu_window_open(title.encode(), width, height, int(hidden)), 'window')
++
++    def present(self, image):
++        """Shows an image in the window (everything recorded runs first)"""
++        self._check(self.lib.nx2gpu_present(image), 'present')
++
++    def window_events(self):
++        """The input events waiting: [(name, key, width, height)]"""
++        out, ev = [], (C.c_int32 * 4)()
++        while self.lib.nx2gpu_window_poll(ev): out.append((EVENTS.get(ev[0], str(ev[0])), ev[1], ev[2], ev[3]))
++        return out
++
++    def window_frames(self): return self.lib.nx2gpu_window_frames()
++
+     def stats(self):
+         a = (C.c_uint64 * 6)(); self.lib.nx2gpu_stats(a)
+         return dict(zip(('draws', 'flushes', 'skipped', 'images', 'shaders', 'pipelines'), a))
++
++
++class GpuWindow:
++    """What Nvn.present drives as its display when the GPU draws: a window of the GPU library's own device"""
++    def __init__(self, gpu, title='NX2Linux', width=1280, height=720, hidden=False):
++        self.gpu_lib = gpu
++        gpu.window_open(title, width, height, hidden)
++
++    @property
++    def gpu(self): return self.gpu_lib.name
++
++    @property
++    def frames(self): return self.gpu_lib.window_frames()
++
++    def present_image(self, image): self.gpu_lib.present(image)
++    def events(self): return self.gpu_lib.window_events()
++    def close(self): pass
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+index 4d139cf..88f4d4a 100644
+--- a/dm/tools/horizon_nvn.py
++++ b/dm/tools/horizon_nvn.py
+@@ -270,26 +270,32 @@ class Nvn:
+         self.input.poll()
+         if self.gpu and os.environ.get('NX2LINUX_GPU_DUMP') and self.stats['presents'] % 120 == 1:
+             import nvn_gpu; nvn_gpu.dump_targets(self.gpu, os.environ['NX2LINUX_GPU_DUMP'])
+-        if self.gpu and self.stats['presents'] % 60 == 1: self.hz.log(f'[nvn] gpu: {self.gpu.stats} gpu lib {self.gpu.gpu.stats()} errors {self.gpu_errors} gpu seconds {self.gpu_seconds:.1f}')
++        if self.gpu and self.stats['presents'] % 60 == 1: self.hz.log(f'[nvn] gpu: {self.gpu.stats} gpu lib {self.gpu.gpu.stats()} errors {self.gpu_errors} gpu seconds {self.gpu_seconds:.1f} window frames {self.display.frames if self.display is not None else 0}')
+         if not w or not w['textures']: return
+         t = self.o.get(w['textures'][index % len(w['textures'])])
+         if not t or not t.get('w'): return
+-        if self.gpu:
+-            try:
+-                px = self.gpu.read_bitmap(w['textures'][index % len(w['textures'])])
+-                if px and len(px) == len(self.texture_bitmap(t)): t['bitmap'][:] = px
+-            except Exception as e: self.hz.log(f'[nvn] gpu readback failed: {e}')
++        tex_ptr = w['textures'][index % len(w['textures'])]
+         dump = os.environ.get('NX2LINUX_DUMP_FRAME')   # NX2LINUX_DUMP_FRAME=<dir>: every 30th presented frame is written there as a PNG
+-        if dump and self.stats['presents'] % 30 == 1:
+-            os.makedirs(dump, exist_ok=True); write_png(os.path.join(dump, f'frame{self.stats["presents"]:05d}.png'), t['w'], t['h'], bytes(self.texture_bitmap(t)))
++        want_dump = bool(dump) and self.stats['presents'] % 30 == 1
+         if self.display is None and self.display_factory is not None:
+             try:
+-                self.display = self.display_factory(); self.hz.log(f'[nvn] window open on {self.display.gpu}')
++                try: self.display = self.display_factory(self.gpu.gpu if self.gpu else None)   # a window of the GPU's own device when the GPU draws
++                except TypeError: self.display = self.display_factory()                        # a factory that takes no argument: the CPU window
++                self.hz.log(f'[nvn] window open on {self.display.gpu}')
+             except Exception as e:
+                 self.hz.log(f'[nvn] cannot open the display: {e}'); self.display_factory = None
++        on_gpu = self.gpu is not None and hasattr(self.display, 'present_image') and tex_ptr in self.gpu.images
++        if self.gpu and (want_dump or (self.display is not None and not on_gpu)):   # the frame is read back only for a dump or a window that is not the GPU's
++            try:
++                px = self.gpu.read_bitmap(tex_ptr)
++                if px and len(px) == len(self.texture_bitmap(t)): t['bitmap'][:] = px
++            except Exception as e: self.hz.log(f'[nvn] gpu readback failed: {e}')
++        if want_dump:
++            os.makedirs(dump, exist_ok=True); write_png(os.path.join(dump, f'frame{self.stats["presents"]:05d}.png'), t['w'], t['h'], bytes(self.texture_bitmap(t)))
+         if self.display is not None:
+             try:
+-                self.display.present(bytes(self.texture_bitmap(t)), t['w'], t['h'])
++                if on_gpu: self.display.present_image(self.gpu.images[tex_ptr]['id'])
++                else: self.display.present(bytes(self.texture_bitmap(t)), t['w'], t['h'])
+                 for ev in self.display.events():
+                     self.input.event(ev)
+                     if ev[0] == 'quit': self.hz.log('window closed'); os._exit(0)
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index eac3f08..b5d1c6d 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -35,7 +35,9 @@ def main():
+     hz.attach()
+     if a.display:
+         import horizon_display
+-        hz.display_factory = lambda: horizon_display.Display(a.title, 1280, 720, hidden=a.hidden)
++        import horizon_gpu
++        # the GPU's own window when the GPU draws (a frame never leaves it), else the CPU one
++        hz.display_factory = lambda gpu=None: horizon_gpu.GpuWindow(gpu, a.title, 1280, 720, hidden=a.hidden) if gpu else horizon_display.Display(a.title, 1280, 720, hidden=a.hidden)
+     # the boot runs on this thread; the game's own threads do the rest. A timer ends the run.
+     import threading
+     def report():
+diff --git a/dm/tools/tests/test_horizon_gpu.py b/dm/tools/tests/test_horizon_gpu.py
+index c3eeb2a..cc98866 100644
+--- a/dm/tools/tests/test_horizon_gpu.py
++++ b/dm/tools/tests/test_horizon_gpu.py
+@@ -218,6 +218,17 @@ class Gpu(unittest.TestCase):
+     def test_tessellation_shaders_run(self):
+         self.assertEqual(self.stage_draw(14, tcs=(TESC, 'tesc'), tes=(TESE, 'tese')), (0, 0, 255, 255))
+ 
++    def test_an_image_is_presented_to_a_window_without_a_readback(self):
++        g = self.gpu
++        try: win = hg.GpuWindow(g, 'test', 320, 180, hidden=True)
++        except hg.GpuError as e: self.skipTest(f'no window: {e}')
++        img = g.image(64, 36, R8G8B8A8_UNORM)
++        for color in ((1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1)):
++            g.clear_color(img, color)
++            win.present_image(img)
++        self.assertEqual(win.frames, 3)
++        self.assertIsInstance(win.events(), list)
++
+     def test_a_view_swizzle_swaps_channels(self):
+         g = self.gpu
+         tex = g.image(2, 2, R8G8B8A8_UNORM)
