@@ -66,3 +66,4 @@
 0085-horizon-on-linux-geometry-tessellation-compute-s.patch
 0086-horizon-on-linux-frames-go-from-the-gpu-to-the-w.patch
 0087-horizon-on-linux-timings-for-the-gpu-path-write.patch
+0088-horizon-on-linux-constant-buffer-1-holds-the-sha.patch
