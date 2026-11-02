@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 20:33:23 +0100
+Subject: [PATCH] Horizon on Linux: the kernel side of the mutex words uses
+ compare-exchange
+
+ArbitrateUnlock and the wake-up path of WaitProcessWideKeyAtomic read a mutex word and wrote it back
+with plain stores while guest threads change it with compare-exchange loops (setting the listeners
+bit, releasing). A lost update left a mutex held by nobody: every thread then waited
+(Xenoblade Chronicles 2 stalled in 4 of 6 runs once the GPU slowed the frame; 0 of 4 runs since).
+aot_cas32 is the atomic primitive; the fake library of the tests has one.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: a lost update on a guest mutex word stalled every thread of Xenoblade Chronicles 2
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/aot_lift.py               |  1 +
+ dm/tools/aot_runtime.cpp           | 10 ++++++++++
+ dm/tools/horizon_hle.py            | 24 +++++++++++++++++-------
+ dm/tools/tests/test_horizon_hle.py |  4 ++++
+ 4 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index 519e915..317636d 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -287,6 +287,7 @@ class Aot:
+         L.aot_unmap.argtypes = [ctypes.c_uint64]
+         L.aot_poke.argtypes = [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
+         L.aot_peek.argtypes = [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
++        L.aot_cas32.argtypes = [ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32]; L.aot_cas32.restype = ctypes.c_uint32
+         L.aot_stat.argtypes = [ctypes.c_int]; L.aot_stat.restype = ctypes.c_uint64
+         L.aot_run.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
+         self.regions = []
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index 84ceb80..f929be7 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -288,6 +288,16 @@ void aot_unmap_all() {
+ }
+ int aot_poke(uint64_t a, const uint8_t *src, uint64_t n) { jmp_buf jb, *outer = g_jb; g_jb = &jb; if (setjmp(jb)) { g_jb = outer; return 1; } memcpy(guest(a, n, "poke"), src, n); g_jb = outer; if (aot_write_hook) aot_write_hook(a, n); return 0; }
+ int aot_peek(uint64_t a, uint8_t *dst, uint64_t n) { jmp_buf jb, *outer = g_jb; g_jb = &jb; if (setjmp(jb)) { g_jb = outer; return 1; } memcpy(dst, guest(a, n, "peek"), n); g_jb = outer; return 0; }
++// An atomic compare-exchange of a 32-bit guest word for the host's own updates of the words the guest changes with exclusive or CAS loops (the kernel side of the mutex words,
++// horizon_hle.py): returns the value the word held, the exchange happened when it equals expected. A word that is not mapped answers 0xFFFFFFFF with expected != it
++uint32_t aot_cas32(uint64_t a, uint32_t expected, uint32_t desired) {
++    jmp_buf jb, *outer = g_jb; g_jb = &jb;
++    if (setjmp(jb)) { g_jb = outer; return expected ^ 1u; }
++    uint32_t *p = (uint32_t *)guest(a, 4, "cas");
++    __atomic_compare_exchange_n(p, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++    g_jb = outer;
++    return expected;
++}
+ uint64_t aot_stat(int i) {
+     if (i != S_READS && i != S_WRITES) return g_stats[i];
+     std::lock_guard<std::mutex> g(g_counts_mu); uint64_t n = 0;
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index 8d076d9..431704f 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -170,6 +170,9 @@ class Horizon:
+     def rd32(self, a): return struct.unpack('<I', self.rd(a, 4))[0]
+     def rd64(self, a): return struct.unpack('<Q', self.rd(a, 8))[0]
+     def wr32(self, a, v): self.wr(a, struct.pack('<I', v & 0xFFFFFFFF))
++    def cas32(self, a, expected, desired):
++        """An atomic compare-exchange of a guest word: the value it held (the exchange happened when that is expected)"""
++        return self.aot.lib.aot_cas32(a, expected & 0xFFFFFFFF, desired & 0xFFFFFFFF)
+     def wr64(self, a, v): self.wr(a, struct.pack('<Q', v & M64))
+ 
+     def cstring(self, a, limit=256):
+@@ -447,22 +450,29 @@ class Horizon:
+         e = Event(); r[1] = self.new_handle(e); r[2] = self.new_handle(e); r[0] = OK
+ 
+     def _unlock(self, addr):
+-        """ArbitrateUnlock: hand the mutex word to the first waiter (keeping the listeners bit while others wait), or clear it"""
++        """ArbitrateUnlock: hand the mutex word to the first waiter (keeping the listeners bit while others wait), or clear it. The guest changes the word with compare-exchange loops at the same time
++        (a thread setting the listeners bit, another releasing), so every update here is one too: a plain write could undo theirs and leave the mutex held by nobody"""
+         q = self.mutex_waiters.get(addr)
+-        if q:
+-            t = q.pop(0); t.granted = True
+-            self.wr32(addr, t.tag | (self.LISTENERS if q else 0))
++        t = q.pop(0) if q else None
++        new = (t.tag | (self.LISTENERS if q else 0)) if t else 0
++        while True:
++            v = self.rd32(addr)
++            if self.cas32(addr, v, new) == v: break
++        if t:
++            t.granted = True
+             self.cv.notify_all()
+-        else: self.wr32(addr, 0)
+ 
+     def _lock(self, addr, tag, owner=None):
+         """Take the mutex word, or wait until an unlock hands it to this thread (caller holds self.cv)"""
+         me = self.current() or self.main_thread_obj
+         while True:
+             v = self.rd32(addr)
+-            if v == 0: self.wr32(addr, tag); return
++            if v == 0:
++                if self.cas32(addr, 0, tag) == 0: return
++                continue
+             if owner is not None and v != (owner | self.LISTENERS): return   # the word changed under the caller: nothing to wait for
+-            if not v & self.LISTENERS: self.wr32(addr, v | self.LISTENERS)
++            if not v & self.LISTENERS:
++                if self.cas32(addr, v, v | self.LISTENERS) != v: continue
+             me.granted, me.tag = False, tag
+             self.mutex_waiters.setdefault(addr, []).append(me)
+             while not me.granted: self.cv.wait()
+diff --git a/dm/tools/tests/test_horizon_hle.py b/dm/tools/tests/test_horizon_hle.py
+index 99acf72..7ecf675 100644
+--- a/dm/tools/tests/test_horizon_hle.py
++++ b/dm/tools/tests/test_horizon_hle.py
+@@ -10,6 +10,10 @@ import horizon_hle as hh
+ class FakeLib:
+     def __init__(self, mem): self.mem = mem
+     def aot_poke(self, a, data, n): self.mem[a:a + n] = data[:n]; return 0
++    def aot_cas32(self, a, expected, desired):
++        old = int.from_bytes(self.mem[a:a + 4], 'little')
++        if old == expected: self.mem[a:a + 4] = desired.to_bytes(4, 'little')
++        return old
+ 
+ 
+ class FakeAot:
