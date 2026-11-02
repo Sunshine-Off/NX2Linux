@@ -270,3 +270,5 @@ uint32_t nx2rec_take(uint64_t cb, uint8_t *out, uint32_t cap) {
     return n;
 }
 void nx2rec_reset(uint64_t cb) { Stream *s = stream_of(cb); if (s) s->len = 0; }
+
+#include "nvnreplay.inc"

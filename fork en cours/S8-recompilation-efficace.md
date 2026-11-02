@@ -77,3 +77,15 @@ Mesure sur 75 s de jeu (cinématique d'ouverture, ≈ 4,4 images par seconde, 1,
 Pour atteindre les 30 images par seconde du jeu, il faut ≈ 33 ms par image, soit pour ≈ 470 dessins environ 60 µs par dessin côté rejeu (aujourd'hui ≈ 290 µs) **et** réduire d'autant le travail du jeu : ni l'un ni l'autre ne s'obtient par de petits réglages (les copies de tampons et l'intervalle de bascule du GIL ont été essayés sans effet). Les deux chantiers qui restent : conversion et rejeu des dessins en C (≈ ×4 côté rejeu), puis recompilation avec accès mémoire en ligne (côté jeu).
 
 Rendu : le segment c0 est rempli comme sur l'hôte Mach (taille de point maximale, position d'échantillon, instance de base, comptes de groupes de calcul). Les images de la cinématique d'ouverture montrent des passages sombres par construction (génériques de crédits) ; je n'ai pas trouvé de preuve qu'une scène reste trop sombre une fois le tampon constant 1 corrigé.
+
+## 8. Étape 2 faite : la conversion et le rejeu des dessins en C (patch 0093)
+
+L'échantillonnage gdb du thread de rejeu avait montré que **44 % de son temps est de l'attente du GIL** (chaque appel ctypes rend le GIL, et le reprendre attend un thread du jeu), 18 % de l'attente du GPU et presque rien dans la bibliothèque C. La conversion en Python n'était donc pas seulement lente : elle forçait ~10 allers-retours par dessin. Le port en C les supprime :
+
+- `linux/host/nvnreplay.inc` (inclus par `nvnrec.c`, même bibliothèque que le GPU) garde l'état qu'un dessin lit (tampons, textures, états, cibles) à partir des flux enregistrés, et appelle directement `nx2gpu_draw`. Les structures `Nx2*` sont dans `nx2gpu_types.h`.
+- Ce qui demande les objets du jeu est demandé à Python **une fois** par programme, par image de rendu et par liaison de texture (celle-ci une fois par image affichée, pour relire une texture que le jeu a écrite entre-temps) ; `nvn_replay.py` répond.
+- Ce que C ne fait pas (programme à images de stockage, dessin indirect, dessin de texture) revient à Python avec l'état exporté de C ; clears, copies et dispatchs aussi.
+- **Vérification** : `NX2LINUX_NVN_REPLAY=check` fait passer chaque flux par les deux chemins et compare chaque dessin octet par octet (structure et mémoire pointée). Sur 35 000 dessins réels de Xenoblade : 7 écarts, tous de la même nature (une texture que le jeu venait d'enregistrer entre les deux passes), aucun écart de format, d'état ou de tampon. Ce mode a trouvé un vrai défaut (`cbuf_slot` = -1 lu comme non signé), corrigé.
+- `NX2LINUX_NVN_REPLAY=py` rétablit le rejeu en Python.
+
+Mesure (100 s, deux essais chacun) : **446 et 455 images contre 357 et 364 en Python (+25 %)**. Le thread de rejeu est maintenant inactif 49 % du temps et le jeu n'attend plus que 3 s sur 100 la présentation : **le goulot est passé du côté du jeu**.
