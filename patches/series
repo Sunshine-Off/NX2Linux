@@ -56,3 +56,5 @@
 0075-horizon-display-show-rgba-frames-through.patch
 0076-aot-host-overrides-of-sdk-functions-thread-exit.patch
 0077-horizon-on-linux-threads-and-synchronisation.patch
+0078-jump-tables-through-x16-x17-thread-pointers-of-a.patch
+0079-horizon-on-linux-fibers-nn-hid-per-title-profile.patch

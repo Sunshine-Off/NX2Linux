@@ -1,43 +1,45 @@
 # S7 bis — Xenoblade Chronicles 2 (0100E95004038000)
 
-Branche `swann/jalon-s7bis-xc2`, issue de `swann/jalon-s7-first-game`. Même objectif que S7 (un jeu qui tourne en x86_64), avec un autre jeu : Balatro restait bloqué par l'absence de services Horizon, et XC2 est le jeu que Téo veut voir tourner. Aucune donnée du jeu n'est dans le dépôt : l'extraction va dans `~/.cache/nx2linux/extract/`, la recompilation dans `~/.cache/nx2linux/aot-xc2/` et `aot-cache/`.
+Branche `swann/jalon-s7bis-xc2`, issue de `swann/jalon-s7-first-game`. Même objectif que S7 (un jeu qui tourne en x86_64), avec Xenoblade Chronicles 2. Aucune donnée du jeu n'est dans le dépôt : l'extraction va dans `~/.cache/nx2linux/extract/`, la recompilation dans `~/.cache/nx2linux/aot-xc2/` et `aot-cache/`, la chaîne Remill dans `~/.cache/nx2linux/toolchain/`.
 
-## État
+## État (honnête)
 
-XC2 (`main`, `sdk`, `subsdk0`, 103 081 entrées recompilées en x86_64) exécute **tout le démarrage du SDK** dans l'ordre de `nn::init::Start` : `_init_libc0`, `nnosInitialize`, `_init_libc1`, `nninitInitializeSdkModule`, `SetHostArgc/Argv`, `nninitStartup`, `_init_libc2`, le `DT_INIT` de chaque module (tous les constructeurs globaux du jeu), puis arrive dans `nnMain`, le point d'entrée du jeu, en 0,2 s.
+**XC2 n'affiche pas encore d'image.** Il exécute le démarrage complet du SDK, `nnMain`, et ~12 s de code d'initialisation de son propre moteur (30 threads invités, des fibres, la configuration NVN) jusqu'à `fw::SoundManager::initialize`, qui échoue parce que **le serveur audio `nn::audio` n'existe pas sur l'hôte**. Aucun `QueuePresentTexture` n'est donc atteint, et la fenêtre Vulkan n'a jamais reçu une trame du jeu.
 
-Il s'arrête là : `nnMain` demande les services `fsp-srv`, `appletOE`, `apm`, `aoc:u`, `pctl`, `pctl:a`, `pctl:s` et `pctl:r`, aucun n'existe, et le jeu lit un pointeur nul. **Rien ne s'affiche et rien n'est jouable.** 47 fonctions (AES, SHA, PMULL, `dc civac`, `faddp`) restent hors de la recompilation : elles attendent le JIT de secours (dynarmic n'est pas construit : sa configuration a été refusée par le classificateur de permissions de la session).
+Ce qui est prouvé séparément, sans le jeu : un tampon RGBA arrive à l'écran par `libnx2linux_display.so` (SDL + Vulkan, 3 tests sur lavapipe), et le périphérique NVN en Python reproduit « effacer un rendu cible, soumettre, présenter » jusqu'à cette même fenêtre (test `NvnDevice.test_a_cleared_window_texture_is_what_is_presented`).
 
-## Ce qui a été corrigé en chemin (tous trouvés par le jeu)
+## Le chemin jusqu'ici
 
-| Problème | Correctif |
+| Étape | Résultat |
 |---|---|
-| 48 relocations RELATIVE à une adresse alignée sur 4 octets (structures packées) refusées | `elf_module.py` : seule la borne et l'alignement sur 4 comptent (patch 0072) |
-| `mrs cntpct_el0`, `cntfrq_el0`, `ctr_el0`, `dczid_el0` sans sémantique (19 fonctions du SDK) | Remill 0007 + `__nx2_read_cntpct` dans `aot_runtime.cpp` (patch 0073) |
-| Le mot `0xe7ffdefe` (piège d'assertion) et `udf` rendaient 18 fonctions inliftables | la fonction est lifted, l'exécution du mot s'arrête avec son adresse (`__remill_error`) |
-| Les wrappers `svc #n ; ret` exportés partagent une entrée de déroulement : pas des entrées | un symbole exporté coupe la fonction (`elf_module.find_functions`) |
-| `aot_peek`/`aot_poke` remettaient le tampon de saut du run à null : un échec après un SVC qui lisait la mémoire abortait le processus | ils rendent le tampon du run |
-| `DT_INIT` puis `init_array` construisaient les singletons deux fois | un seul `DT_INIT` par module, comme `host/loader.c` ; l'ordre est celui de `host/main.c` |
-| Le tampon de commande IPC est au début de la région locale du thread, pas à `+0x100` | corrigé, avec les tests |
+| Extraction, conversion ELF, recompilation | 103 404 entrées en x86_64, 27 fonctions (AES, SHA, PMULL) restent hors de la recompilation |
+| Couche Horizon (SVC, IPC, `sm:`, threads, mutex, variables de condition, événements) | `horizon_hle.py`, 29 tests |
+| Remplacement de fonctions du SDK (`HLE_FORCE` du moteur Mach, en Python) | `fs`, `account`, `oe`, `vi`, `nv`, `hid` portés ; 259 entrées triviales générées ; 388 entrées à logique des fichiers de services répondent 0 et sont comptées |
+| Fibres (`nn::os::Fiber`) | un thread hôte par fibre, `horizon_fiber.py` |
+| NVN | périphérique Python (Tegra X1, pools, tailles de textures, files, tampons de commandes rejoués, fenêtre) ; **les dessins et les shaders ne sont pas rendus** |
+| Son | **bloque** : le jeu utilise tout le graphe de mixage `nn::audio` |
 
-Patchs : 0072 (relocations), 0073 (compteur), 0074 (couche Horizon et trois correctifs AOT). Remill : `remill-patches/0007`.
+Remill : patchs 0006 (EXT, CRC32), 0007 (registres de compteur), 0008 (`DC`/`IC`, `FADDP`). Moteur : patchs 0072 à 0079.
 
-## La couche Horizon
+## Ce qui a été trouvé en chemin (tous par le jeu)
 
-`engine/dm/tools/horizon_hle.py` : les SVC d'un SDK retail (mémoire : `SetHeapSize`, `MapMemory`, `MapPhysicalMemory`, `QueryMemory` ; `GetInfo`, handles, événements, attentes, `GetSystemTick`, `OutputDebugString`, `Break` avec la pile d'appels), le décodage et la réponse IPC (types 4 et 5, descripteurs A/B/W, handles copiés et déplacés) et la séquence de démarrage. `engine/dm/tools/horizon_services.py` : `sm:` et `lm`. Tout ce qui n'est pas géré est journalisé (`unhandled ...`) et répond une erreur : rien n'est simulé comme un succès. Un seul thread invité : une attente que personne ne peut signaler est signalée, jamais bloquante. `CreateThread` n'est pas encore pris en charge. 11 tests (`tests/test_horizon_hle.py`, mémoire invitée factice).
+relocations alignées sur 4 octets · `mrs cntpct_el0` · mot de piège `0xe7ffdefe` · wrappers `svc` exportés · `aot_peek` qui effaçait le tampon de saut · le tampon IPC est au début du TLR · `DT_INIT` suffit (pas `init_array` en plus) · `br x16` des `switch` LLVM · `DC`/`IC` (SYS est un appel hyperviseur asynchrone pour le décodeur) · les fibres changent de pile par `ret`, impossible en code recompilé.
 
-## Ce qui manque pour que le jeu s'affiche
+## Ce qui manque pour afficher (dans l'ordre)
 
-1. Les services de `nnMain` : `fsp-srv` (le RomFS de 13 Go est extrait ; `hle_fs.c` du moteur Mach montre ce qu'il faut), `appletOE` (boucle de messages, ressources, focus), `apm`, `aoc:u`, `pctl*`, puis `hid`, `vi`/`nvdrv`, `audren`, `time`, `set`. Chaque service est une classe de `horizon_services.py`.
-2. Les threads invités : XC2 en crée plusieurs (`CreateThread` / `StartThread` / attentes).
-3. Le rendu NVN : XC2 n'utilise pas OpenGL. `engine/dm/gfx/nvn` est le moteur Mach/Metal, à porter sur le backend Vulkan (S4), ce qui est le plus gros travail de S7 bis.
-4. Le JIT (dynarmic) pour les 47 fonctions restantes, ou leur sémantique dans Remill (AES, SHA1/256, PMULL).
-5. Comparer les entrées exécutées à Unicorn : le module XC2 n'a pas été validé (`module_validate.py`).
+1. **Serveur `nn::audio` silencieux.** Le jeu appelle `GetAudioRendererWorkBufferSize`, `OpenAudioRenderer`, `AcquireMemoryPool`, `AcquireVoiceSlot`, `AddDeviceSink`, effets (retard, réverbération I3DL2), `RequestUpdateAudioRenderer`, plus `AudioOut`. Le moteur Mach exécute le serveur du SDK en local avec un rendu CPU (`hle_audren.c`). Le côté client du SDK tourne tel quel ; il faut répondre au bloc de mise à jour (en-tête, états des pools et des voix, tampons d'onde consommés) et fournir l'événement système du renderer. Un contournement par titre (`horizon_profile_xc2.py`, qui saute `ssd::SoundCore::Init`) a été essayé : le gestionnaire de son plante ensuite, donc il ne suffit pas.
+2. **Ce que le jeu demandera après le son** : d'autres gestionnaires du `Framework::initializeManager`, `hid` complet (manettes, entrées SDL → `NpadState`), `time`, `pctl`, sauvegardes.
+3. **Rendu réel.** Les commandes de dessin sont comptées, pas exécutées. Une scène demande de traduire les shaders Maxwell/DKSH en SPIR-V (la chaîne `dmsh` du moteur Mach cible Metal), de gérer les textures bloc-linéaires, les états et les passes. C'est le plus gros travail de S4/S7.
+4. Les 27 fonctions cryptographiques : sémantique AES/SHA/PMULL dans Remill, ou le JIT dynarmic (sa configuration a été refusée par le classificateur de permissions de la session).
+5. Comparer les entrées exécutées à Unicorn (`module_validate.py`) : le module XC2 n'a pas été validé.
 
 ## Reproduire
 
 ```bash
 python3 linux/cli/nx2linux.py extract --keys <prod.keys> "Xenoblade Chronicles 2 [...].nsp"
-# convertir (elf_module.py <ExeFS>/<module> <dossier> <module>) puis recompiler et lancer avec REMILL_BUILD défini ;
-# Remill (commit 56918a8 + remill-patches/0001..0007) est construit dans ~/.cache/nx2linux/toolchain/remill
+# convertir : engine/dm/tools/elf_module.py <ExeFS>/<module> <dossier> <module>   (main, sdk, subsdk0)
+# Remill (commit 56918a8 + fork en cours/remill-patches/0001..0008) dans ~/.cache/nx2linux/toolchain/remill
+# fenêtre : cmake -S linux/host -B ~/.cache/nx2linux/build-host && cmake --build ~/.cache/nx2linux/build-host
+REMILL_BUILD=~/.cache/nx2linux/toolchain/remill/build python3 -I engine/dm/tools/horizon_run.py \
+    --modules <dossier> --romfs <RomFS.img> --title 0100e95004038000 --display --seconds 60
 ```
