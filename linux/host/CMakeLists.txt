@@ -76,7 +76,7 @@ target_compile_definitions(nx2linux_display PRIVATE NX2LINUX_SHADER_DIR="${NX2LI
 target_link_libraries(nx2linux_display PRIVATE nx2linux_vulkan)
 
 # The GPU the NVN layer draws with, for Python (ctypes): engine/dm/tools/horizon_gpu.py. Headless Vulkan 1.3 (dynamic rendering, push descriptors)
-add_library(nx2linux_gpu SHARED gpu.c)
+add_library(nx2linux_gpu SHARED gpu.c nvnrec.c)
 target_compile_options(nx2linux_gpu PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(nx2linux_gpu PRIVATE nx2linux_host Vulkan::Vulkan pthread PkgConfig::SDL3)
 

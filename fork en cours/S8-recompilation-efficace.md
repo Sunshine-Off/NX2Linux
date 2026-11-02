@@ -51,3 +51,9 @@ Mesuré pendant le jeu (cinématique d'ouverture, 2,4 images par seconde) :
 
 - **Entités et décor en silhouettes noires** : 39 % des shaders (1 502 sur 3 867) lisent le **tampon constant 1**, que le pilote remplit avec le segment de constantes du shader (octets entre `+0x700` et `+0x704` de la section de contrôle). Il était rempli de zéros. Corrigé : `nvn_spirv.shader_c1`, `GpuBackend.constant_segment`.
 - **Textures chargées après leur premier usage** : une texture n'était lue qu'une fois. Une empreinte de sa mémoire (`aot_hash64`) est comparée une fois par image, et la texture est relue si elle a changé (`reuploads` dans le journal).
+
+## 5. Étape 1 faite : l'enregistrement NVN en C (patch 0089)
+
+`linux/host/nvnrec.c` (dans `libnx2linux_gpu.so`) fournit en C les appels chauds : liaisons (uniform, storage, vertex, texture), viewport, scissor, programme, états liés, tableaux de sommets, dessins, cibles de rendu, pochoir, `GetTextureHandle`, `Barrier`, et les setters des objets d'état (modifiés en place dans la mémoire invitée). Le jeu les appelle sans passer par Python ; `nvn_rec.py` reprend le flux binaire de chaque tampon de commandes et le décode en tuples identiques à ceux de `rec`. Désactivable : `NX2LINUX_NVN_NATIVE=0`.
+
+Mesure (même scénario, 150 s) : **637 images contre 517** (+23 %). Le gain est modeste parce que le rejeu des dessins (étape 2) reste en Python. Les tests comparent C et Python sur des arguments aléatoires (`tests/test_nvn_rec.py`).
