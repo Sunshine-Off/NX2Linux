@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 23:38:55 +0100
+Subject: [PATCH] horizon on linux: where the queue thread and the game's
+ threads wait, in the GPU log line
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: timings of the queue thread (idle, busy, cpu) and of the game waiting on syncs
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/horizon_nvn.py | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+index ac95195..15c6959 100644
+--- a/dm/tools/horizon_nvn.py
++++ b/dm/tools/horizon_nvn.py
+@@ -48,6 +48,7 @@ class Nvn:
+             import cProfile
+             self.gpu_profile = cProfile.Profile()
+         self.input = None
++        self.queue_idle = self.queue_busy = self.queue_cpu = self.sync_wait = self.acquire_wait = 0.0   # seconds: the queue thread idle and busy, the game's threads blocked in nvnSyncWait and in acquiring a window texture
+         self.jobs = None         # the queue's work (start_worker): submits, fences and presents run on a thread of their own, in order, as on a GPU
+         self.rec = None          # a nvn_rec.Recorder: the hot calls are host functions in C and their commands are taken from there
+         self.draw_sink = None   # called with the described draw (describe_draw) of every draw at submit: the hook of a rendering backend
+@@ -95,7 +96,8 @@ class Nvn:
+ 
+     def work(self):
+         while True:
+-            job = self.jobs.get()
++            t0 = time.monotonic(); job = self.jobs.get(); t1 = time.monotonic(); c1 = time.thread_time()
++            self.queue_idle += t1 - t0   # time the queue had nothing to do: the game was not feeding it
+             try:
+                 if job[0] == 'submit':
+                     state = {}
+@@ -104,6 +106,7 @@ class Nvn:
+             except Exception as e:
+                 self.hz.log(f'[nvn] queue job {job[0]} failed: {type(e).__name__}: {e}')
+             finally:
++                self.queue_busy += time.monotonic() - t1; self.queue_cpu += time.thread_time() - c1
+                 if job[-1] is not None: job[-1].set()   # the event the job ends with: a fence, a finished present, a drain
+ 
+     def enqueue(self, op, *args, event=None):
+@@ -325,7 +328,7 @@ class Nvn:
+         if self.gpu_profile and self.stats['presents'] % 150 == 1 and self.stats['presents'] > 1:   # the run ends with os._exit: the profile is printed while it goes
+             import io, pstats
+             out = io.StringIO(); pstats.Stats(self.gpu_profile, stream=out).sort_stats(os.environ.get('NX2LINUX_GPU_PROFILE_SORT', 'cumulative')).print_stats(int(os.environ.get('NX2LINUX_GPU_PROFILE_LINES', '30'))); self.hz.log('[nvn] gpu profile by cumulative time:\n' + out.getvalue())
+-        if self.gpu and self.stats['presents'] % 60 == 1: self.hz.log(f'[nvn] gpu: {self.gpu.stats} gpu lib {self.gpu.gpu.stats()} errors {self.gpu_errors} gpu seconds {self.gpu_seconds:.1f} write-back {self.gpu.stats.get("write_back_seconds", 0)} s lib draw {getattr(self.gpu, "lib_draw_seconds", 0):.1f} s window frames {self.display.frames if self.display is not None else 0}')
++        if self.gpu and self.stats['presents'] % 60 == 1: self.hz.log(f'[nvn] gpu: {self.gpu.stats} gpu lib {self.gpu.gpu.stats()} errors {self.gpu_errors} gpu seconds {self.gpu_seconds:.1f} write-back {self.gpu.stats.get("write_back_seconds", 0)} s lib draw {getattr(self.gpu, "lib_draw_seconds", 0):.1f} s queue idle {self.queue_idle:.1f} busy {self.queue_busy:.1f} (cpu {self.queue_cpu:.1f}) s, game blocked in SyncWait {self.sync_wait:.1f} s, in acquire {self.acquire_wait:.1f} s window frames {self.display.frames if self.display is not None else 0}')
+         if not w or not w['textures']: return
+         t = self.o.get(w['textures'][index % len(w['textures'])])
+         if not t or not t.get('w'): return
+@@ -559,7 +562,8 @@ def _(n, r):
+     if not sync.get('fenced'): ret(r, SYNC_TIMEOUT)
+     elif ev is None or ev.is_set(): ret(r, SYNC_ALREADY_SIGNALED)
+     else:   # the timeout is in nanoseconds, all ones for no limit
+-        ns = r[1]; ret(r, SYNC_CONDITION_SATISFIED if ev.wait(min(60.0, ns / 1e9) if ns < 1 << 63 else 60.0) else SYNC_TIMEOUT)
++        ns = r[1]; t0 = time.monotonic(); ok = ev.wait(min(60.0, ns / 1e9) if ns < 1 << 63 else 60.0); n.sync_wait += time.monotonic() - t0
++        ret(r, SYNC_CONDITION_SATISFIED if ok else SYNC_TIMEOUT)
+ @nvn('nvnEventBuilderSetDefaults')
+ def _(n, r): n.o[r[0]] = Obj()
+ @nvn('nvnEventBuilderSetStorage')
+@@ -933,7 +937,7 @@ def _(n, r):
+     w = n.get(r[0]); k = len(w.get('textures', []))
+     idx = w['next'] % k if k else 0; w['next'] = w.get('next', 0) + 1
+     busy = w.get('busy', {}).pop(idx, None)
+-    if busy is not None: busy.wait(60)   # the texture is still being drawn or shown: the frame that used it last has to finish first
++    if busy is not None: t0 = time.monotonic(); busy.wait(60); n.acquire_wait += time.monotonic() - t0   # the texture is still being drawn or shown: the frame that used it last has to finish first
+     n.hz.wr32(r[2], idx)
+     if r[1]: s = n.get(r[1]); s['fenced'] = True; s['event'] = None
+     ret(r, 0)

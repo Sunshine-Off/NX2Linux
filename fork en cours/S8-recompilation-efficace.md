@@ -65,3 +65,15 @@ Le chemin des dessins (rejeu, conversion, bibliothèque GPU) occupe ~52 % du tem
 Fait : la file NVN tourne sur son propre thread (`nvn-queue`). Un `Submit`, un `FenceSync` et un `Present` y sont rejoués dans l'ordre ; les syncs sont signalés quand la file atteint la barrière ; une texture de fenêtre n'est redonnée qu'après la présentation de sa dernière image ; `QueueFinish` attend la file vide. `NX2LINUX_NVN_ASYNC=0` rétablit le rejeu synchrone.
 
 Mesure (150 s, même scénario) : **521 images contre 456** (+14 %), avec du bruit : deux anciens processus `horizon_run` d'une autre session tournaient encore sur la machine pendant les essais. Restent, par ordre de gain : copies évitables (les tampons du jeu sont lus par Python puis recopiés deux fois), conversion en C, coût de la bibliothèque par dessin (mutex global, tampons uniformes de 64 Ko recopiés à chaque dessin).
+
+## 7. Où le temps passe après la file asynchrone (patchs 0091, 0092)
+
+Mesure sur 75 s de jeu (cinématique d'ouverture, ≈ 4,4 images par seconde, 1,7 cœur utilisé sur 16, aucun thread saturé) :
+
+- le thread de la file est **occupé 55 % du temps et inactif 33 %** : le jeu ne le nourrit pas assez vite ; sur ses 41 s occupées il ne passe que 21 s sur le CPU (le reste : attente du GIL ou du GPU) ;
+- les threads du jeu **attendent la présentation de l'image précédente 20 % du temps** (acquisition d'une texture de fenêtre) ;
+- donc le pipeline est limité par la **latence entre les deux côtés** (une image en vol), pas par un thread saturé : ≈ 0,14 s de rejeu par image + ≈ 0,1 s de travail du jeu non recouvert.
+
+Pour atteindre les 30 images par seconde du jeu, il faut ≈ 33 ms par image, soit pour ≈ 470 dessins environ 60 µs par dessin côté rejeu (aujourd'hui ≈ 290 µs) **et** réduire d'autant le travail du jeu : ni l'un ni l'autre ne s'obtient par de petits réglages (les copies de tampons et l'intervalle de bascule du GIL ont été essayés sans effet). Les deux chantiers qui restent : conversion et rejeu des dessins en C (≈ ×4 côté rejeu), puis recompilation avec accès mémoire en ligne (côté jeu).
+
+Rendu : le segment c0 est rempli comme sur l'hôte Mach (taille de point maximale, position d'échantillon, instance de base, comptes de groupes de calcul). Les images de la cinématique d'ouverture montrent des passages sombres par construction (génériques de crédits) ; je n'ai pas trouvé de preuve qu'une scène reste trop sombre une fois le tampon constant 1 corrigé.
