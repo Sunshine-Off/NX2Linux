@@ -1,0 +1,182 @@
+From 2ebf3c21410bee759e8c671d59e51ca76584b6e7 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 15:03:26 +0100
+Subject: [PATCH] AArch64: DC and IC cache maintenance (DC ZVA zeroes its
+ block), FADDP (vector)
+
+SYS is an asynchronous hyper call to the decoder, so the semantics take the NEXT_PC operand and fall through. Found lifting Xenoblade Chronicles 2's sdk (nn::os::FlushDataCache, a float reduction).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ lib/Arch/AArch64/Arch.cpp             | 25 +++++++++++++++++++++++++
+ lib/Arch/AArch64/Decode.cpp           | 12 ------------
+ lib/Arch/AArch64/Semantics/SIMD.cpp   | 16 ++++++++++++++++
+ lib/Arch/AArch64/Semantics/SYSTEM.cpp | 24 ++++++++++++++++++++++++
+ 4 files changed, 65 insertions(+), 12 deletions(-)
+
+diff --git a/lib/Arch/AArch64/Arch.cpp b/lib/Arch/AArch64/Arch.cpp
+index bfb5855..efb1a0b 100644
+--- a/lib/Arch/AArch64/Arch.cpp
++++ b/lib/Arch/AArch64/Arch.cpp
+@@ -3319,6 +3319,30 @@ bool TryDecodeMRS_RS_SYSTEM(const InstData &data, Instruction &inst) {
+   return AppendSysRegName(inst, bits);
+ }
+ 
++// DC  <dc_op>, <Xt>: cache maintenance by address. ZVA zeroes a block; the others do nothing on a coherent host
++bool TryDecodeDC_SYS_CR_SYSTEM(const InstData &data, Instruction &inst) {
++  if (data.op1 == 3 && data.CRm == 4 && data.op2 == 1) {
++    inst.function = "DC_ZVA_SYS_CR_SYSTEM";
++  }
++  AddRegOperand(inst, kActionRead, kRegX, kUseAsValue, data.Rt);
++  return true;
++}
++
++// SYS  #<op1>, <Cn>, <Cm>, #<op2>{, <Xt>}: the decoder reports DC and IC by their SYS encoding. Cache maintenance (Cn = 7) is DC / IC above; nothing else is lifted
++bool TryDecodeSYS_CR_SYSTEM(const InstData &data, Instruction &inst) {
++  if (data.CRn != 7) {
++    return false;
++  }
++  inst.function = "DC_SYS_CR_SYSTEM";
++  return TryDecodeDC_SYS_CR_SYSTEM(data, inst);
++}
++
++// IC  <ic_op>{, <Xt>}: instruction cache maintenance; nothing to do (recompiled code does not change)
++bool TryDecodeIC_SYS_CR_SYSTEM(const InstData &data, Instruction &inst) {
++  AddRegOperand(inst, kActionRead, kRegX, kUseAsValue, data.Rt);
++  return true;
++}
++
+ // MSR  (<systemreg>|S<op0>_<op1>_<Cn>_<Cm>_<op2>), <Xt>
+ bool TryDecodeMSR_SR_SYSTEM(const InstData &data, Instruction &inst) {
+   SystemReg bits;
+@@ -5426,6 +5450,7 @@ static bool NxFmovImm(const InstData &data, Instruction &inst, bool dbl) {
+ }
+ bool TryDecodeFADD_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+ bool TryDecodeFSUB_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
++bool TryDecodeFADDP_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+ bool TryDecodeFMUL_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+ bool TryDecodeFDIV_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+ bool TryDecodeFMAX_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+diff --git a/lib/Arch/AArch64/Decode.cpp b/lib/Arch/AArch64/Decode.cpp
+index 07beec7..63e2b7a 100644
+--- a/lib/Arch/AArch64/Decode.cpp
++++ b/lib/Arch/AArch64/Decode.cpp
+@@ -448,9 +448,6 @@ bool TryDecodeFADDP_ASIMDSAMEFP16_ONLY(const InstData &, Instruction &) {
+ //  30 x Q        0
+ //  31 0
+ // FADDP  <Vd>.<T>, <Vn>.<T>, <Vm>.<T>
+-bool TryDecodeFADDP_ASIMDSAME_ONLY(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FABS FABS_asimdmiscfp16_R:
+ //   0 x Rd       0
+@@ -19419,9 +19416,6 @@ bool TryDecodeFMULX_ASIMDELEM_R_SD(const InstData &, Instruction &) {
+ //  30 1
+ //  31 1
+ // DC  <dc_op>, <Xt>
+-bool TryDecodeDC_SYS_CR_SYSTEM(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // PRFM PRFM_P_ldst_regoff:
+ //   0 x Rt       0
+@@ -33594,9 +33588,6 @@ bool TryDecodeSRI_ASISDSHF_R(const InstData &, Instruction &) {
+ //  30 1
+ //  31 1
+ // IC  <ic_op>{, <Xt>}
+-bool TryDecodeIC_SYS_CR_SYSTEM(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDTRSH LDTRSH_32_ldst_unpriv:
+ //   0 x Rt       0
+@@ -37343,9 +37334,6 @@ bool TryDecodeLDSMAXL_64_MEMOP(const InstData &, Instruction &) {
+ //  30 1
+ //  31 1
+ // SYS  #<op1>, <Cn>, <Cm>, #<op2>{, <Xt>}
+-bool TryDecodeSYS_CR_SYSTEM(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SQABS SQABS_asisdmisc_R:
+ //   0 x Rd       0
+diff --git a/lib/Arch/AArch64/Semantics/SIMD.cpp b/lib/Arch/AArch64/Semantics/SIMD.cpp
+index 73404f4..c602fb2 100644
+--- a/lib/Arch/AArch64/Semantics/SIMD.cpp
++++ b/lib/Arch/AArch64/Semantics/SIMD.cpp
+@@ -1730,6 +1730,19 @@ template <typename T> ALWAYS_INLINE static T NxAbsF(T x) { return x < 0 ? -x : (
+     NxVec a = NxRead(src), r = {}; \
+     for (int i = 0; i < NxN<E, Q>::n; i++) { T x = NxGetF<E>(a, i), y = 0; NxSet<E>(r, i, (EXPR) ? NX_ALL1 : 0); } \
+     NxWrite(dst, r); return memory; }
++// FADDP (vector): the sums of adjacent pairs of the first source, then of the second
++template <int E, int Q> DEF_SEM(NX_FADDP, V128W dst, V128 src1, V128 src2) {
++  typedef typename NxF<E>::T T;
++  NxVec a = NxRead(src1), b = NxRead(src2), r = {};
++  const int n = NxN<E, Q>::n;
++  NX_FBEGIN
++  for (int i = 0; i < n / 2; i++) {
++    T x = NxGetF<E>(a, 2 * i), y = NxGetF<E>(a, 2 * i + 1); T res = ArmNaN(x + y, x, y); NxSetF<E>(r, i, res);
++    T u = NxGetF<E>(b, 2 * i), v = NxGetF<E>(b, 2 * i + 1); T res2 = ArmNaN(u + v, u, v); NxSetF<E>(r, n / 2 + i, res2);
++  }
++  NX_FEND
++  NxWrite(dst, r); return memory;
++}
+ NX_FSAME(NX_FADD, ArmNaN(x + y, x, y))
+ NX_FSAME(NX_FSUB, ArmNaN(x - y, x, y))
+ NX_FSAME(NX_FMUL, ArmNaN(x * y, x, y))
+@@ -1839,6 +1852,9 @@ template <int E, int Q> DEF_SEM(NX_FMOVI, V128W dst, I64 imm) {
+ DEF_ISEL(FADD_ASIMDSAME_ONLY_2S) = NX_FADD<4, 0>;
+ DEF_ISEL(FADD_ASIMDSAME_ONLY_4S) = NX_FADD<4, 1>;
+ DEF_ISEL(FADD_ASIMDSAME_ONLY_2D) = NX_FADD<8, 1>;
++DEF_ISEL(FADDP_ASIMDSAME_ONLY_2S) = NX_FADDP<4, 0>;
++DEF_ISEL(FADDP_ASIMDSAME_ONLY_4S) = NX_FADDP<4, 1>;
++DEF_ISEL(FADDP_ASIMDSAME_ONLY_2D) = NX_FADDP<8, 1>;
+ DEF_ISEL(FSUB_ASIMDSAME_ONLY_2S) = NX_FSUB<4, 0>;
+ DEF_ISEL(FSUB_ASIMDSAME_ONLY_4S) = NX_FSUB<4, 1>;
+ DEF_ISEL(FSUB_ASIMDSAME_ONLY_2D) = NX_FSUB<8, 1>;
+diff --git a/lib/Arch/AArch64/Semantics/SYSTEM.cpp b/lib/Arch/AArch64/Semantics/SYSTEM.cpp
+index 8f2526c..e2ae133 100644
+--- a/lib/Arch/AArch64/Semantics/SYSTEM.cpp
++++ b/lib/Arch/AArch64/Semantics/SYSTEM.cpp
+@@ -111,6 +111,27 @@ DEF_SEM(DoMRS_RS_SYSTEM_DCZID_EL0, R64W dest) {
+   return memory;
+ }
+ 
++// DC ZVA: zero the 64-byte block (DCZID_EL0 says 64) that holds the address; every other DC and IC operation does nothing
++// SYS is an asynchronous hyper call to the decoder, which adds the NEXT_PC operand: the instruction falls through to the next one
++DEF_SEM(DoDC_ZVA, R64 src, R64W pc_dst) {
++  const uint64_t base = Read(src) & ~uint64_t(63);
++  for (uint64_t i = 0; i < 64; i += 8) {
++    memory = __remill_write_memory_64(memory, base + i, uint64_t(0));
++  }
++  auto new_pc = UAdd(Read(REG_PC), 4_u64);
++  Write(REG_PC, new_pc);
++  Write(pc_dst, new_pc);
++  return memory;
++}
++
++DEF_SEM(DoCacheMaintenance, R64 src, R64W pc_dst) {
++  (void) src;
++  auto new_pc = UAdd(Read(REG_PC), 4_u64);
++  Write(REG_PC, new_pc);
++  Write(pc_dst, new_pc);
++  return memory;
++}
++
+ DEF_SEM(DoMSR_SR_SYSTEM_TPIDR_EL0, R64 src) {
+   WriteZExt(state.sr.tpidr_el0.qword, Read(src));
+   return memory;
+@@ -150,6 +171,9 @@ DEF_ISEL(MRS_RS_SYSTEM_CTR_EL0) = DoMRS_RS_SYSTEM_CTR_EL0;
+ DEF_ISEL(MRS_RS_SYSTEM_DCZID_EL0) = DoMRS_RS_SYSTEM_DCZID_EL0;
+ 
+ DEF_ISEL(DMB_BO_SYSTEM) = DataMemoryBarrier;
++DEF_ISEL(DC_ZVA_SYS_CR_SYSTEM) = DoDC_ZVA;
++DEF_ISEL(DC_SYS_CR_SYSTEM) = DoCacheMaintenance;
++DEF_ISEL(IC_SYS_CR_SYSTEM) = DoCacheMaintenance;
+ DEF_ISEL(ISB_BI_SYSTEM) = InstructionSynchronizationBarrier;
+ 
+ DEF_ISEL(DSB_BO_SYSTEM) = DataMemoryBarrier;   // DSB: at least as strong as the full barrier DMB is here
+-- 
+2.56.0
+

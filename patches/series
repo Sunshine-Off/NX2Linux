@@ -54,3 +54,5 @@
 0073-aot-counter-register-reads-mrs-cntpct-el0-and-fr.patch
 0074-horizon-on-linux-svcs-ipc-and-sm-nn-init-start-b.patch
 0075-horizon-display-show-rgba-frames-through.patch
+0076-aot-host-overrides-of-sdk-functions-thread-exit.patch
+0077-horizon-on-linux-threads-and-synchronisation.patch
