@@ -51,3 +51,4 @@
 0070-aot-ext-crc32-and-yield-found-by-balatro-s-main.patch
 0071-aot-modules-laid-out-contiguously-cross-module-e.patch
 0072-elf-module-accept-8-byte-relocations-at-4-byte-a.patch
+0073-aot-counter-register-reads-mrs-cntpct-el0-and-fr.patch
