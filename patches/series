@@ -53,3 +53,4 @@
 0072-elf-module-accept-8-byte-relocations-at-4-byte-a.patch
 0073-aot-counter-register-reads-mrs-cntpct-el0-and-fr.patch
 0074-horizon-on-linux-svcs-ipc-and-sm-nn-init-start-b.patch
+0075-horizon-display-show-rgba-frames-through.patch

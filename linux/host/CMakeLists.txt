@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(nx2linux_host LANGUAGES C)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # the static libraries end up in libnx2linux_display.so
 
 include(CTest)
 find_package(PkgConfig REQUIRED)
@@ -67,6 +68,12 @@ target_include_directories(nx2linux_gl_vulkan
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(nx2linux_gl_vulkan PUBLIC PkgConfig::EGL)
+
+# The window a recompiled game draws into, for Python (ctypes): tools/horizon_display.py
+add_library(nx2linux_display SHARED display.c)
+target_compile_options(nx2linux_display PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(nx2linux_display PRIVATE NX2LINUX_SHADER_DIR="${NX2LINUX_SHADER_DIR}")
+target_link_libraries(nx2linux_display PRIVATE nx2linux_vulkan)
 
 if(BUILD_TESTING)
     add_executable(nx2linux_sdl_host_test tests/test_sdl_host.c)

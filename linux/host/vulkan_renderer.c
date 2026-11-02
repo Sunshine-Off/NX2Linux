@@ -230,7 +230,8 @@ static int create_swapchain(Nx2LinuxVulkanRenderer *renderer)
         .imageColorSpace = format.colorSpace,
         .imageExtent = extent,
         .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                       (capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT),
         .preTransform = capabilities.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
         .presentMode = choose_present_mode(modes, mode_count),
@@ -679,6 +680,170 @@ int nx2linux_vulkan_draw_triangle(Nx2LinuxVulkanRenderer *renderer)
     }
     if (result != VK_SUCCESS) {
         return fail("cannot present Vulkan triangle", result);
+    }
+    renderer->frames_rendered++;
+    return 0;
+}
+
+void nx2linux_scale_rgba(const uint8_t *src, uint32_t src_w, uint32_t src_h, uint32_t src_stride,
+                         uint8_t *dst, uint32_t dst_w, uint32_t dst_h, bool bgra)
+{
+    for (uint32_t y = 0; y < dst_h; ++y) {
+        const uint8_t *row = src + (uint64_t)(y * (uint64_t)src_h / dst_h) * src_stride;
+        uint8_t *out = dst + (uint64_t)y * dst_w * 4;
+        for (uint32_t x = 0; x < dst_w; ++x) {
+            const uint8_t *px = row + (uint64_t)(x * (uint64_t)src_w / dst_w) * 4;
+            out[0] = bgra ? px[2] : px[0];
+            out[1] = px[1];
+            out[2] = bgra ? px[0] : px[2];
+            out[3] = 255;
+            out += 4;
+        }
+    }
+}
+
+static bool find_memory_type(VkPhysicalDevice device, uint32_t bits, VkMemoryPropertyFlags wanted, uint32_t *index)
+{
+    VkPhysicalDeviceMemoryProperties memory;
+    vkGetPhysicalDeviceMemoryProperties(device, &memory);
+    for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+        if ((bits & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & wanted) == wanted) {
+            *index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+int nx2linux_vulkan_present_rgba(Nx2LinuxVulkanRenderer *renderer, const uint8_t *pixels,
+                                 uint32_t width, uint32_t height, uint32_t stride)
+{
+    if (renderer == NULL || !renderer->initialized || pixels == NULL || width == 0 || height == 0) {
+        return -1;
+    }
+    VkResult result = vkWaitForFences(renderer->device, 1, &renderer->in_flight, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        return fail("cannot wait for Vulkan frame", result);
+    }
+    uint32_t image_index = 0;
+    result = vkAcquireNextImageKHR(renderer->device, renderer->swapchain, UINT64_MAX,
+                                   renderer->image_available, VK_NULL_HANDLE, &image_index);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        return 1;
+    }
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        return fail("cannot acquire Vulkan swapchain image", result);
+    }
+    const VkExtent2D extent = renderer->swapchain_extent;
+    const VkDeviceSize size = (VkDeviceSize)extent.width * extent.height * 4;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    result = vkCreateBuffer(renderer->device, &buffer_info, NULL, &buffer);
+    if (result != VK_SUCCESS) {
+        return fail("cannot create the frame staging buffer", result);
+    }
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(renderer->device, buffer, &requirements);
+    uint32_t type = 0;
+    if (!find_memory_type(renderer->physical_device, requirements.memoryTypeBits,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &type)) {
+        vkDestroyBuffer(renderer->device, buffer, NULL);
+        SDL_SetError("no host-visible memory for the frame");
+        return -1;
+    }
+    VkMemoryAllocateInfo allocate = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = requirements.size,
+        .memoryTypeIndex = type,
+    };
+    result = vkAllocateMemory(renderer->device, &allocate, NULL, &memory);
+    void *mapped = NULL;
+    if (result == VK_SUCCESS) result = vkBindBufferMemory(renderer->device, buffer, memory, 0);
+    if (result == VK_SUCCESS) result = vkMapMemory(renderer->device, memory, 0, size, 0, &mapped);
+    if (result != VK_SUCCESS) {
+        if (memory != VK_NULL_HANDLE) vkFreeMemory(renderer->device, memory, NULL);
+        vkDestroyBuffer(renderer->device, buffer, NULL);
+        return fail("cannot map the frame staging buffer", result);
+    }
+    const bool bgra = renderer->swapchain_format == VK_FORMAT_B8G8R8A8_UNORM ||
+                      renderer->swapchain_format == VK_FORMAT_B8G8R8A8_SRGB;
+    nx2linux_scale_rgba(pixels, width, height, stride ? stride : width * 4, mapped, extent.width, extent.height, bgra);
+    vkUnmapMemory(renderer->device, memory);
+
+    vkResetFences(renderer->device, 1, &renderer->in_flight);
+    vkResetCommandBuffer(renderer->command_buffer, 0);
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    result = vkBeginCommandBuffer(renderer->command_buffer, &begin);
+    if (result == VK_SUCCESS) {
+        VkImageMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = renderer->images[image_index],
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        vkCmdPipelineBarrier(renderer->command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+        VkBufferImageCopy copy = {
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .imageExtent = {extent.width, extent.height, 1},
+        };
+        vkCmdCopyBufferToImage(renderer->command_buffer, buffer, renderer->images[image_index],
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = 0;
+        vkCmdPipelineBarrier(renderer->command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+        result = vkEndCommandBuffer(renderer->command_buffer);
+    }
+    if (result == VK_SUCCESS) {
+        VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkSubmitInfo submit = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &renderer->image_available,
+            .pWaitDstStageMask = &wait_stage,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &renderer->command_buffer,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &renderer->render_finished,
+        };
+        result = vkQueueSubmit(renderer->graphics_queue, 1, &submit, renderer->in_flight);
+    }
+    if (result == VK_SUCCESS) {
+        /* the staging memory is freed once the copy ran */
+        result = vkWaitForFences(renderer->device, 1, &renderer->in_flight, VK_TRUE, UINT64_MAX);
+    }
+    vkFreeMemory(renderer->device, memory, NULL);
+    vkDestroyBuffer(renderer->device, buffer, NULL);
+    if (result != VK_SUCCESS) {
+        return fail("cannot copy the frame to the swapchain", result);
+    }
+    VkPresentInfoKHR present = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &renderer->render_finished,
+        .swapchainCount = 1,
+        .pSwapchains = &renderer->swapchain,
+        .pImageIndices = &image_index,
+    };
+    result = vkQueuePresentKHR(renderer->present_queue, &present);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        return 1;
+    }
+    if (result != VK_SUCCESS) {
+        return fail("cannot present the frame", result);
     }
     renderer->frames_rendered++;
     return 0;
