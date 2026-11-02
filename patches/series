@@ -61,3 +61,4 @@
 0080-aot-an-svc-no-longer-leaks-into-the-next-dc-ic-p.patch
 0081-horizon-on-linux-silent-nn-audio-nn-time-nested.patch
 0082-horizon-on-linux-nvn-draws-on-a-vulkan-gpu.patch
+0083-horizon-on-linux-layered-3d-and-mip-mapped-textu.patch

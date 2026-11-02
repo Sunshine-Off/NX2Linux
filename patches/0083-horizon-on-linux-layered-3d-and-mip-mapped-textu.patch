@@ -1,0 +1,870 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 20:02:07 +0100
+Subject: [PATCH] Horizon on Linux: layered, 3D and mip-mapped textures, views,
+ copies, stencil, input
+
+Textures keep all their levels and layers (2D arrays, cube maps, 3D), sampled through views of the
+type the shader asks for, and render targets may be a layer, a face or a slice (texture views are
+recorded). Buffer to texture and texture to texture copies, depth and stencil state, blend constants,
+depth bias, indirect draws and the depth clip convention are made. Uploads go through the ring without
+waiting. Shaders translate in the translator's debug mode (all 3867 of Xenoblade Chronicles 2's).
+horizon_input.py feeds the window's keys and gamepad to NpadState, NX2LINUX_PRESS scripts presses.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: layered, 3D and mip-mapped textures, copies, stencil and input for the Vulkan GPU path
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/horizon_gpu.py              |  45 ++++--
+ dm/tools/horizon_input.py            |  46 ++++++
+ dm/tools/horizon_nvn.py              |  86 +++++++++--
+ dm/tools/nvn_gpu.py                  | 220 ++++++++++++++++++++++-----
+ dm/tools/nvn_spirv.py                |   4 +-
+ dm/tools/nvn_state.py                |   6 +
+ dm/tools/tests/test_horizon_gpu.py   |  53 ++++++-
+ dm/tools/tests/test_horizon_input.py |  34 +++++
+ 8 files changed, 425 insertions(+), 69 deletions(-)
+ create mode 100644 dm/tools/horizon_input.py
+ create mode 100644 dm/tools/tests/test_horizon_input.py
+
+diff --git a/dm/tools/horizon_gpu.py b/dm/tools/horizon_gpu.py
+index cd3fa9c..0ec4692 100644
+--- a/dm/tools/horizon_gpu.py
++++ b/dm/tools/horizon_gpu.py
+@@ -28,17 +28,25 @@ class Buf(C.Structure):
+ 
+ class Tex(C.Structure):
+     _fields_ = [(n, C.c_uint32) for n in ('binding', 'image', 'min_filter', 'mag_filter', 'mip_mode', 'wrap_s', 'wrap_t', 'wrap_r', 'compare_enable', 'compare_op')] + \
+-               [(n, C.c_float) for n in ('lod_min', 'lod_max', 'lod_bias', 'aniso')]
++               [(n, C.c_float) for n in ('lod_min', 'lod_max', 'lod_bias', 'aniso')] + \
++               [(n, C.c_uint32) for n in ('view_type', 'base_level', 'nlevels', 'base_layer', 'nlayers', 'border', 'alpha_one', 'pad')]
++
++
++class Target(C.Structure):
++    _fields_ = [('image', C.c_uint32), ('layer', C.c_uint32), ('level', C.c_uint32), ('pad', C.c_uint32)]
+ 
+ 
+ class Draw(C.Structure):
+-    _fields_ = [('vs', C.c_uint32), ('ps', C.c_uint32), ('ntargets', C.c_uint32), ('targets', C.c_uint32 * MAX_TARGETS), ('depth_image', C.c_uint32),
++    _fields_ = [('vs', C.c_uint32), ('ps', C.c_uint32), ('ntargets', C.c_uint32), ('targets', Target * MAX_TARGETS), ('depth', Target),
+                 ('nattrs', C.c_uint32), ('attrs', Attr * 16), ('nstreams', C.c_uint32), ('streams', Stream * 16),
+                 ('topology', C.c_uint32), ('index_type', C.c_uint32), ('pad0', C.c_uint32), ('pad1', C.c_uint32), ('index_data', C.c_void_p), ('index_size', C.c_uint64),
+                 ('first', C.c_int32), ('count', C.c_int32), ('base_vertex', C.c_int32), ('base_instance', C.c_int32), ('instances', C.c_uint32), ('pad2', C.c_uint32),
+                 ('blend', Blend * MAX_TARGETS),
+                 ('cull', C.c_uint32), ('front_face', C.c_uint32), ('polygon_mode', C.c_uint32), ('depth_test', C.c_uint32), ('depth_write', C.c_uint32), ('depth_func', C.c_uint32),
+-                ('depth_clamp', C.c_uint32), ('pad3', C.c_uint32),
++                ('depth_clamp', C.c_uint32), ('depth_neg_one', C.c_uint32),
++                ('stencil_test', C.c_uint32), ('depth_bias_on', C.c_uint32), ('pad4', C.c_uint32), ('pad5', C.c_uint32),
++                ('stencil_front', C.c_uint32 * 4), ('stencil_back', C.c_uint32 * 4), ('stencil_masks', C.c_uint32 * 6),
++                ('blend_color', C.c_float * 4), ('depth_bias', C.c_float * 3), ('pad6', C.c_float),
+                 ('viewport', C.c_float * 4), ('depth_range', C.c_float * 2), ('scissor', C.c_int32 * 4),
+                 ('nbufs', C.c_uint32), ('bufs', Buf * 32), ('ntex', C.c_uint32), ('tex', Tex * 32)]
+ 
+@@ -56,12 +64,13 @@ class Gpu:
+         L.nx2gpu_error.restype = C.c_char_p; L.nx2gpu_name.restype = C.c_char_p
+         L.nx2gpu_open.argtypes = [C.c_int]
+         L.nx2gpu_shader.argtypes = [C.c_char_p, C.c_uint32]; L.nx2gpu_shader.restype = C.c_uint32
+-        L.nx2gpu_image.argtypes = [C.c_uint32, C.c_uint32, C.c_uint32, C.c_int]; L.nx2gpu_image.restype = C.c_uint32
++        L.nx2gpu_image.argtypes = [C.c_uint32] * 6 + [C.c_int]; L.nx2gpu_image.restype = C.c_uint32
+         L.nx2gpu_image_free.argtypes = [C.c_uint32]
+-        L.nx2gpu_upload.argtypes = [C.c_uint32, C.c_char_p, C.c_uint64]
++        L.nx2gpu_upload.argtypes = [C.c_uint32, C.c_char_p, C.c_uint64] + [C.c_uint32] * 8
++        L.nx2gpu_copy_image.argtypes = [C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32, C.POINTER(C.c_int32), C.POINTER(C.c_int32), C.POINTER(C.c_uint32)]
+         L.nx2gpu_read.argtypes = [C.c_uint32, C.c_void_p, C.c_uint64]
+-        L.nx2gpu_deswizzle.argtypes = [C.c_char_p, C.c_void_p, C.c_uint32, C.c_uint32, C.c_uint32]
+-        L.nx2gpu_clear_color.argtypes = [C.c_uint32, C.POINTER(C.c_float)]
++        L.nx2gpu_deswizzle.argtypes = [C.c_char_p, C.c_void_p] + [C.c_uint32] * 6
++        L.nx2gpu_clear_color.argtypes = [C.c_uint32, C.POINTER(C.c_float)] + [C.c_uint32] * 4
+         L.nx2gpu_clear_depth.argtypes = [C.c_uint32, C.c_float, C.c_uint32]
+         L.nx2gpu_draw.argtypes = [C.POINTER(Draw)]
+         L.nx2gpu_stats.argtypes = [C.POINTER(C.c_uint64)]
+@@ -78,17 +87,23 @@ class Gpu:
+         if not i: raise GpuError(f'shader: {self.lib.nx2gpu_error().decode()}')
+         return i
+ 
+-    def image(self, w, h, vk_format, depth=False):
+-        i = self.lib.nx2gpu_image(w, h, vk_format, int(depth))
+-        if not i: raise GpuError(f'image {w}x{h} format {vk_format}: {self.lib.nx2gpu_error().decode()}')
++    def image(self, w, h, vk_format, depth=1, layers=1, levels=1, kind=0):
++        """kind 0: a 2D image of `layers` array layers (6 or a multiple: sampled as a cube too), kind 1: a 3D image of `depth` slices"""
++        i = self.lib.nx2gpu_image(w, h, depth, layers, levels, vk_format, kind)
++        if not i: raise GpuError(f'image {w}x{h}x{depth} layers {layers} levels {levels} format {vk_format}: {self.lib.nx2gpu_error().decode()}')
+         return i
+ 
+     def image_free(self, i): self.lib.nx2gpu_image_free(i)
+-    def upload(self, i, pixels): self._check(self.lib.nx2gpu_upload(i, bytes(pixels), len(pixels)), 'upload')
++    def upload(self, i, pixels, w, h, d=1, level=0, layer=0, x=0, y=0, z=0):
++        """pixels: the w x h x d region (tightly packed, in blocks for compressed formats) of one level of one layer"""
++        self._check(self.lib.nx2gpu_upload(i, bytes(pixels), len(pixels), level, layer, x, y, z, w, h, d), 'upload')
++
++    def copy_image(self, src, dst, extent, src_at=(0, 0, 0), dst_at=(0, 0, 0), src_level=0, src_layer=0, dst_level=0, dst_layer=0):
++        self._check(self.lib.nx2gpu_copy_image(src, dst, src_level, src_layer, dst_level, dst_layer, (C.c_int32 * 3)(*src_at), (C.c_int32 * 3)(*dst_at), (C.c_uint32 * 3)(*extent)), 'copy')
+ 
+-    def deswizzle(self, raw, row_bytes, rows, tile_h):
+-        out = C.create_string_buffer(row_bytes * rows)
+-        self._check(self.lib.nx2gpu_deswizzle(bytes(raw), out, row_bytes, rows, tile_h), 'deswizzle')
++    def deswizzle(self, raw, row_bytes, rows, tile_h, slices=1, tile_d=0, gobs_x=0):
++        out = C.create_string_buffer(row_bytes * rows * slices)
++        self._check(self.lib.nx2gpu_deswizzle(bytes(raw), out, row_bytes, rows, slices, tile_h, tile_d, gobs_x), 'deswizzle')
+         return out.raw
+ 
+     def read(self, i, nbytes):
+@@ -96,7 +111,7 @@ class Gpu:
+         self._check(self.lib.nx2gpu_read(i, out, nbytes), 'read')
+         return out.raw
+ 
+-    def clear_color(self, i, rgba): self._check(self.lib.nx2gpu_clear_color(i, (C.c_float * 4)(*rgba)), 'clear')
++    def clear_color(self, i, rgba, level=0, nlevels=0, layer=0, nlayers=0): self._check(self.lib.nx2gpu_clear_color(i, (C.c_float * 4)(*rgba), level, nlevels, layer, nlayers), 'clear')
+     def clear_depth(self, i, depth, stencil=0): self._check(self.lib.nx2gpu_clear_depth(i, depth, stencil), 'clear depth')
+     def flush(self): self._check(self.lib.nx2gpu_flush(), 'flush')
+ 
+diff --git a/dm/tools/horizon_input.py b/dm/tools/horizon_input.py
+new file mode 100644
+index 0000000..19d4dab
+--- /dev/null
++++ b/dm/tools/horizon_input.py
+@@ -0,0 +1,46 @@
++"""Input for the Linux host (NX2Linux S7bis): the keyboard and gamepad events of the window become the buttons of NpadState (horizon_hid.py). Keys: X A, Z B, C X, V Y, arrows and Return (Plus),
++Backspace (Minus), A / S the shoulders, Q / W the triggers. A gamepad uses the physical layout (SDL's east button is Switch A). NX2LINUX_PRESS=A@45:0.3,Plus@60 presses a button at a time in seconds
++(for how long, 0.2 s by default) without a person: how a title screen is passed in a test run."""
++import os, time
++
++import horizon_hid
++
++BUTTONS = {n: 1 << i for i, n in enumerate(('A', 'B', 'X', 'Y', 'StickL', 'StickR', 'L', 'R', 'ZL', 'ZR', 'Plus', 'Minus', 'Left', 'Up', 'Right', 'Down'))}
++KEYS = {ord('x'): 'A', ord('z'): 'B', ord('c'): 'X', ord('v'): 'Y', ord('a'): 'L', ord('s'): 'R', ord('q'): 'ZL', ord('w'): 'ZR', 0x0D: 'Plus', 0x08: 'Minus', 0x20: 'A', 0x1B: 'B',
++        0x4000004F: 'Right', 0x40000050: 'Left', 0x40000051: 'Down', 0x40000052: 'Up'}
++GAMEPAD = {0: 'B', 1: 'A', 2: 'Y', 3: 'X', 4: 'Minus', 6: 'Plus', 7: 'StickL', 8: 'StickR', 9: 'L', 10: 'R', 11: 'Up', 12: 'Down', 13: 'Left', 14: 'Right'}   # SDL_GamepadButton
++
++
++def script():
++    """[(button mask, start, end)] from NX2LINUX_PRESS"""
++    out = []
++    for item in filter(None, os.environ.get('NX2LINUX_PRESS', '').split(',')):
++        name, _, when = item.partition('@')
++        start, _, length = when.partition(':')
++        if name in BUTTONS and start: out.append((BUTTONS[name], float(start), float(start) + float(length or 0.2)))
++    return out
++
++
++class Input:
++    def __init__(self, hz, now=time.monotonic):
++        self.hz, self.now, self.t0, self.held, self.script = hz, now, now(), 0, script()
++
++    def event(self, ev):
++        """One window event: (name, key, ...)"""
++        name, key = ev[0], ev[1]
++        bit = BUTTONS.get(KEYS.get(key)) if name.startswith('key') else BUTTONS.get(GAMEPAD.get(key)) if name.startswith('pad') and name not in ('pad_added', 'pad_removed', 'pad_axis') else None
++        if not bit: return
++        down = name.endswith('down')
++        self.held = self.held | bit if down else self.held & ~bit
++        self.apply()
++
++    def poll(self):
++        """Applies the scripted presses that are on now"""
++        if self.script: self.apply()
++
++    def apply(self):
++        t = self.now() - self.t0
++        scripted = 0
++        for bit, a, b in self.script:
++            if a <= t < b: scripted |= bit
++        horizon_hid.state(self.hz).buttons = self.held | scripted
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+index a6d10b4..01d5cb4 100644
+--- a/dm/tools/horizon_nvn.py
++++ b/dm/tools/horizon_nvn.py
+@@ -42,7 +42,8 @@ class Nvn:
+         self.draw_by_prim, self.draw_programs = {}, set()
+         self.shader_bytes = {}   # shader key -> (control section, code area)
+         self.gpu = None          # a nvn_gpu.GpuBackend: draws are rendered when it is set
+-        self.gpu_errors = 0
++        self.gpu_errors, self.gpu_seconds = 0, 0.0
++        self.input = None
+         self.draw_sink = None   # called with the described draw (describe_draw) of every draw at submit: the hook of a rendering backend
+         self.draw_log, self.draw_log_max = None, int(os.environ.get('NX2LINUX_DRAW_LOG_MAX', '2000'))
+         if os.environ.get('NX2LINUX_DRAW_LOG'): self.draw_log = open(os.environ['NX2LINUX_DRAW_LOG'], 'w')   # JSON lines, one per draw, the first NX2LINUX_DRAW_LOG_MAX of them
+@@ -100,14 +101,20 @@ class Nvn:
+     def replay(self, cmds, state):
+         for c in cmds:
+             op = c[0]
+-            if op == 'targets': state['rt'] = c[1]; state['depth'] = c[2] if len(c) > 2 else 0
++            if op == 'targets':
++                state['rt'], state['depth'] = c[1], c[2] if len(c) > 2 else 0
++                state['rt_views'], state['depth_view'] = c[3] if len(c) > 3 else [], c[4] if len(c) > 4 else None
+             elif op == 'clear':
+                 _, index, color, mask = c
+                 if 0 <= index < len(state.get('rt', [])):
+                     self.fill(state['rt'][index], color, mask)
+-                    if self.gpu and mask & 0xF == 0xF: self.gpu.clear(state['rt'][index], color)
++                    if self.gpu and mask & 0xF == 0xF:
++                        views = state.get('rt_views', [])
++                        self.gpu.clear(state['rt'][index], color, views[index] if index < len(views) else None)
+                 self.stats['clears'] += 1
+-            elif op == 'cleards': self.stats['clears'] += 1   # depth and stencil are not kept in the CPU bitmaps; a backend reads the command from the draw log's targets
++            elif op == 'cleards':
++                self.stats['clears'] += 1   # depth and stencil are not kept in the CPU bitmaps
++                if self.gpu and state.get('depth'): self.gpu.clear_depth(state['depth'], c[1], c[2], c[3], c[4])
+             elif op == 'cleartex':
+                 self.fill(c[1], c[2], c[3]); self.stats['clears'] += 1
+                 if self.gpu and c[3] & 0xF == 0xF: self.gpu.clear(c[1], c[2])
+@@ -119,7 +126,7 @@ class Nvn:
+                 hs = struct.unpack(f'<{k}Q', self.hz.rd(src, 8 * k)) if k else ()
+                 self.apply_state(state, ('tex', {(stage, first + i): h for i, h in enumerate(hs)}))
+             elif op == 'signal': self.signal_event(*c[1:])
+-            elif op == 'copy': self.stats['copies'] += 1
++            elif op == 'copy': self.copy(state, c[1])
+             else: self.apply_state(state, c)
+ 
+     @staticmethod
+@@ -156,10 +163,12 @@ class Nvn:
+         prog = state.get('program')
+         if prog: self.draw_programs.add(prog[0])
+         if self.gpu:
++            t0 = time.monotonic()
+             try: self.gpu.draw(state, call)
+             except Exception as e:
+                 if not self.gpu_errors: self.hz.log(f'[nvn] gpu draw failed: {type(e).__name__}: {e}')
+                 self.gpu_errors += 1
++            self.gpu_seconds += time.monotonic() - t0
+         want_log = self.draw_log is not None and self.stats['draws'] <= self.draw_log_max
+         if not want_log and self.draw_sink is None: return
+         d = self.describe_draw(state, call)
+@@ -201,6 +210,18 @@ class Nvn:
+         d['samplers'] = {f'{k[0]}:{k[1]}': h for k, h in state.get('samp', {}).items()}
+         return d
+ 
++    def copy(self, state, c):
++        """A copy command at submit. Buffer to buffer moves bytes in the game's memory; the texture ones go to the GPU backend when there is one"""
++        self.stats['copies'] += 1
++        if c['kind'] == 'b2b':
++            try: self.hz.wr(c['dst'], self.hz.rd(c['src'], c['size']))
++            except AssertionError: self.stats['copy_failed'] = self.stats.get('copy_failed', 0) + 1
++        elif self.gpu:
++            try: self.gpu.copy_guarded(state, c)
++            except Exception as e:
++                if not self.gpu_errors: self.hz.log(f'[nvn] gpu copy failed: {type(e).__name__}: {e}')
++                self.gpu_errors += 1
++
+     def window_textures(self):
+         return {t for w in self.o.values() if w.get('kind') == 'window' for t in w['textures']}
+ 
+@@ -226,9 +247,12 @@ class Nvn:
+         w = self.o.get(win_ptr)
+         self.stats['presents'] += 1
+         self.hz.frames_presented = self.stats['presents']
++        if self.input is None:
++            import horizon_input; self.input = horizon_input.Input(self.hz)
++        self.input.poll()
+         if self.gpu and os.environ.get('NX2LINUX_GPU_DUMP') and self.stats['presents'] % 120 == 1:
+             import nvn_gpu; nvn_gpu.dump_targets(self.gpu, os.environ['NX2LINUX_GPU_DUMP'])
+-        if self.gpu and self.stats['presents'] % 60 == 1: self.hz.log(f'[nvn] gpu: {self.gpu.stats} gpu lib {self.gpu.gpu.stats()} errors {self.gpu_errors}')
++        if self.gpu and self.stats['presents'] % 60 == 1: self.hz.log(f'[nvn] gpu: {self.gpu.stats} gpu lib {self.gpu.gpu.stats()} errors {self.gpu_errors} gpu seconds {self.gpu_seconds:.1f}')
+         if not w or not w['textures']: return
+         t = self.o.get(w['textures'][index % len(w['textures'])])
+         if not t or not t.get('w'): return
+@@ -249,6 +273,7 @@ class Nvn:
+             try:
+                 self.display.present(bytes(self.texture_bitmap(t)), t['w'], t['h'])
+                 for ev in self.display.events():
++                    self.input.event(ev)
+                     if ev[0] == 'quit': self.hz.log('window closed'); os._exit(0)
+             except Exception as e: self.hz.log(f'[nvn] present failed: {e}')
+ 
+@@ -379,7 +404,8 @@ def _(n, r): pass
+ @nvn('nvnTexturePoolInitialize')
+ def _(n, r): n.o[r[0]] = Obj(kind='texpool', pool=r[1], off=r[2], count=r[3] & M32, tex={}); ret(r, 1)
+ @nvn('nvnTexturePoolRegisterTexture')
+-def _(n, r): n.get(r[0]).setdefault('tex', {})[r[1] & M32] = r[2]
++def _(n, r):
++    p = n.get(r[0]); p.setdefault('tex', {})[r[1] & M32] = r[2]; p.setdefault('views', {})[r[1] & M32] = read_view(n, r[3])
+ @nvn('nvnSamplerPoolInitialize')
+ def _(n, r): n.o[r[0]] = Obj(kind='samplerpool', pool=r[1], off=r[2], count=r[3] & M32, samplers={}); ret(r, 1)
+ @nvn('nvnSamplerPoolRegisterSampler')
+@@ -516,10 +542,17 @@ def _(n, r): ret(r, int(bool(n.get(r[0]).get('recording'))))
+ @nvn('nvnCommandBufferCopyCommands')
+ def _(n, r): c = n.get(r[0]); k = r[1] & M32; c.setdefault('cmds', []).append(('call', struct.unpack(f'<{k}Q', n.hz.rd(r[2], 8 * k)) if k else ()))
+ IMPL['nvnCommandBufferCallCommands'] = IMPL['nvnCommandBufferCopyCommands']
++def read_view(n, ptr):
++    """The texture view struct at ptr as a dict, or None"""
++    return nvn_state.TEXTURE_VIEW.unpack(n.hz.rd(ptr, 16)) if ptr else None
++
++
+ @nvn('nvnCommandBufferSetRenderTargets')
+ def _(n, r):
+     k = r[1] & M32
+-    n.get(r[0]).setdefault('cmds', []).append(('targets', list(struct.unpack(f'<{k}Q', n.hz.rd(r[2], 8 * k))) if k else [], r[4]))
++    ptrs = list(struct.unpack(f'<{k}Q', n.hz.rd(r[2], 8 * k))) if k else []
++    vptrs = list(struct.unpack(f'<{k}Q', n.hz.rd(r[3], 8 * k))) if k and r[3] else [0] * k
++    n.get(r[0]).setdefault('cmds', []).append(('targets', ptrs, r[4], [read_view(n, v) for v in vptrs], read_view(n, r[5])))
+ @nvn('nvnCommandBufferClearColor')
+ def _(n, r): n.get(r[0]).setdefault('cmds', []).append(('clear', r[1] & M32, struct.unpack('<4f', n.hz.rd(r[2], 16)), r[3] & M32))
+ @nvn('nvnCommandBufferClearTexture')
+@@ -586,13 +619,19 @@ for _kind, (_spec, _setters) in nvn_state.OBJECTS.items(): _state_object(_kind,
+ 
+ # ---- samplers: the integer parts of the builder (the float ones, lod and anisotropy, arrive in float registers the host functions do not get) ----
+ @nvn('nvnSamplerBuilderSetDefaults')
+-def _(n, r): n.o[r[0]] = Obj(min_filter=0, mag_filter=0, wrap_s=0, wrap_t=0, wrap_r=0, cmp_mode=0, cmp_func=0)
++def _(n, r): n.o[r[0]] = Obj(min_filter=0, mag_filter=0, wrap_s=1, wrap_t=1, wrap_r=1, cmp_mode=0, cmp_func=0, border=(0.0, 0.0, 0.0, 0.0), lod_min=0.0, lod_max=1000.0, lod_bias=0.0, aniso=1.0)
+ @nvn('nvnSamplerBuilderSetDevice')
+ def _(n, r): pass
+ @nvn('nvnSamplerBuilderSetMinMagFilter')
+ def _(n, r): n.get(r[0]).update(min_filter=r[1] & M32, mag_filter=r[2] & M32)
+ @nvn('nvnSamplerBuilderSetWrapMode')
+ def _(n, r): n.get(r[0]).update(wrap_s=r[1] & M32, wrap_t=r[2] & M32, wrap_r=r[3] & M32)
++@nvn('nvnSamplerBuilderSetBorderColor')
++def _(n, r): n.get(r[0])['border'] = struct.unpack('<4f', n.hz.rd(r[1], 16))
++@nvn('nvnSamplerBuilderSetBorderColori')
++def _(n, r): n.get(r[0])['border'] = tuple(float(v) for v in struct.unpack('<4i', n.hz.rd(r[1], 16)))
++@nvn('nvnSamplerBuilderSetBorderColorui')
++def _(n, r): n.get(r[0])['border'] = tuple(float(v) for v in struct.unpack('<4I', n.hz.rd(r[1], 16)))
+ @nvn('nvnSamplerBuilderSetCompare')
+ def _(n, r): n.get(r[0]).update(cmp_mode=r[1] & M32, cmp_func=r[2] & M32)
+ @nvn('nvnSamplerBuilderSetLodClamp')
+@@ -616,6 +655,9 @@ def f32(r, i):
+     return struct.unpack('<f', struct.pack('<I', r[31 + i] & M32))[0]
+ 
+ 
++def s64(v): return v - (1 << 64) if v & (1 << 63) else v
++
++
+ def s32(v): v &= M32; return v - (1 << 32) if v & 0x80000000 else v
+ 
+ 
+@@ -624,7 +666,7 @@ def _bind_state(kind, spec):
+ 
+ 
+ for _kind, (_spec, _) in nvn_state.OBJECTS.items():
+-    if not _kind.startswith('Vertex'): _bind_state(_kind, _spec)
++    if _kind.endswith('State') and not _kind.startswith('Vertex'): _bind_state(_kind, _spec)
+ 
+ 
+ @nvn('nvnCommandBufferBindProgram')
+@@ -705,11 +747,11 @@ def _(n, r):
+ @nvn('nvnCommandBufferSetBlendColor')
+ def _(n, r): rec(n, r, 'misc', {'blend_color': struct.unpack('<4f', n.hz.rd(r[1], 16))})
+ @nvn('nvnCommandBufferSetStencilValueMask')
+-def _(n, r): rec(n, r, 'misc', {f'stencil_value_mask_{r[1] & M32}': r[2] & M32})
++def _(n, r): rec(n, r, 'misc', {f'stencil_value_mask_{f}': r[2] & M32 for f in (1, 2) if r[1] & f})
+ @nvn('nvnCommandBufferSetStencilMask')
+-def _(n, r): rec(n, r, 'misc', {f'stencil_mask_{r[1] & M32}': r[2] & M32})
++def _(n, r): rec(n, r, 'misc', {f'stencil_mask_{f}': r[2] & M32 for f in (1, 2) if r[1] & f})
+ @nvn('nvnCommandBufferSetStencilRef')
+-def _(n, r): rec(n, r, 'misc', {f'stencil_ref_{r[1] & M32}': r[2] & M32})
++def _(n, r): rec(n, r, 'misc', {f'stencil_ref_{f}': r[2] & M32 for f in (1, 2) if r[1] & f})
+ @nvn('nvnCommandBufferSetDepthRange')
+ def _(n, r): rec(n, r, 'misc', {'depth_range': (f32(r, 0), f32(r, 1))})
+ @nvn('nvnCommandBufferSetDepthRanges')
+@@ -752,8 +794,22 @@ def _(n, r): rec(n, r, 'draw', {'kind': 'elements_indirect', 'prim': r[1] & M32,
+ @nvn('nvnCommandBufferDrawTexture')
+ def _(n, r):
+     rec(n, r, 'draw', {'kind': 'texture', 'prim': -1, 'handle': r[1] & 0xFFFFFFFF, 'dst': struct.unpack('<4f', n.hz.rd(r[2], 16)), 'src': struct.unpack('<4f', n.hz.rd(r[3], 16))})
+-for _name in ('CopyBufferToTexture', 'CopyTextureToBuffer', 'CopyTextureToTexture', 'CopyBufferToBuffer'):
+-    IMPL[f'nvnCommandBuffer{_name}'] = lambda n, r: n.get(r[0]).setdefault('cmds', []).append(('copy',))
++def read_region(n, ptr): return struct.unpack('<6i', n.hz.rd(ptr, 24)) if ptr else (0, 0, 0, 0, 0, 0)   # x, y, z, width, height, depth
++
++
++@nvn('nvnCommandBufferSetCopyRowStride')
++def _(n, r): rec(n, r, 'misc', {'copy_row_stride': s64(r[1])})
++@nvn('nvnCommandBufferSetCopyImageStride')
++def _(n, r): rec(n, r, 'misc', {'copy_image_stride': s64(r[1])})
++@nvn('nvnCommandBufferCopyBufferToTexture')
++def _(n, r): rec(n, r, 'copy', {'kind': 'b2t', 'src': r[1], 'tex': r[2], 'view': read_view(n, r[3]), 'region': read_region(n, r[4]), 'flags': r[5] & M32})
++@nvn('nvnCommandBufferCopyTextureToBuffer')
++def _(n, r): rec(n, r, 'copy', {'kind': 't2b', 'tex': r[1], 'view': read_view(n, r[2]), 'region': read_region(n, r[3]), 'dst': r[4], 'flags': r[5] & M32})
++@nvn('nvnCommandBufferCopyTextureToTexture')
++def _(n, r):
++    rec(n, r, 'copy', {'kind': 't2t', 'src': r[1], 'src_view': read_view(n, r[2]), 'src_region': read_region(n, r[3]), 'dst': r[4], 'dst_view': read_view(n, r[5]), 'dst_region': read_region(n, r[6]), 'flags': r[7] & M32})
++@nvn('nvnCommandBufferCopyBufferToBuffer')
++def _(n, r): rec(n, r, 'copy', {'kind': 'b2b', 'src': r[1], 'dst': r[2], 'size': r[3]})
+ 
+ 
+ # ---- window ----
+diff --git a/dm/tools/nvn_gpu.py b/dm/tools/nvn_gpu.py
+index 97b68a0..d69dc6d 100644
+--- a/dm/tools/nvn_gpu.py
++++ b/dm/tools/nvn_gpu.py
+@@ -33,6 +33,12 @@ NVN_TO_VK = {0x01: VK['R8_UNORM'], 0x02: VK['R8_SNORM'], 0x03: VK['R8_UINT'], 0x
+              0x37: VK['RGBA8_SRGB'], 0x38: VK['RGBA8_SRGB'], 0x3D: VK['A2B10G10R10_UNORM'], 0x3F: VK['B10G11R11_UFLOAT'],
+              0x41: VK['BC1_RGB'], 0x42: VK['BC1_RGBA'], 0x43: VK['BC2'], 0x44: VK['BC3'], 0x45: VK['BC1_RGB_SRGB'], 0x46: VK['BC1_RGBA_SRGB'], 0x47: VK['BC2_SRGB'], 0x48: VK['BC3_SRGB'],
+              0x49: VK['BC4_U'], 0x4A: VK['BC4_S'], 0x4B: VK['BC5_U'], 0x4C: VK['BC5_S'], 0x4D: VK['BC7'], 0x4E: VK['BC7_SRGB'], 0x4F: VK['BC6H_S'], 0x50: VK['BC6H_U']}
++NVN_TO_VK.update({0x6D: VK['RGBA8_UNORM'], 0x6E: VK['RGBA8_SNORM'], 0x6F: VK['RGBA8_UINT'], 0x70: VK['RGBA8_SINT'],
++                  0x71: VK['RGBA16_SFLOAT'], 0x72: VK['RGBA16_UNORM'], 0x73: VK['RGBA16_SNORM'], 0x74: VK['RGBA16_UINT'], 0x75: VK['RGBA16_SINT'],
++                  0x76: VK['RGBA32_SFLOAT'], 0x77: VK['RGBA32_UINT'], 0x78: VK['RGBA32_SINT'], 0x99: 44, 0x9A: 44, 0x9B: 50, 0x9C: 50})
++# formats that exist only for vertex input: integers read as floats (VK *_USCALED / *_SSCALED)
++NVN_TO_VK.update({0x51: 11, 0x52: 12, 0x53: 72, 0x54: 73, 0x57: 18, 0x58: 19, 0x59: 79, 0x5A: 80, 0x5D: 25, 0x5E: 26, 0x5F: 86, 0x60: 87, 0x63: 39, 0x64: 40, 0x65: 93, 0x66: 94})
++NO_ALPHA = {0x38, 0x41, 0x45, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x99, 0x9B}   # RGBX, BGRX and RGB_DXT1: alpha reads 1
+ DEPTH_FORMATS = {0x32, 0x33, 0x34, 0x35, 0x36}
+ TARGET_2D, TARGET_RECTANGLE = 1, 7
+ QUADS = 100
+@@ -63,7 +69,7 @@ class GpuBackend:
+         self.shaders = {}    # shader key -> (id, stage, resources) once translated
+         self.failed = {}     # shader key -> why it did not translate
+         self.images = {}     # texture pointer -> dict(id, w, h, fmt, uploaded, target)
+-        self.dummy = None
++        self.dummies = {}
+         self.target_draws = {}   # texture pointer -> draws made into it (diagnostics)
+         self.stats = {'draws': 0, 'skipped': {}, 'uploads': 0, 'translated': 0}
+ 
+@@ -98,7 +104,7 @@ class GpuBackend:
+         return f
+ 
+     def image_of(self, ptr, target=False):
+-        """The GPU image of an NVN texture (created on first use; sampled textures are read from the game's memory then)"""
++        """The GPU image of an NVN texture (created on first use, with all its levels and layers; sampled textures are read from the game's memory then)"""
+         n = self.nvn
+         t = n.o.get(ptr)
+         if not t or 'd' not in t: raise Skip('unknown texture')
+@@ -106,45 +112,77 @@ class GpuBackend:
+         im = self.images.get(ptr)
+         if im is None:
+             if d.samples > 1: raise Skip('multisampled texture')
+-            if d.target not in (TARGET_2D, TARGET_RECTANGLE) or d.depth > 1: raise Skip(f'texture target {d.target}')
++            if d.target in (0, 3, 6, 10): raise Skip(f'texture target {d.target}')
+             depth = d.format in DEPTH_FORMATS
+             vkf = self.vk_format(d.format)
+-            im = self.images[ptr] = dict(id=self.gpu.image(max(1, d.width), max(1, d.height), vkf, depth), w=d.width, h=d.height, fmt=vkf, depth=depth, uploaded=False, written=False)
++            w, h = max(1, d.width), max(1, d.height)
++            levels = max(1, d.levels)
++            if d.target == 2: kind, layers, dep = 1, 1, max(1, d.depth)
++            elif d.target == 4: kind, layers, dep = 0, max(1, d.depth), 1
++            elif d.target == 8: kind, layers, dep = 0, 6, 1
++            elif d.target == 9: kind, layers, dep = 0, 6 * max(1, d.depth), 1
++            else: kind, layers, dep = 0, 1, 1
++            levels = min(levels, max(w, h, dep).bit_length())
++            im = self.images[ptr] = dict(id=self.gpu.image(w, h, vkf, dep, layers, levels, kind), w=w, h=h, fmt=vkf, depth=depth, kind=kind, layers=layers, levels=levels, uploaded=False, written=False)
+         if target: im['written'] = True
+         elif not im['uploaded'] and not im['written']: self.upload(ptr, t, d, im)
+         return im
+ 
+     def upload(self, ptr, t, d, im):
++        """Every level and layer of a texture from the game's memory (block-linear: deswizzled by the GPU library)"""
+         im['uploaded'] = True
+         if im['depth']: self.count('upload: depth'); return
+-        lay = nvn_layout.layout(d)
+         bpb, bw, bh = nvn_layout.fmt_of(d.format)
+         if not bpb: self.count('upload: format without a size'); return
+-        row_bytes, rows = nvn_layout.blk(d.width, bw) * bpb, nvn_layout.blk(d.height, bh)
+         addr = self.nvn.pool_addr(t.get('pool', 0), t.get('off', 0))
+         if not addr: self.count('upload: texture without storage'); return
++        lay = nvn_layout.layout(d)
++        dpl, layered, w, h, z = nvn_layout.shape(d)
++        linear = bool(d.flags & 0x50)
+         try:
+-            if d.flags & 0x50:   # linear
+-                stride = d.stride or (row_bytes + 31 & ~31)
+-                raw = self.nvn.hz.rd(addr, stride * rows)
+-                data = b''.join(raw[y * stride:y * stride + row_bytes] for y in range(rows))
+-            else:
+-                th = nvn_layout.adj_tile(lay.tileH, 8, rows)
+-                gobs_x, blocks_y = (row_bytes + 63) // 64, (nvn_layout.blk(rows, 8) + (1 << th) - 1) >> th
+-                raw = self.nvn.hz.rd(addr, gobs_x * blocks_y * (512 << th))
+-                data = self.gpu.deswizzle(raw, row_bytes, rows, th)
+-            self.gpu.upload(im['id'], data)
+-            self.stats['uploads'] += 1
++            for level in range(im['levels']):
++                lw, lh = nvn_layout.blk(nvn_layout.mip(w, level), bw), nvn_layout.blk(nvn_layout.mip(h, level), bh)
++                ld = nvn_layout.mip(z, level) if d.target == 2 else 1
++                row_bytes = lw * bpb
++                off, wg = nvn_layout.level_walk(d, level, dpl, w, h, z, lay.tileH, lay.tileD, (bpb, bw, bh))
++                th, td = nvn_layout.adj_tile(lay.tileH, 8, lh), nvn_layout.adj_tile(lay.tileD, 1, ld)
++                size = wg * ((nvn_layout.blk(lh, 8) + (1 << th) - 1) >> th) * ((ld + (1 << td) - 1) >> td) * (512 << (th + td))
++                for layer in range(im['layers']):
++                    base = addr + layer * lay.layer_size + off
++                    if linear:
++                        stride = d.stride or (row_bytes + 31 & ~31)
++                        raw = self.nvn.hz.rd(base, stride * lh)
++                        data = b''.join(raw[y * stride:y * stride + row_bytes] for y in range(lh))
++                    else: data = self.gpu.deswizzle(self.nvn.hz.rd(base, size), row_bytes, lh, th, ld, td, wg)
++                    self.gpu.upload(im['id'], data, nvn_layout.mip(w, level), nvn_layout.mip(h, level), ld, level, layer)
++                    self.stats['uploads'] += 1
+         except (AssertionError, hg.GpuError) as e: self.count(f'upload: {type(e).__name__} {str(e)[:40]}')
+ 
+-    def dummy_image(self):
+-        if self.dummy is None:
+-            self.dummy = self.gpu.image(1, 1, VK['RGBA8_UNORM']); self.gpu.upload(self.dummy, bytes(4))
+-        return self.dummy
++    def dummy_image(self, view_type=1):
++        """A 1x1 black image of the kind a shader texture of this view type needs (2D, 3D, cube, arrays)"""
++        key = {1: 1, 2: 2, 3: 3, 5: 1, 6: 3}.get(view_type, 1)
++        if key not in self.dummies:
++            kind, layers = (1, 1) if key == 2 else (0, 6) if key == 3 else (0, 1)
++            i = self.gpu.image(1, 1, VK['RGBA8_UNORM'], 1, layers, 1, kind)
++            self.gpu.clear_color(i, (0, 0, 0, 0))
++            self.dummies[key] = i
++        return self.dummies[key]
++
++    @staticmethod
++    def target_of(im, view):
++        """(layer or slice, level) a render target view names"""
++        if not view: return 0, 0
++        return (view['min_layer'] if view['set_layers'] else 0), (view['base_level'] if view['set_levels'] else 0)
+ 
+     # ---- clears and presents ----
+-    def clear(self, ptr, color):
+-        try: self.gpu.clear_color(self.image_of(ptr, target=True)['id'], color)
++    def clear(self, ptr, color, view=None):
++        try:
++            im = self.image_of(ptr, target=True)
++            if im['depth']: return
++            if view and (view['set_layers'] or view['set_levels']):
++                self.gpu.clear_color(im['id'], color, view['base_level'] if view['set_levels'] else 0, view['nlevels'] if view['set_levels'] else 0,
++                                     view['min_layer'] if view['set_layers'] else 0, view['nlayers'] if view['set_layers'] else 0)
++            else: self.gpu.clear_color(im['id'], color)
+         except Skip: pass
+ 
+     def read_bitmap(self, ptr):
+@@ -163,6 +201,27 @@ class GpuBackend:
+         try: self._draw(state, call)
+         except Skip as e: self.skip(str(e))
+ 
++    def copy_guarded(self, state, c):
++        try: self.copy(state, c)
++        except Skip as e: self.skip(str(e))
++
++    def resolve_indirect(self, call):
++        """An indirect draw with the record it points to read from the game's memory now (a record a GPU pass wrote is not there: that draw is skipped as zero-sized)"""
++        try:
++            if call['kind'] == 'arrays_indirect':
++                count, inst, first, base_inst = struct.unpack('<4I', self.nvn.hz.rd(call['indirect'], 16))
++                return dict(call, kind='arrays', first=first, count=count, instances=inst, base_instance=base_inst)
++            count, inst, first_idx, base_vertex, base_inst = struct.unpack('<5I', self.nvn.hz.rd(call['indirect'], 20))
++            return dict(call, kind='elements', count=count, instances=inst, index_buffer=call['index_buffer'] + first_idx * (1, 2, 4)[min(call['index_type'], 2)],
++                        base_vertex=struct.unpack('<i', struct.pack('<I', base_vertex))[0], base_instance=base_inst)
++        except AssertionError: raise Skip('indirect record unreadable')
++
++    def clear_depth(self, ptr, depth, dmask, stencil, smask):
++        try:
++            im = self.image_of(ptr, target=True)
++            if im['depth'] and dmask: self.gpu.clear_depth(im['id'], depth, stencil)
++        except Skip: pass
++
+     def _buffer(self, addr, size, limit=MAX_VERTEX_BYTES):
+         if not addr or size <= 0: return b''
+         try: return self.nvn.hz.rd(addr, min(size, limit))
+@@ -170,7 +229,9 @@ class GpuBackend:
+ 
+     def _draw(self, state, call):
+         n, gpu = self.nvn, self.gpu
+-        if call['kind'] in ('arrays_indirect', 'elements_indirect', 'texture'): raise Skip(call['kind'])
++        if call['kind'] == 'texture': raise Skip('draw texture')
++        if call['kind'] in ('arrays_indirect', 'elements_indirect'):
++            call = self.resolve_indirect(call)
+         prog = state.get('program')
+         if not prog: raise Skip('no program')
+         by_stage = {}
+@@ -184,11 +245,20 @@ class GpuBackend:
+         if len(rts) > hg.MAX_TARGETS: raise Skip('targets')
+         d = hg.Draw(); keep = []
+         d.vs, d.ps, d.ntargets = vs_id, ps_id, len(rts)
+-        for i, p in enumerate(rts): d.targets[i] = self.image_of(p, target=True)['id']
+-        if state.get('depth'): d.depth_image = self.image_of(state['depth'], target=True)['id']
+-        if not rts and not d.depth_image: raise Skip('no target')
+-        t0 = n.o.get(rts[0]) if rts else n.o.get(state['depth'])
+-        tw, th = t0['d'].width, t0['d'].height
++        views = state.get('rt_views', [])
++        extent = None
++        for i, p in enumerate(rts):
++            im = self.image_of(p, target=True)
++            layer, level = self.target_of(im, views[i] if i < len(views) else None)
++            d.targets[i].image, d.targets[i].layer, d.targets[i].level = im['id'], layer, level
++            extent = extent or (max(1, im['w'] >> level), max(1, im['h'] >> level))
++        if state.get('depth'):
++            im = self.image_of(state['depth'], target=True)
++            layer, level = self.target_of(im, state.get('depth_view'))
++            d.depth.image, d.depth.layer, d.depth.level = im['id'], layer, level
++            extent = extent or (max(1, im['w'] >> level), max(1, im['h'] >> level))
++        if not extent: raise Skip('no target')
++        tw, th = extent
+ 
+         # fixed-function state
+         st = state.get('states', {})
+@@ -202,6 +272,18 @@ class GpuBackend:
+             if en and b: bl.enable, bl.src_rgb, bl.dst_rgb, bl.op_rgb, bl.src_a, bl.dst_a, bl.op_a = 1, BLEND_FACTOR.get(b['src_rgb'], 1), BLEND_FACTOR.get(b['dst_rgb'], 0), b['eq_rgb'] - 1, BLEND_FACTOR.get(b['src_a'], 1), BLEND_FACTOR.get(b['dst_a'], 0), b['eq_a'] - 1
+         d.cull, d.front_face, d.polygon_mode = poly.get('cull', 0), poly.get('front', 1), {0: 2, 1: 1, 2: 0}.get(poly.get('mode', 2), 0)
+         d.depth_test, d.depth_write, d.depth_func = ds.get('dt', 0), ds.get('dw', 1), max(0, ds.get('df', 2) - 1)
++        dev = n.o.get(getattr(n, 'device', 0), {})
++        d.depth_neg_one = int(dev.get('depth', 0) == 0)   # NVN_DEPTH_MODE_NEAR_IS_MINUS_W: clip z runs from -w to w
++        misc = state.get('misc', {})
++        if ds:
++            d.stencil_test = ds.get('st', 0)
++            for arr, face in ((d.stencil_front, 'f'), (d.stencil_back, 'b')):
++                arr[0], arr[1], arr[2], arr[3] = (max(0, ds[f'{k}_{face}'] - 1) for k in ('fail', 'zfail', 'zpass', 'sf'))
++        for i, face in enumerate((1, 2)):
++            d.stencil_masks[3 * i:3 * i + 3] = (misc.get(f'stencil_value_mask_{face}', 0xFF), misc.get(f'stencil_mask_{face}', 0xFF), misc.get(f'stencil_ref_{face}', 0))
++        d.blend_color[:] = misc.get('blend_color', (0.0, 0.0, 0.0, 0.0))
++        factor, units, clamp = misc.get('polygon_offset', (0.0, 0.0, 0.0))
++        if poly.get('offset_en', 0): d.depth_bias_on = 1; d.depth_bias[:] = (units, clamp, factor)
+         vp = state.get('viewport', {}).get(0, (0, 0, tw, th))
+         d.viewport[:] = (vp[0], vp[1] + vp[3], vp[2], -vp[3])   # y up in clip space: the negative height flips it to the window (upper-left origin)
+         d.depth_range[:] = state.get('misc', {}).get('depth_range', (0.0, 1.0))
+@@ -212,6 +294,7 @@ class GpuBackend:
+         vattr, vstream, vbuf = state.get('vattr', []), state.get('vstream', []), state.get('vbuf', {})
+         kind = call['kind']
+         indices = None
++        if call['count'] <= 0 or call.get('instances', 1) <= 0: return
+         if kind == 'elements':
+             isz = (1, 2, 4)[call['index_type']] if call['index_type'] < 3 else 4
+             raw = self._buffer(call['index_buffer'], call['count'] * isz, 1 << 26)
+@@ -274,23 +357,88 @@ class GpuBackend:
+             for tx in res['textures']:
+                 if tx['binding'] in seen: continue
+                 seen.add(tx['binding'])
+-                kind = tx['type'] & 0xFF
+-                if kind != 3 or tx['type'] & 0x300: raise Skip(f'texture type {tx["type"]:#x}')
++                kind, array = tx['type'] & 0xFF, bool(tx['type'] & 0x100)
++                if kind not in (3, 4, 5) or tx['type'] & 0x200 or (kind == 4 and array): raise Skip(f'texture type {tx["type"]:#x}')
++                view_type = {3: 5 if array else 1, 4: 2, 5: 6 if array else 3}[kind]   # VkImageViewType: 2D / 2D array, 3D, cube / cube array
+                 handle = self.handle_of(state, stage, tx)
+                 tex_id, samp_id = handle & 0xFFFFF, handle >> 20 & 0xFFF
+                 tp = n.o.get(state.get('texpool', 0), {})
+                 ptr = tp.get('tex', {}).get(tex_id)
+-                try: image = self.image_of(ptr)['id'] if ptr else self.dummy_image()
+-                except Skip as e: image = self.dummy_image(); self.count('dummy: ' + str(e))
+-                if not ptr: self.count('dummy: texture id not in the pool')
++                view = tp.get('views', {}).get(tex_id)
++                image, base_level, nlevels, base_layer, nlayers = None, 0, 0, 0, 0
++                if ptr:
++                    try:
++                        im = self.image_of(ptr)
++                        if self.view_fits(im, view_type): image = im['id']
++                        else: self.count(f'dummy: view type {view_type} of a {"3D" if im["kind"] else str(im["layers"]) + "-layer"} image')
++                    except Skip as e: self.count('dummy: ' + str(e))
++                    if image and view:
++                        if view['set_levels']: base_level, nlevels = view['base_level'], view['nlevels']
++                        if view['set_layers']: base_layer, nlayers = view['min_layer'], view['nlayers']
++                else: self.count('dummy: texture id not in the pool')
++                if image is None: image, view_type, base_level, nlevels, base_layer, nlayers = self.dummy_image(view_type), view_type, 0, 0, 0, 0
+                 sp = n.o.get(state.get('samppool', 0), {}).get('samplers', {}).get(samp_id, {})
+                 t = hg.Tex(); t.binding, t.image = tx['binding'], image
+-                t.min_filter, t.mag_filter = int(sp.get('min_filter', 0) & 1), int(sp.get('mag_filter', 0) & 1)
++                t.view_type, t.base_level, t.nlevels, t.base_layer, t.nlayers = view_type, base_level, nlevels, base_layer, nlayers
++                t.alpha_one = int(bool(ptr) and ptr in self.images and n.o[ptr]['d'].format in NO_ALPHA)
++                mn = sp.get('min_filter', 0)
++                t.min_filter, t.mag_filter = int(mn & 1), int(sp.get('mag_filter', 0) & 1)
++                t.mip_mode = 1 if mn in (4, 5) else 0
+                 t.wrap_s, t.wrap_t, t.wrap_r = (WRAP.get(sp.get(k, 1), 0) for k in ('wrap_s', 'wrap_t', 'wrap_r'))
+-                t.lod_max = 0.25; t.aniso = 1.0
++                t.lod_min, t.lod_max, t.lod_bias, t.aniso = sp.get('lod_min', 0.0), (sp.get('lod_max', 1000.0) if mn >= 2 else 0.0), sp.get('lod_bias', 0.0), max(1.0, sp.get('aniso', 1.0))
++                bc = sp.get('border', (0.0, 0.0, 0.0, 0.0))
++                t.border = 4 if bc[0] > 0.5 and bc[3] > 0.5 else 2 if bc[3] > 0.5 else 0   # opaque white, opaque black, transparent black (the three Vulkan has)
+                 if tx['type'] & 0x400: t.compare_enable, t.compare_op = 1, max(0, sp.get('cmp_func', 2) - 1)
+                 d.tex[d.ntex] = t; d.ntex += 1
+ 
++    @staticmethod
++    def view_fits(im, view_type):
++        """Whether an image can be seen as the view type a shader samples it as"""
++        if view_type == 2: return im['kind'] == 1
++        if im['kind'] == 1: return False
++        if view_type in (3, 6): return im['layers'] % 6 == 0 and im['w'] == im['h']
++        return True
++
++    def copy(self, state, c):
++        """A texture copy: buffer to texture is read from the game's memory and uploaded, texture to texture stays on the GPU. Texture to buffer is not done yet"""
++        n = self.nvn
++        if c['kind'] == 'b2t':
++            im = self.image_of(c['tex'], target=True)
++            d = n.o[c['tex']]['d']
++            bpb, bw, bh = nvn_layout.fmt_of(d.format)
++            x, y, z, w, h, dep = c['region']
++            view = c['view']
++            level = view['base_level'] if view and view['set_levels'] else 0
++            layer0 = view['min_layer'] if view and view['set_layers'] else 0
++            row_bytes = nvn_layout.blk(w, bw) * bpb
++            rows = nvn_layout.blk(h, bh)
++            misc = state.get('misc', {})
++            row_stride = misc.get('copy_row_stride') or row_bytes
++            img_stride = misc.get('copy_image_stride') or row_stride * rows
++            slices = max(1, dep)
++            parts = []
++            for k in range(slices):
++                base = c['src'] + k * img_stride
++                if row_stride == row_bytes: parts.append(n.hz.rd(base, row_bytes * rows))
++                else:
++                    raw = n.hz.rd(base, row_stride * (rows - 1) + row_bytes)
++                    parts.append(b''.join(raw[r * row_stride:r * row_stride + row_bytes] for r in range(rows)))
++            if im['kind']: self.gpu.upload(im['id'], b''.join(parts), w, h, slices, level, 0, x, y, z)
++            else:
++                for k, data in enumerate(parts): self.gpu.upload(im['id'], data, w, h, 1, level, layer0 + z + k, x, y, 0)
++        elif c['kind'] == 't2t':
++            si, di = self.image_of(c['src']), self.image_of(c['dst'], target=True)
++            sx, sy, sz, w, h, dep = c['src_region']
++            dx, dy, dz = c['dst_region'][:3]
++            sv, dv = c['src_view'], c['dst_view']
++            slevel, slayer = (sv['base_level'] if sv and sv['set_levels'] else 0), (sv['min_layer'] if sv and sv['set_layers'] else 0)
++            dlevel, dlayer = (dv['base_level'] if dv and dv['set_levels'] else 0), (dv['min_layer'] if dv and dv['set_layers'] else 0)
++            if si['fmt'] != di['fmt']: raise Skip('copy between formats')
++            if si['kind'] or di['kind']: self.gpu.copy_image(si['id'], di['id'], (w, h, max(1, dep)), (sx, sy, sz), (dx, dy, dz), slevel, 0, dlevel, 0)
++            else:
++                for k in range(max(1, dep)): self.gpu.copy_image(si['id'], di['id'], (w, h, 1), (sx, sy, 0), (dx, dy, 0), slevel, slayer + sz + k, dlevel, dlayer + dz + k)
++        else: self.count('copy: ' + c['kind'])
++
+     def handle_of(self, state, stage, tx):
+         """The texture handle a shader texture slot reads: from the bound handle table (slot r of combined textures sits at c2 word 8 + 2 r, separate textures from word 90), or, for a bindless
+         read, from the word of the uniform buffer the shader names"""
+diff --git a/dm/tools/nvn_spirv.py b/dm/tools/nvn_spirv.py
+index 9d2e234..59f00d2 100644
+--- a/dm/tools/nvn_spirv.py
++++ b/dm/tools/nvn_spirv.py
+@@ -9,7 +9,7 @@ from pathlib import Path
+ XLATE_SRC = Path(__file__).resolve().parent.parent / 'gfx/tools/dmsh_xlate'
+ XLATE_DIR = Path(os.environ.get('NX2LINUX_XLATE_DIR', Path.home() / '.cache/nx2linux/xlate'))   # the translator built for this machine (the dmsh_xlate_bin in the tree is built for macOS)
+ XLATE_DLL = XLATE_DIR / 'dmsh_xlate.dll'
+-CACHE = Path(os.environ.get('NX2LINUX_SPIRV_CACHE', Path.home() / '.cache/nx2linux/spirv'))
++CACHE = Path(os.environ.get('NX2LINUX_SPIRV_CACHE', Path.home() / '.cache/nx2linux/spirv-debug'))
+ SPH_MAGIC = bytes.fromhex('78563412')
+ SHADER_TYPES = {0: 'vs', 1: 'vs', 2: 'tcs', 3: 'tes', 4: 'gs', 5: 'ps'}   # SPH shader type (word 0, bits 10..13); type 0 is a vertex shader, in two parts when the control section says so
+ 
+@@ -59,7 +59,7 @@ def make_job(key, stage, ctl, code, workdir):
+         if ab: code, c1 = ab
+     if stage != 'cs': code = code[0x30:]   # the header; the translator reads the 0x50-byte SPH after it itself
+     path = os.path.join(workdir, key + '.bin'); open(path, 'wb').write(code)
+-    job = {'key': key, 'stage': stage, 'code': path, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'no_facts': True, 'debug': False, 'reduced': True}
++    job = {'key': key, 'stage': stage, 'code': path, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'no_facts': True, 'debug': True, 'reduced': True}   # debug as the Mach chain's default (XLATE_DEBUG=1): without it the translator's AST optimizer fails on some shaders
+     if stage == 'ps' and early_fragment_tests(ctl, code): job['early_fragment_tests'] = True
+     return job
+ 
+diff --git a/dm/tools/nvn_state.py b/dm/tools/nvn_state.py
+index 6116328..b5df9bc 100644
+--- a/dm/tools/nvn_state.py
++++ b/dm/tools/nvn_state.py
+@@ -43,6 +43,10 @@ DEPTH_STENCIL = Spec('depth_stencil', 8, [('dt', 1), ('dw', 1), ('df', 4), ('st'
+ VERTEX_ATTRIB = Spec('vertex_attrib', 4, [('fmt', 8), ('offset', 19), ('stream', 5)], dict(fmt=0, offset=0, stream=0))
+ VERTEX_STREAM = Spec('vertex_stream', 8, [('stride', 32), ('divisor', 32)], dict(stride=0, divisor=0))
+ 
++TEXTURE_VIEW = Spec('texture_view', 16, [('set_levels', 1), ('set_layers', 1), ('set_format', 1), ('set_target', 1), ('set_swizzle', 1), ('set_dsmode', 1), ('dsmode', 2), ('target', 8), ('base_level', 8),
++                                          ('nlevels', 8), ('format', 16), ('min_layer', 16), ('nlayers', 16)],
++                    dict(set_levels=0, set_layers=0, set_format=0, set_target=0, set_swizzle=0, set_dsmode=0, dsmode=0, target=0, base_level=0, nlevels=0, format=0, min_layer=0, nlayers=0))
++
+ M32 = 0xFFFFFFFF
+ 
+ 
+@@ -81,4 +85,6 @@ OBJECTS = {
+                                           'SetStencilFunc': _stencil_func, 'SetStencilOp': _stencil_op}),
+     'VertexAttribState': (VERTEX_ATTRIB, {'SetFormat': lambda d, a: d.update(fmt=a[0], offset=a[1]), 'SetStreamIndex': lambda d, a: d.update(stream=a[0])}),
+     'VertexStreamState': (VERTEX_STREAM, {'SetStride': lambda d, a: d.update(stride=a[0]), 'SetDivisor': lambda d, a: d.update(divisor=a[0])}),
++    'TextureView': (TEXTURE_VIEW, {'SetLevels': lambda d, a: d.update(set_levels=1, base_level=a[0], nlevels=a[1]), 'SetLayers': lambda d, a: d.update(set_layers=1, min_layer=a[0], nlayers=a[1]),
++                                   'SetFormat': lambda d, a: d.update(set_format=1, format=a[0]), 'SetTarget': lambda d, a: d.update(set_target=1, target=a[0])}),
+ }
+diff --git a/dm/tools/tests/test_horizon_gpu.py b/dm/tools/tests/test_horizon_gpu.py
+index ebc2b12..a58f371 100644
+--- a/dm/tools/tests/test_horizon_gpu.py
++++ b/dm/tools/tests/test_horizon_gpu.py
+@@ -17,7 +17,20 @@ layout(location=0) out vec4 o;
+ layout(binding=1) uniform U { vec4 tint; } u;
+ void main() { o = v * u.tint; }
+ """
++FRAG_3D = """#version 450
++layout(location=0) in vec4 v;
++layout(location=0) out vec4 o;
++layout(binding=1) uniform sampler3D t;
++void main() { o = texture(t, vec3(0.5, 0.5, 0.75)); }
++"""
++FRAG_ARRAY = """#version 450
++layout(location=0) in vec4 v;
++layout(location=0) out vec4 o;
++layout(binding=1) uniform sampler2DArray t;
++void main() { o = texture(t, vec3(0.5, 0.5, 1.0)); }
++"""
+ R8G8B8A8_UNORM, TRIANGLE_LIST = 37, 3
++VIEW_2D, VIEW_3D, VIEW_2D_ARRAY = 1, 2, 5
+ 
+ 
+ def spirv(src, stage):
+@@ -44,7 +57,7 @@ class Gpu(unittest.TestCase):
+         g.clear_color(img, (0, 0, 0, 1))
+         verts = struct.pack('<18f', -1, -1, 1, 0, 0, 1, 3, -1, 1, 0, 0, 1, -1, 3, 1, 0, 0, 1)   # covers the whole target, red
+         keep = ctypes.create_string_buffer(verts); tint = ctypes.create_string_buffer(struct.pack('<4f', 1, 0.5, 1, 1))
+-        d = hg.Draw(); d.vs, d.ps, d.ntargets = vs, ps, 1; d.targets[0] = img
++        d = hg.Draw(); d.vs, d.ps, d.ntargets = vs, ps, 1; d.targets[0].image = img
+         d.nattrs = 2; d.attrs[0] = hg.Attr(0, 0, 103, 0); d.attrs[1] = hg.Attr(1, 0, 109, 8)   # R32G32_SFLOAT, R32G32B32A32_SFLOAT
+         d.nstreams = 1; d.streams[0] = hg.Stream(0, 24, 0, 0, ctypes.addressof(keep), len(verts))
+         d.topology, d.count, d.instances = 4, 3, 1
+@@ -58,6 +71,44 @@ class Gpu(unittest.TestCase):
+         c = (32 * 64 + 32) * 4
+         self.assertEqual(tuple(px[c:c + 4]), (255, 0, 0, 255))   # red * (1, .5, 1, 1)
+ 
++    def draw_fullscreen(self, frag, texture, view_type, target):
++        g = self.gpu
++        vs, ps = g.shader(spirv(VERT, 'vert')), g.shader(spirv(frag, 'frag'))
++        verts = struct.pack('<18f', -1, -1, 1, 0, 0, 1, 3, -1, 1, 0, 0, 1, -1, 3, 1, 0, 0, 1)
++        keep = ctypes.create_string_buffer(verts)
++        d = hg.Draw(); d.vs, d.ps, d.ntargets = vs, ps, 1; d.targets[0].image = target
++        d.nattrs = 2; d.attrs[0] = hg.Attr(0, 0, 103, 0); d.attrs[1] = hg.Attr(1, 0, 109, 8)
++        d.nstreams = 1; d.streams[0] = hg.Stream(0, 24, 0, 0, ctypes.addressof(keep), len(verts))
++        d.topology, d.count, d.instances = 4, 3, 1
++        d.blend[0].mask = 0xF
++        d.viewport[:] = (0, 0, 16, 16); d.depth_range[:] = (0, 1); d.scissor[:] = (0, 0, 16, 16)
++        d.ntex = 1; t = d.tex[0]; t.binding, t.image, t.view_type, t.lod_max = 1, texture, view_type, 0.25
++        self.assertEqual(g.draw(d), 0)
++        px = g.read(target, 16 * 16 * 4)
++        return tuple(px[(8 * 16 + 8) * 4:(8 * 16 + 8) * 4 + 4])
++
++    def test_a_3d_image_is_sampled_by_slice(self):
++        g = self.gpu
++        vol = g.image(2, 2, R8G8B8A8_UNORM, 4, 1, 1, kind=1)
++        for z in range(4): g.upload(vol, bytes((z * 60, 0, 0, 255)) * 4, 2, 2, 1, 0, 0, 0, 0, z)
++        out = g.image(16, 16, R8G8B8A8_UNORM)
++        self.assertEqual(self.draw_fullscreen(FRAG_3D, vol, VIEW_3D, out), (180, 0, 0, 255))   # z = 0.75 * 4 - 0.5 = slice 2.5 would blend 120 and 180: nearest filtering picks slice 3
++
++    def test_an_array_layer_is_sampled_and_drawn_into(self):
++        g = self.gpu
++        arr = g.image(2, 2, R8G8B8A8_UNORM, 1, 3)
++        for layer in range(3): g.upload(arr, bytes((0, layer * 100, 0, 255)) * 4, 2, 2, 1, 0, layer)
++        out = g.image(16, 16, R8G8B8A8_UNORM)
++        self.assertEqual(self.draw_fullscreen(FRAG_ARRAY, arr, VIEW_2D_ARRAY, out), (0, 100, 0, 255))
++
++    def test_a_block_linear_volume_comes_out_linear(self):
++        # two slices of one block with 2 GOBs deep: slice 1 follows slice 0's GOB
++        gob = lambda v: bytes([v]) * 512
++        raw = gob(1) + gob(2)
++        out = self.gpu.deswizzle(raw, 64, 8, 0, 2, 1)
++        self.assertEqual(out[:64 * 8], bytes([1]) * 512)
++        self.assertEqual(out[64 * 8:], bytes([2]) * 512)
++
+     def test_a_block_linear_image_comes_out_linear(self):
+         row_bytes, rows = 64, 8   # one GOB
+         lin = bytes((y * 7 + x) & 255 for y in range(rows) for x in range(row_bytes))
+diff --git a/dm/tools/tests/test_horizon_input.py b/dm/tools/tests/test_horizon_input.py
+new file mode 100644
+index 0000000..c8673f2
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_input.py
+@@ -0,0 +1,34 @@
++"""horizon_input.py: window events and scripted presses become NpadState buttons"""
++import os, sys, unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++import horizon_hid
++import horizon_input as hi
++
++
++class Hz: pass
++
++
++class Input(unittest.TestCase):
++    def test_keys_and_gamepad_buttons_set_and_clear_bits(self):
++        hz, clock = Hz(), [0.0]
++        i = hi.Input(hz, now=lambda: clock[0])
++        i.event(('key_down', ord('x'), 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, hi.BUTTONS['A'])
++        i.event(('pad_down', 11, 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, hi.BUTTONS['A'] | hi.BUTTONS['Up'])
++        i.event(('key_up', ord('x'), 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, hi.BUTTONS['Up'])
++        i.event(('pad_axis', 11, 5, 0)); self.assertEqual(horizon_hid.state(hz).buttons, hi.BUTTONS['Up'])
++
++    def test_a_scripted_press_lasts_its_duration(self):
++        os.environ['NX2LINUX_PRESS'] = 'A@10:0.5,Plus@20'
++        try:
++            hz, clock = Hz(), [0.0]
++            i = hi.Input(hz, now=lambda: clock[0])
++            for t, want in ((9.9, 0), (10.1, hi.BUTTONS['A']), (10.6, 0), (20.1, hi.BUTTONS['Plus']), (20.5, 0)):
++                clock[0] = t; i.poll()
++                self.assertEqual(horizon_hid.state(hz).buttons, want, t)
++        finally: del os.environ['NX2LINUX_PRESS']
++
++
++if __name__ == '__main__':
++    unittest.main()
