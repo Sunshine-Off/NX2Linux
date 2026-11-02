@@ -22,15 +22,17 @@
 typedef struct { uint32_t binding, stride, divisor, pad; const void *data; uint64_t size; } Nx2Stream;
 typedef struct { uint32_t location, binding, format, offset; } Nx2Attr;
 typedef struct { uint32_t enable, src_rgb, dst_rgb, op_rgb, src_a, dst_a, op_a, mask; } Nx2Blend;
-typedef struct { uint32_t binding, kind, pad0, pad1; const void *data; uint64_t size; } Nx2Buf;   /* kind 0: uniform, 1: storage */
+typedef struct { uint32_t binding, kind, pad0, pad1; const void *data; uint64_t size; uint64_t ring_offset; /* out: where the data sits in the ring until the next flush */ } Nx2Buf;   /* kind 0: uniform, 1: storage */
+typedef struct { uint32_t binding, image, view_type, level, base_layer, nlayers, pad0, pad1; } Nx2Img;   /* a storage image */
 typedef struct {
     uint32_t binding, image, min_filter, mag_filter, mip_mode, wrap_s, wrap_t, wrap_r, compare_enable, compare_op;
     float lod_min, lod_max, lod_bias, aniso;
-    uint32_t view_type /* VkImageViewType */, base_level, nlevels, base_layer, nlayers, border /* VkBorderColor */, alpha_one /* RGBX formats: alpha reads 1 */, pad;
+    uint32_t view_type /* VkImageViewType */, base_level, nlevels, base_layer, nlayers, border /* VkBorderColor */;
+    uint32_t swz[4];   /* VkComponentSwizzle of r, g, b, a (0 identity) */
 } Nx2Tex;
 typedef struct { uint32_t image, layer, level, pad; } Nx2Target;   /* layer: the array layer, cube face or 3D slice drawn into */
 typedef struct {
-    uint32_t vs, ps;
+    uint32_t vs, ps, tcs, tes, gs, patch_points;
     uint32_t ntargets; Nx2Target targets[MAX_TARGETS]; Nx2Target depth;
     uint32_t nattrs; Nx2Attr attrs[16];
     uint32_t nstreams; Nx2Stream streams[16];
@@ -45,11 +47,19 @@ typedef struct {
     float viewport[4], depth_range[2]; int32_t scissor[4];
     uint32_t nbufs; Nx2Buf bufs[32];
     uint32_t ntex; Nx2Tex tex[32];
+    uint32_t nimgs, pad7; Nx2Img imgs[8];
 } Nx2Draw;
+
+typedef struct {
+    uint32_t cs, groups[3];
+    uint32_t nbufs; Nx2Buf bufs[32];
+    uint32_t ntex; Nx2Tex tex[32];
+    uint32_t nimgs, pad; Nx2Img imgs[8];
+} Nx2Dispatch;
 
 typedef struct { uint64_t key; VkImageView v; } View;
 typedef struct {
-    VkImage image; VkDeviceMemory mem; uint32_t w, h, d, layers, levels; VkFormat format; VkImageAspectFlags aspect; int is3d, live;
+    VkImage image; VkDeviceMemory mem; uint32_t w, h, d, layers, levels; VkFormat format; VkImageAspectFlags aspect; int is3d, live, storage;
     View *views; uint32_t nviews, cviews;
 } Image;
 typedef struct { VkShaderModule mod; int live; } Shader;
@@ -71,6 +81,7 @@ static struct {
     PFN_vkCmdPushDescriptorSetKHR push;
     PFN_vkCmdBeginRendering begin_rendering; PFN_vkCmdEndRendering end_rendering;
     uint64_t draws, flushes, skipped;
+    uint64_t cpipe_key[256]; VkPipeline cpipe[256]; VkPipelineLayout cpipe_layout[256]; uint32_t ncpipes;
 } G = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 const char *nx2gpu_error(void) { return G.err; }
@@ -136,7 +147,9 @@ int nx2gpu_open(int prefer_software)
     VkPhysicalDeviceFeatures avail; vkGetPhysicalDeviceFeatures(G.phys, &avail);
     f2.features.samplerAnisotropy = avail.samplerAnisotropy; f2.features.shaderFloat64 = avail.shaderFloat64; f2.features.shaderInt64 = avail.shaderInt64;
     f2.features.fragmentStoresAndAtomics = avail.fragmentStoresAndAtomics; f2.features.vertexPipelineStoresAndAtomics = avail.vertexPipelineStoresAndAtomics;
-    f2.features.depthClamp = avail.depthClamp; f2.features.independentBlend = avail.independentBlend; f2.features.fillModeNonSolid = avail.fillModeNonSolid;
+    f2.features.depthClamp = avail.depthClamp; f2.features.independentBlend = avail.independentBlend; f2.features.fillModeNonSolid = avail.fillModeNonSolid; f2.features.geometryShader = avail.geometryShader; f2.features.tessellationShader = avail.tessellationShader;
+    f2.features.shaderStorageImageReadWithoutFormat = avail.shaderStorageImageReadWithoutFormat; f2.features.shaderStorageImageWriteWithoutFormat = avail.shaderStorageImageWriteWithoutFormat;
+    f2.features.shaderTessellationAndGeometryPointSize = avail.shaderTessellationAndGeometryPointSize; f2.features.largePoints = avail.largePoints; f2.features.multiViewport = avail.multiViewport;
     f2.features.shaderImageGatherExtended = avail.shaderImageGatherExtended; f2.features.shaderStorageImageExtendedFormats = avail.shaderStorageImageExtendedFormats;
     f2.features.textureCompressionBC = avail.textureCompressionBC; f2.features.shaderClipDistance = avail.shaderClipDistance; f2.features.shaderCullDistance = avail.shaderCullDistance;
     const char *exts[2] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME }; uint32_t next = 1;
@@ -247,6 +260,7 @@ uint32_t nx2gpu_image(uint32_t w, uint32_t h, uint32_t depth, uint32_t layers, u
     int depth_fmt = is_depth_format(im->format);
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (depth_fmt) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT; else if (!is_compressed(im->format)) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    { VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(G.phys, im->format, &fp); if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) { usage |= VK_IMAGE_USAGE_STORAGE_BIT; im->storage = 1; } }
     VkImageCreateFlags fl = 0;
     if (!kind && im->layers >= 6 && w == h) fl |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (kind) fl |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
@@ -275,8 +289,8 @@ out:
 }
 
 /* The view of an image the shader or the render pass asks for, made once. aspect: depth only for a depth-stencil image (shaders sample the depth) */
-/* mode: bit 0 the alpha channel reads 1, bit 1 a render attachment (a depth-stencil image then keeps its stencil aspect) */
-static VkImageView view_of(Image *im, VkImageViewType type, uint32_t level, uint32_t nlevels, uint32_t layer, uint32_t nlayers, int mode)
+/* mode: bit 1 a render attachment (a depth-stencil image then keeps its stencil aspect); swz: the component swizzle of the view or NULL */
+static VkImageView view_of(Image *im, VkImageViewType type, uint32_t level, uint32_t nlevels, uint32_t layer, uint32_t nlayers, int mode, const uint32_t *swz)
 {
     if (!nlevels || level + nlevels > im->levels) { if (level >= im->levels) level = 0; nlevels = im->levels - level; }
     if (im->is3d) { if (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_2D_ARRAY) { if (layer >= im->d) layer = 0; if (!nlayers || layer + nlayers > im->d) nlayers = im->d - layer; } else { layer = 0; nlayers = 1; } }
@@ -284,9 +298,11 @@ static VkImageView view_of(Image *im, VkImageViewType type, uint32_t level, uint
     if (type == VK_IMAGE_VIEW_TYPE_2D) nlayers = 1;
     if (type == VK_IMAGE_VIEW_TYPE_CUBE) nlayers = 6;
     uint64_t key = (uint64_t)type | (uint64_t)level << 8 | (uint64_t)nlevels << 16 | (uint64_t)layer << 24 | (uint64_t)nlayers << 44 | (uint64_t)(mode & 3) << 62;
+    uint64_t swzkey = swz ? (swz[0] & 15) | (swz[1] & 15) << 4 | (swz[2] & 15) << 8 | (swz[3] & 15) << 12 : 0;
+    key ^= swzkey * 0x9E3779B97F4A7C15ull;
     for (uint32_t i = 0; i < im->nviews; i++) if (im->views[i].key == key) return im->views[i].v;
     VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->image, .viewType = type, .format = im->format,
-                                 .components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, (mode & 1) ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_IDENTITY },
+                                 .components = { swz ? swz[0] : 0, swz ? swz[1] : 0, swz ? swz[2] : 0, swz ? swz[3] : 0 },
                                  .subresourceRange = { .aspectMask = (mode & 2) ? im->aspect : im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = level, .levelCount = nlevels, .baseArrayLayer = layer, .layerCount = nlayers } };
     VkImageView v;
     VkResult r = vkCreateImageView(G.dev, &vi, NULL, &v);
@@ -441,20 +457,78 @@ static VkSampler sampler_for(const Nx2Tex *t)
 }
 
 /* The descriptor set layout of a draw: one binding per buffer (uniform or storage) and per texture */
-static uint64_t layout_key(const Nx2Draw *d)
+static uint64_t layout_key(const Nx2Buf *bufs, uint32_t nb, const Nx2Tex *tex, uint32_t nt, const Nx2Img *imgs, uint32_t ni)
 {
     uint64_t h = 1469598103934665603ull;
-    for (uint32_t i = 0; i < d->nbufs; i++) { uint32_t v[2] = { d->bufs[i].binding, d->bufs[i].kind }; h = fnv(h, v, 8); }
-    for (uint32_t i = 0; i < d->ntex; i++) { uint32_t v = d->tex[i].binding | 0x80000000u; h = fnv(h, &v, 4); }
+    for (uint32_t i = 0; i < nb; i++) { uint32_t v[2] = { bufs[i].binding, bufs[i].kind }; h = fnv(h, v, 8); }
+    for (uint32_t i = 0; i < nt; i++) { uint32_t v = tex[i].binding | 0x80000000u; h = fnv(h, &v, 4); }
+    for (uint32_t i = 0; i < ni; i++) { uint32_t v = imgs[i].binding | 0x40000000u; h = fnv(h, &v, 4); }
     return h;
+}
+
+/* The push descriptor set layout and pipeline layout of a set of resources */
+static int make_layouts(const Nx2Buf *bufs, uint32_t nb, const Nx2Tex *tex, uint32_t nt, const Nx2Img *imgs, uint32_t ni, VkDescriptorSetLayout *sl, VkPipelineLayout *pl)
+{
+    VkDescriptorSetLayoutBinding lb[96]; uint32_t nlb = 0;
+    for (uint32_t i = 0; i < nb && nlb < 96; i++)
+        lb[nlb++] = (VkDescriptorSetLayoutBinding){ .binding = bufs[i].binding, .descriptorType = bufs[i].kind ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL };
+    for (uint32_t i = 0; i < nt && nlb < 96; i++)
+        lb[nlb++] = (VkDescriptorSetLayoutBinding){ .binding = tex[i].binding, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL };
+    for (uint32_t i = 0; i < ni && nlb < 96; i++)
+        lb[nlb++] = (VkDescriptorSetLayoutBinding){ .binding = imgs[i].binding, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL };
+    VkDescriptorSetLayoutCreateInfo sli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = nlb, .pBindings = lb };
+    if (vkCreateDescriptorSetLayout(G.dev, &sli, NULL, sl) != VK_SUCCESS) return -1;
+    VkPipelineLayoutCreateInfo pli = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = sl };
+    if (vkCreatePipelineLayout(G.dev, &pli, NULL, pl) != VK_SUCCESS) return -1;
+    return 0;
+}
+
+static uint64_t ring_alloc(uint64_t bytes, uint64_t align, uint8_t **ptr);
+
+/* The descriptor writes of a draw or dispatch: buffers copied into the ring (bufs[i].ring_offset says where), textures and storage images through their views. 0, or 1 when a resource is missing */
+static int fill_writes(Nx2Buf *bufs, uint32_t nb, const Nx2Tex *tex, uint32_t nt, const Nx2Img *imgs, uint32_t ni, VkDescriptorBufferInfo *bi, VkDescriptorImageInfo *ii, VkWriteDescriptorSet *wr, uint32_t *nw_out)
+{
+    uint32_t nw = 0;
+    for (uint32_t i = 0; i < nb; i++) {
+        uint8_t *p; uint64_t sz = bufs[i].size ? bufs[i].size : 16;
+        uint64_t o = ring_alloc(sz, G.ubo_align, &p);
+        if (o == UINT64_MAX) return 1;
+        memcpy(p, bufs[i].data, bufs[i].size);
+        bufs[i].ring_offset = o;
+        bi[i] = (VkDescriptorBufferInfo){ G.ring, o, sz };
+        wr[nw++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = bufs[i].binding, .descriptorCount = 1,
+                                           .descriptorType = bufs[i].kind ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[i] };
+    }
+    for (uint32_t i = 0; i < nt; i++) {
+        uint32_t id = tex[i].image;
+        if (id >= G.nimages || !G.images[id].live) return 1;
+        VkSampler s = sampler_for(&tex[i]);
+        if (!s) return -1;
+        VkImageView v = view_of(&G.images[id], (VkImageViewType)tex[i].view_type, tex[i].base_level, tex[i].nlevels, tex[i].base_layer, tex[i].nlayers, 0, tex[i].swz);
+        if (!v) return -1;
+        ii[i] = (VkDescriptorImageInfo){ s, v, VK_IMAGE_LAYOUT_GENERAL };
+        wr[nw++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = tex[i].binding, .descriptorCount = 1,
+                                           .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[i] };
+    }
+    for (uint32_t i = 0; i < ni; i++) {
+        uint32_t id = imgs[i].image;
+        if (id >= G.nimages || !G.images[id].live || !G.images[id].storage) return 1;
+        VkImageView v = view_of(&G.images[id], (VkImageViewType)imgs[i].view_type, imgs[i].level, 1, imgs[i].base_layer, imgs[i].nlayers, 0, NULL);
+        if (!v) return -1;
+        ii[nt + i] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL };
+        wr[nw++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = imgs[i].binding, .descriptorCount = 1,
+                                           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[nt + i] };
+    }
+    *nw_out = nw;
+    return 0;
 }
 
 static int has_stencil(VkFormat f) { return f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT; }
 
 static Pipe *pipeline_for(const Nx2Draw *d, VkFormat color_fmt[MAX_TARGETS], VkFormat depth_fmt, uint32_t topology, VkPipelineLayout *layout_out)
 {
-    uint64_t key = layout_key(d);
-    key = fnv(key, &d->vs, 8);   /* vs and ps */
+    uint64_t key = layout_key(d->bufs, d->nbufs, d->tex, d->ntex, d->imgs, d->nimgs);
+    key = fnv(key, &d->vs, 6 * 4);   /* the shaders and the patch size */
     key = fnv(key, color_fmt, sizeof(VkFormat) * d->ntargets); key = fnv(key, &depth_fmt, 4); key = fnv(key, &topology, 4);
     key = fnv(key, d->attrs, sizeof(Nx2Attr) * d->nattrs);
     for (uint32_t i = 0; i < d->nstreams; i++) { uint32_t v[3] = { d->streams[i].binding, d->streams[i].stride, d->streams[i].divisor }; key = fnv(key, v, 12); }
@@ -463,26 +537,21 @@ static Pipe *pipeline_for(const Nx2Draw *d, VkFormat color_fmt[MAX_TARGETS], VkF
     key = fnv(key, &d->stencil_test, 2 * 4); key = fnv(key, d->stencil_front, 8 * 4);
     for (uint32_t i = 0; i < G.npipes; i++) if (G.pipes[i].key == key) { *layout_out = G.pipes[i].layout; return &G.pipes[i]; }
 
-    VkDescriptorSetLayoutBinding lb[64]; uint32_t nlb = 0;
-    for (uint32_t i = 0; i < d->nbufs && nlb < 64; i++)
-        lb[nlb++] = (VkDescriptorSetLayoutBinding){ .binding = d->bufs[i].binding, .descriptorType = d->bufs[i].kind ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS };
-    for (uint32_t i = 0; i < d->ntex && nlb < 64; i++)
-        lb[nlb++] = (VkDescriptorSetLayoutBinding){ .binding = d->tex[i].binding, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS };
-    VkDescriptorSetLayoutCreateInfo sli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = nlb, .pBindings = lb };
     VkDescriptorSetLayout sl; VkPipelineLayout pl;
-    if (vkCreateDescriptorSetLayout(G.dev, &sli, NULL, &sl) != VK_SUCCESS) return NULL;
-    VkPipelineLayoutCreateInfo pli = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl };
-    if (vkCreatePipelineLayout(G.dev, &pli, NULL, &pl) != VK_SUCCESS) return NULL;
+    if (make_layouts(d->bufs, d->nbufs, d->tex, d->ntex, d->imgs, d->nimgs, &sl, &pl)) return NULL;
 
-    VkPipelineShaderStageCreateInfo st[2] = {
-        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = G.shaders[d->vs].mod, .pName = "main" },
-        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = d->ps ? G.shaders[d->ps].mod : VK_NULL_HANDLE, .pName = "main" } };
+    VkPipelineShaderStageCreateInfo st[5]; uint32_t nst = 0;
+    const struct { uint32_t id; VkShaderStageFlagBits stage; } stages[5] = { { d->vs, VK_SHADER_STAGE_VERTEX_BIT }, { d->tcs, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT },
+                                                                              { d->tes, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT }, { d->gs, VK_SHADER_STAGE_GEOMETRY_BIT }, { d->ps, VK_SHADER_STAGE_FRAGMENT_BIT } };
+    for (int i = 0; i < 5; i++)
+        if (stages[i].id) st[nst++] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = stages[i].stage, .module = G.shaders[stages[i].id].mod, .pName = "main" };
     VkVertexInputBindingDescription vb[16]; VkVertexInputAttributeDescription va[16];
     for (uint32_t i = 0; i < d->nstreams; i++) vb[i] = (VkVertexInputBindingDescription){ d->streams[i].binding, d->streams[i].stride, d->streams[i].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX };
     for (uint32_t i = 0; i < d->nattrs; i++) va[i] = (VkVertexInputAttributeDescription){ d->attrs[i].location, d->attrs[i].binding, (VkFormat)d->attrs[i].format, d->attrs[i].offset };
     VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .vertexBindingDescriptionCount = d->nstreams, .pVertexBindingDescriptions = vb,
                                                 .vertexAttributeDescriptionCount = d->nattrs, .pVertexAttributeDescriptions = va };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = (VkPrimitiveTopology)topology };
+    VkPipelineTessellationStateCreateInfo tess = { .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO, .patchControlPoints = d->patch_points ? d->patch_points : 3 };
     VkPipelineViewportDepthClipControlCreateInfoEXT ccs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, .negativeOneToOne = VK_TRUE };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = G.clip_control && d->depth_neg_one ? &ccs : NULL, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .depthClampEnable = d->depth_clamp, .polygonMode = (VkPolygonMode)d->polygon_mode,
@@ -501,7 +570,7 @@ static Pipe *pipeline_for(const Nx2Draw *d, VkFormat color_fmt[MAX_TARGETS], VkF
     VkPipelineDynamicStateCreateInfo dy = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 7, .pDynamicStates = dyn };
     VkPipelineRenderingCreateInfo ri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = d->ntargets, .pColorAttachmentFormats = color_fmt,
                                          .depthAttachmentFormat = depth_fmt, .stencilAttachmentFormat = has_stencil(depth_fmt) ? depth_fmt : VK_FORMAT_UNDEFINED };
-    VkGraphicsPipelineCreateInfo gi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = d->ps ? 2 : 1, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+    VkGraphicsPipelineCreateInfo gi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = nst, .pStages = st, .pTessellationState = d->tcs || d->tes ? &tess : NULL, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
                                         .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cbs, .pDynamicState = &dy, .layout = pl };
     VkPipeline pipe;
     VkResult r = vkCreateGraphicsPipelines(G.dev, VK_NULL_HANDLE, 1, &gi, NULL, &pipe);
@@ -529,6 +598,11 @@ static uint32_t topology_of(uint32_t prim)
     case 4: case QUADS: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     case 5: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
     case 6: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    case 10: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+    case 11: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+    case 12: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+    case 13: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+    case 14: return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
     default: return UINT32_MAX;
     }
 }
@@ -540,7 +614,7 @@ int nx2gpu_draw(const Nx2Draw *d)
     int r = -1;
     VkFormat color_fmt[MAX_TARGETS], depth_fmt = VK_FORMAT_UNDEFINED;
     uint32_t topo;
-    if (!G.open || !d->vs || d->vs >= G.nshaders || (d->ps && d->ps >= G.nshaders) || d->ntargets > MAX_TARGETS) goto out;
+    if (!G.open || !d->vs || d->vs >= G.nshaders || (d->ps && d->ps >= G.nshaders) || (d->tcs && d->tcs >= G.nshaders) || (d->tes && d->tes >= G.nshaders) || (d->gs && d->gs >= G.nshaders) || d->ntargets > MAX_TARGETS) goto out;
     if ((topo = topology_of(d->topology)) == UINT32_MAX) { G.skipped++; r = 1; goto out; }
     for (uint32_t i = 0; i < d->ntargets; i++) {
         if (d->targets[i].image >= G.nimages || !G.images[d->targets[i].image].live) { G.skipped++; r = 1; goto out; }
@@ -585,27 +659,8 @@ int nx2gpu_draw(const Nx2Draw *d)
             itype = VK_INDEX_TYPE_UINT32; index_count = out_n;
         } else { memcpy(p, d->index_data, (size_t)src_n * isz); itype = isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32; index_count = src_n; }
     }
-    VkDescriptorBufferInfo bi[32]; VkDescriptorImageInfo ii[32]; VkWriteDescriptorSet wr[64]; uint32_t nw = 0;
-    for (uint32_t i = 0; i < d->nbufs; i++) {
-        uint8_t *p; uint64_t sz = d->bufs[i].size ? d->bufs[i].size : 16;
-        uint64_t o = ring_alloc(sz, G.ubo_align, &p);
-        if (o == UINT64_MAX) { G.skipped++; r = 1; goto out; }
-        memcpy(p, d->bufs[i].data, d->bufs[i].size);
-        bi[i] = (VkDescriptorBufferInfo){ G.ring, o, sz };
-        wr[nw++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = d->bufs[i].binding, .descriptorCount = 1,
-                                           .descriptorType = d->bufs[i].kind ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[i] };
-    }
-    for (uint32_t i = 0; i < d->ntex; i++) {
-        uint32_t id = d->tex[i].image;
-        if (id >= G.nimages || !G.images[id].live) { G.skipped++; r = 1; goto out; }
-        VkSampler s = sampler_for(&d->tex[i]);
-        if (!s) goto out;
-        VkImageView v = view_of(&G.images[id], (VkImageViewType)d->tex[i].view_type, d->tex[i].base_level, d->tex[i].nlevels, d->tex[i].base_layer, d->tex[i].nlayers, d->tex[i].alpha_one);
-        if (!v) goto out;
-        ii[i] = (VkDescriptorImageInfo){ s, v, VK_IMAGE_LAYOUT_GENERAL };
-        wr[nw++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = d->tex[i].binding, .descriptorCount = 1,
-                                           .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[i] };
-    }
+    VkDescriptorBufferInfo bi[32]; VkDescriptorImageInfo ii[40]; VkWriteDescriptorSet wr[72]; uint32_t nw = 0;
+    { int fr = fill_writes((Nx2Buf *)d->bufs, d->nbufs, d->tex, d->ntex, d->imgs, d->nimgs, bi, ii, wr, &nw); if (fr) { if (fr > 0) { G.skipped++; r = 1; } goto out; } }
 
     VkPipelineLayout layout;
     Pipe *pipe = pipeline_for(d, color_fmt, depth_fmt, topo, &layout);
@@ -619,12 +674,12 @@ int nx2gpu_draw(const Nx2Draw *d)
         VkRenderingAttachmentInfo ca[MAX_TARGETS], da = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
         for (uint32_t i = 0; i < d->ntargets; i++) {
             Image *ti = &G.images[d->targets[i].image];
-            VkImageView v = view_of(ti, VK_IMAGE_VIEW_TYPE_2D, d->targets[i].level, 1, d->targets[i].layer, 1, 2);
+            VkImageView v = view_of(ti, VK_IMAGE_VIEW_TYPE_2D, d->targets[i].level, 1, d->targets[i].layer, 1, 2, NULL);
             if (!v) goto out;
             ca[i] = (VkRenderingAttachmentInfo){ .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v, .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE };
         }
         if (d->depth.image) {
-            VkImageView v = view_of(&G.images[d->depth.image], VK_IMAGE_VIEW_TYPE_2D, d->depth.level, 1, d->depth.layer, 1, 2);
+            VkImageView v = view_of(&G.images[d->depth.image], VK_IMAGE_VIEW_TYPE_2D, d->depth.level, 1, d->depth.layer, 1, 2, NULL);
             if (!v) goto out;
             da = (VkRenderingAttachmentInfo){ .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v, .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE };
         }
@@ -655,6 +710,56 @@ int nx2gpu_draw(const Nx2Draw *d)
     } else {
         vkCmdDraw(G.cb, count, inst, (uint32_t)d->first, (uint32_t)d->base_instance);
     }
+    G.draws++;
+    r = 0;
+out:
+    pthread_mutex_unlock(&G.mu);
+    return r;
+}
+
+/* The bytes of the ring at an offset, after a flush: what a shader wrote to the storage buffers of the last draw or dispatch (the host writes them back to the game's memory) */
+int nx2gpu_ring_read(uint64_t offset, void *out, uint64_t bytes)
+{
+    pthread_mutex_lock(&G.mu);
+    int r = -1;
+    if (G.open && !G.recording && offset + bytes <= RING_BYTES) { memcpy(out, G.ring_ptr + offset, bytes); r = 0; }
+    pthread_mutex_unlock(&G.mu);
+    return r;
+}
+
+/* A compute dispatch. 0: recorded, 1: skipped, -1: error */
+int nx2gpu_dispatch(Nx2Dispatch *d)
+{
+    pthread_mutex_lock(&G.mu);
+    int r = -1;
+    if (!G.open || !d->cs || d->cs >= G.nshaders || begin()) goto out;
+    {
+        uint64_t need = 4096;
+        for (uint32_t i = 0; i < d->nbufs; i++) need += d->bufs[i].size + G.ubo_align;
+        if (need > RING_BYTES) { G.skipped++; r = 1; goto out; }
+        if (G.ring_off + need > RING_BYTES && (flush_locked() || begin())) goto out;
+    }
+    VkDescriptorBufferInfo bi[32]; VkDescriptorImageInfo ii[40]; VkWriteDescriptorSet wr[72]; uint32_t nw = 0;
+    { int fr = fill_writes(d->bufs, d->nbufs, d->tex, d->ntex, d->imgs, d->nimgs, bi, ii, wr, &nw); if (fr) { if (fr > 0) { G.skipped++; r = 1; } goto out; } }
+    uint64_t key = fnv(layout_key(d->bufs, d->nbufs, d->tex, d->ntex, d->imgs, d->nimgs), &d->cs, 4);
+    VkPipeline pipe = VK_NULL_HANDLE; VkPipelineLayout layout = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < G.ncpipes; i++) if (G.cpipe_key[i] == key) { pipe = G.cpipe[i]; layout = G.cpipe_layout[i]; }
+    if (!pipe) {
+        VkDescriptorSetLayout sl;
+        if (G.ncpipes >= 256 || make_layouts(d->bufs, d->nbufs, d->tex, d->ntex, d->imgs, d->nimgs, &sl, &layout)) goto out;
+        VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = layout,
+                                           .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = G.shaders[d->cs].mod, .pName = "main" } };
+        VkResult vr = vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipe);
+        if (vr != VK_SUCCESS) { fail("vkCreateComputePipelines", vr); goto out; }
+        G.cpipe_key[G.ncpipes] = key; G.cpipe[G.ncpipes] = pipe; G.cpipe_layout[G.ncpipes] = layout; G.ncpipes++;
+    }
+    end_rendering();
+    barrier_all();
+    vkCmdBindPipeline(G.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    for (uint32_t i = 0; i < nw; i++) wr[i].dstSet = VK_NULL_HANDLE;
+    if (nw) G.push(G.cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, nw, wr);
+    vkCmdDispatch(G.cb, d->groups[0], d->groups[1], d->groups[2]);
+    barrier_all();
     G.draws++;
     r = 0;
 out:
