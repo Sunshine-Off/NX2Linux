@@ -58,3 +58,5 @@
 0077-horizon-on-linux-threads-and-synchronisation.patch
 0078-jump-tables-through-x16-x17-thread-pointers-of-a.patch
 0079-horizon-on-linux-fibers-nn-hid-per-title-profile.patch
+0080-aot-an-svc-no-longer-leaks-into-the-next-dc-ic-p.patch
+0081-horizon-on-linux-silent-nn-audio-nn-time-nested.patch

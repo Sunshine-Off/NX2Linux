@@ -4,9 +4,9 @@ Branche `swann/jalon-s7bis-xc2`, issue de `swann/jalon-s7-first-game`. Même obj
 
 ## État (honnête)
 
-**XC2 n'affiche pas encore d'image.** Il exécute le démarrage complet du SDK, `nnMain`, et ~12 s de code d'initialisation de son propre moteur (30 threads invités, des fibres, la configuration NVN) jusqu'à `fw::SoundManager::initialize`, qui échoue parce que **le serveur audio `nn::audio` n'existe pas sur l'hôte**. Aucun `QueuePresentTexture` n'est donc atteint, et la fenêtre Vulkan n'a jamais reçu une trame du jeu.
+**Premier affichage atteint, mais noir.** XC2 démarre complètement : SDK, `nnMain`, 36 threads invités, fibres, son silencieux, configuration NVN. Il soumet ses tampons de commandes et présente des trames : **275 trames en 120 s** sur la fenêtre Vulkan (ouverte sur la RTX 4060, ou lavapipe sans GPU), avec 92 643 dessins et 7 225 effacements reçus. Les trames sont **toutes noires** : les seuls effacements qui visent les textures de la fenêtre sont noirs, et les dessins sont comptés, pas exécutés (pas de shaders). `NX2LINUX_DUMP_FRAME=<dossier>` écrit un PNG toutes les 30 trames.
 
-Ce qui est prouvé séparément, sans le jeu : un tampon RGBA arrive à l'écran par `libnx2linux_display.so` (SDL + Vulkan, 3 tests sur lavapipe), et le périphérique NVN en Python reproduit « effacer un rendu cible, soumettre, présenter » jusqu'à cette même fenêtre (test `NvnDevice.test_a_cleared_window_texture_is_what_is_presented`).
+Cadence : environ 2 trames par seconde. Le compteur de lectures/écritures invitées était un atomique partagé par tous les threads (un thread de 36 se battait pour une ligne de cache) : passé en compteurs par thread, 12 fois plus de dessins par minute ; le reste est le coût du code recompilé (chaque accès passe par `guest()`), à optimiser.
 
 ## Le chemin jusqu'ici
 
@@ -17,7 +17,8 @@ Ce qui est prouvé séparément, sans le jeu : un tampon RGBA arrive à l'écran
 | Remplacement de fonctions du SDK (`HLE_FORCE` du moteur Mach, en Python) | `fs`, `account`, `oe`, `vi`, `nv`, `hid` portés ; 259 entrées triviales générées ; 388 entrées à logique des fichiers de services répondent 0 et sont comptées |
 | Fibres (`nn::os::Fiber`) | un thread hôte par fibre, `horizon_fiber.py` |
 | NVN | périphérique Python (Tegra X1, pools, tailles de textures, files, tampons de commandes rejoués, fenêtre) ; **les dessins et les shaders ne sont pas rendus** |
-| Son | **bloque** : le jeu utilise tout le graphe de mixage `nn::audio` |
+| Son | serveur silencieux (`horizon_audio.py`) : voix, pools, effets, `AudioOut`, événement du renderer qui bat toutes les 5 ms ; pas de son produit |
+| Temps | `horizon_time.py` (horloges de l'hôte) |
 
 Remill : patchs 0006 (EXT, CRC32), 0007 (registres de compteur), 0008 (`DC`/`IC`, `FADDP`). Moteur : patchs 0072 à 0079.
 
@@ -25,12 +26,12 @@ Remill : patchs 0006 (EXT, CRC32), 0007 (registres de compteur), 0008 (`DC`/`IC`
 
 relocations alignées sur 4 octets · `mrs cntpct_el0` · mot de piège `0xe7ffdefe` · wrappers `svc` exportés · `aot_peek` qui effaçait le tampon de saut · le tampon IPC est au début du TLR · `DT_INIT` suffit (pas `init_array` en plus) · `br x16` des `switch` LLVM · `DC`/`IC` (SYS est un appel hyperviseur asynchrone pour le décodeur) · les fibres changent de pile par `ret`, impossible en code recompilé.
 
-## Ce qui manque pour afficher (dans l'ordre)
+## Ce qui manque pour une vraie image (dans l'ordre)
 
-1. **Serveur `nn::audio` silencieux.** Le jeu appelle `GetAudioRendererWorkBufferSize`, `OpenAudioRenderer`, `AcquireMemoryPool`, `AcquireVoiceSlot`, `AddDeviceSink`, effets (retard, réverbération I3DL2), `RequestUpdateAudioRenderer`, plus `AudioOut`. Le moteur Mach exécute le serveur du SDK en local avec un rendu CPU (`hle_audren.c`). Le côté client du SDK tourne tel quel ; il faut répondre au bloc de mise à jour (en-tête, états des pools et des voix, tampons d'onde consommés) et fournir l'événement système du renderer. Un contournement par titre (`horizon_profile_xc2.py`, qui saute `ssd::SoundCore::Init`) a été essayé : le gestionnaire de son plante ensuite, donc il ne suffit pas.
-2. **Ce que le jeu demandera après le son** : d'autres gestionnaires du `Framework::initializeManager`, `hid` complet (manettes, entrées SDL → `NpadState`), `time`, `pctl`, sauvegardes.
-3. **Rendu réel.** Les commandes de dessin sont comptées, pas exécutées. Une scène demande de traduire les shaders Maxwell/DKSH en SPIR-V (la chaîne `dmsh` du moteur Mach cible Metal), de gérer les textures bloc-linéaires, les états et les passes. C'est le plus gros travail de S4/S7.
-4. Les 27 fonctions cryptographiques : sémantique AES/SHA/PMULL dans Remill, ou le JIT dynarmic (sa configuration a été refusée par le classificateur de permissions de la session).
+1. **Exécuter les dessins.** Traduire les shaders Maxwell/DKSH en SPIR-V (la chaîne `dmsh` du moteur Mach cible Metal), puis rejouer états, tampons, textures bloc-linéaires (déswizzle), cibles de rendu et passes sur Vulkan. C'est le gros morceau de S4/S7.
+2. **Vitesse.** Environ 2 trames/s : optimiser les accès mémoire invités (table de pages au lieu d'une recherche de région) et le coût des appels de service Python.
+3. **Entrées** SDL → `NpadState`, sauvegardes, `pctl`, tactile.
+4. **JIT dynarmic** pour les 27 fonctions cryptographiques restantes (AES, SHA, PMULL), ou leur sémantique dans Remill.
 5. Comparer les entrées exécutées à Unicorn (`module_validate.py`) : le module XC2 n'a pas été validé.
 
 ## Reproduire

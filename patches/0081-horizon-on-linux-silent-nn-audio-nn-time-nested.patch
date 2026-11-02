@@ -1,0 +1,648 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 17:09:36 +0100
+Subject: [PATCH] Horizon on Linux: silent nn::audio, nn::time, nested guest
+ calls, NVN submit bookkeeping, frame dump, hang reports
+
+nn::audio client API replaced by host bookkeeping (voices consume wave buffers at the sample rate, pools attach at once, the renderer event ticks every sampleCount/sampleRate, audio-out buffers release after their duration); nn::time over the host clocks; Horizon.call_guest runs guest code from a service handler (the SDK's own CreateSystemEvent); nvnCommandBufferGetCommandMemoryUsed so the game submits what it recorded; NX2LINUX_DUMP_FRAME writes PNGs of presented frames; the runner reports where every guest thread waits and the clear colours. Found booting Xenoblade Chronicles 2.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: S7bis: silent audio, time, first frames presented by Xenoblade Chronicles 2, and AOT runtime fixes found doing it; tests use synthetic code and fake guest memory, no game data
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/horizon_audio.py               | 254 ++++++++++++++++++++++++
+ dm/tools/horizon_hle.py                 |  44 +++-
+ dm/tools/horizon_nvn.py                 |  37 +++-
+ dm/tools/horizon_overrides.py           |   2 +-
+ dm/tools/horizon_profile_xc2.py         |   4 -
+ dm/tools/horizon_run.py                 |  16 +-
+ dm/tools/horizon_time.py                |  70 +++++++
+ dm/tools/tests/test_horizon_services.py |  41 ++++
+ 8 files changed, 452 insertions(+), 16 deletions(-)
+ create mode 100644 dm/tools/horizon_audio.py
+ create mode 100644 dm/tools/horizon_time.py
+
+diff --git a/dm/tools/horizon_audio.py b/dm/tools/horizon_audio.py
+new file mode 100644
+index 0000000..3102fcd
+--- /dev/null
++++ b/dm/tools/horizon_audio.py
+@@ -0,0 +1,254 @@
++"""nn::audio on the Linux host, silent (NX2Linux S7bis): the audio renderer and the audio output as the game's client API sees them, with nothing behind them but bookkeeping. The Mach host runs the SDK's own
++renderer server on the CPU (hle_audren.c); here every call that would reach the audio services is replaced, the objects are tracked by the guest address of their opaque struct, and time passes as it would:
++the renderer's system event is signalled every `sampleCount / sampleRate` seconds (the game's audio thread waits on it), a started voice consumes its wave buffers at the sample rate and releases them, memory pools
++attach at once, an audio-out buffer is released after the time its samples would take. No sound is produced. Layouts used: AudioRendererParameter {u32 sampleRate; u32 sampleCount}, WaveBuffer {ptr; size;
++s32 startSampleOffset; s32 endSampleOffset; bool loop}, AudioOutBuffer {ptr; capacity; size} (the SDK keeps nothing else in the first 24 bytes)."""
++import os, struct, threading, time
++
++from horizon_overrides import hle
++
++RATE = 48000
++POOL_DETACHED, POOL_ATTACHED = 3, 5   # MemoryPoolType::State: Invalid, New, RequestDetach, Detached, RequestAttach, Attached, Released
++PLAY_START = 0
++M32 = 0xFFFFFFFF
++
++
++class Voice:
++    def __init__(self, rate): self.rate, self.playing, self.waves, self.released, self.consumed, self.played = rate, False, [], [], 0, 0
++
++
++class Audio:
++    def __init__(self, hz):
++        self.hz, self.lock = hz, threading.Lock()
++        self.voices, self.pools, self.delays, self.outs = {}, {}, {}, {}
++        self.event_wh, self.ticker, self.tick_samples, self.rate, self.running = 0, None, 240, RATE, False
++
++    def start_ticker(self):
++        if self.ticker: return
++        self.running = True
++        self.ticker = threading.Thread(target=self.run, name='audren-tick', daemon=True); self.ticker.start()
++
++    def run(self):
++        hz, period = self.hz, self.tick_samples / self.rate
++        nxt = time.monotonic()
++        while self.running:
++            nxt += period
++            self.tick()
++            delay = nxt - time.monotonic()
++            if delay > 0: time.sleep(delay)
++            else: nxt = time.monotonic()
++
++    def tick(self):
++        with self.lock:
++            for v in self.voices.values():
++                if not v.playing or not v.waves: continue
++                v.consumed += self.tick_samples; v.played += self.tick_samples
++                while v.waves and v.waves[0][1] is not None and v.consumed >= v.waves[0][1]:
++                    wb, dur = v.waves.pop(0); v.consumed -= dur; v.released.append(wb)
++        ev = self.hz.handles.get(self.event_wh)
++        if ev is not None:
++            with self.hz.cv: ev.signaled = True; self.hz.cv.notify_all()
++
++
++def state(hz):
++    if not hasattr(hz, 'audio'): hz.audio = Audio(hz)
++    return hz.audio
++
++
++def ret(r, v=0): r[0] = v & 0xFFFFFFFFFFFFFFFF
++
++
++def reg(symbol, why):
++    """Register an nn::audio replacement; NX2LINUX_AUDIO_LOG=1 logs each call with its arguments and its result"""
++    deco = hle(symbol, 'silent nn::audio: ' + why)
++    def wrap(fn):
++        def traced(hz, r):
++            args = [hex(x) for x in r[:4]]
++            fn(hz, r)
++            if os.environ.get('NX2LINUX_AUDIO_LOG'): hz.log(f'[audio] {symbol.split("audio")[-1][:50]}({", ".join(args)}) -> {r[0]:#x}')
++        deco(traced)
++        return fn
++    return wrap
++
++
++# ---- sizes the game allocates before it opens the renderer ----
++reg('_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererParameterE', 'no server work buffer is needed; small enough for the 1 MiB pools the game carves it from')(lambda hz, r: ret(r, 0x60000))
++reg('_ZN2nn5audio36GetAudioRendererConfigWorkBufferSizeERKNS0_22AudioRendererParameterE', 'the config is bookkeeping on the host; a generous size')(lambda hz, r: ret(r, 0x30000))
++reg('_ZN2nn5audio29IsValidAudioRendererParameterERKNS0_22AudioRendererParameterE', 'every parameter is accepted')(lambda hz, r: ret(r, 1))
++reg('_ZN2nn5audio29InitializeAudioRendererConfigEPNS0_19AudioRendererConfigERKNS0_22AudioRendererParameterEPvm', 'the config is tracked by the host')(lambda hz, r: ret(r))
++reg('_ZN2nn5audio29GetRequiredBufferSizeForDelayENS_8TimeSpanEii', 'delay line size: the time, in samples of 4 bytes per channel, with room to spare')(
++    lambda hz, r: ret(r, ((r[0] * (r[1] & M32) // 10**9 * (r[2] & M32) * 4 * 2 + 0x2000) + 0x3F) & ~0x3F))
++reg('_ZN2nn5audio35GetRequiredBufferSizeForI3dl2ReverbEii', 'reverb state size: a generous constant')(lambda hz, r: ret(r, 0x40000))
++
++
++# ---- the renderer ----
++@reg('_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm', 'the renderer is a token; its system event ticks every sampleCount / sampleRate seconds')
++def open_renderer(hz, r):
++    a = state(hz); handle, ev, param = r[0], r[1], r[2]
++    a.rate, a.tick_samples = (hz.rd32(param) or RATE), (hz.rd32(param + 4) or 240)
++    hz.wr(handle, struct.pack('<QQ', 0xA0D10000, 0))
++    if ev:   # the SDK's own CreateSystemEvent (auto clear, inter-process) makes the kernel event; the host signals its writable end
++        hz.call_guest('_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb', {'x0': ev, 'x1': 1, 'x2': 1})
++        a.event_wh = hz.call_guest('_ZN2nn2os30GetWritableHandleOfSystemEventEPKNS0_15SystemEventTypeE', {'x0': ev}) & M32
++    a.start_ticker(); ret(r)
++
++
++reg('_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE', 'nothing to start')(lambda hz, r: ret(r))
++reg('_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE', 'nothing to stop')(lambda hz, r: ret(r))
++reg('_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE', 'the update is accepted; voices and pools are advanced by the host')(lambda hz, r: ret(r))
++
++
++@reg('_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE', 'stops the host tick')
++def close_renderer(hz, r): state(hz).running = False; state(hz).ticker = None
++
++
++# ---- mixing graph: accepted, nothing is mixed ----
++reg('_ZN2nn5audio15AcquireFinalMixEPNS0_19AudioRendererConfigEPNS0_12FinalMixTypeEi', 'bool: acquired')(lambda hz, r: ret(r, 1))
++for _s in ('_ZN2nn5audio13AddDeviceSinkEPNS0_19AudioRendererConfigEPNS0_14DeviceSinkTypeEPNS0_12FinalMixTypeEPKaiPKc',
++           '_ZN2nn5audio14AddBufferMixerEPNS0_19AudioRendererConfigEPNS0_15BufferMixerTypeEPNS0_12FinalMixTypeE',
++           ):
++    reg(_s, 'Result: success')(lambda hz, r: ret(r))
++
++
++@reg('_ZN2nn5audio8AddDelayEPNS0_19AudioRendererConfigEPNS0_9DelayTypeEPvmPNS0_12FinalMixTypeENS_8TimeSpanEi', 'remembers the delay line the game gave, RemoveDelay hands it back')
++def add_delay(hz, r): state(hz).delays[r[1]] = r[2]; ret(r)
++
++
++@reg('_ZN2nn5audio14AddI3dl2ReverbEPNS0_19AudioRendererConfigEPNS0_15I3dl2ReverbTypeEPvmPNS0_12FinalMixTypeEi', 'remembers the reverb buffer the game gave, RemoveI3dl2Reverb hands it back')
++def add_reverb(hz, r): state(hz).delays[r[1]] = r[2]; ret(r)
++
++
++reg('_ZN2nn5audio11RemoveDelayEPNS0_19AudioRendererConfigEPNS0_9DelayTypeEPNS0_12FinalMixTypeE', 'returns the buffer given to AddDelay')(lambda hz, r: ret(r, state(hz).delays.pop(r[1], 0)))
++reg('_ZN2nn5audio17RemoveI3dl2ReverbEPNS0_19AudioRendererConfigEPNS0_15I3dl2ReverbTypeEPNS0_12FinalMixTypeE', 'returns the buffer given to AddI3dl2Reverb')(lambda hz, r: ret(r, state(hz).delays.pop(r[1], 0)))
++reg('_ZN2nn5audio17RemoveBufferMixerEPNS0_19AudioRendererConfigEPNS0_15BufferMixerTypeEPNS0_12FinalMixTypeE', 'nothing to remove')(lambda hz, r: ret(r))
++for _s in ('_ZN2nn5audio16IsDelayRemovableEPKNS0_9DelayTypeE', '_ZN2nn5audio22IsBufferMixerRemovableEPKNS0_15BufferMixerTypeE', '_ZN2nn5audio22IsI3dl2ReverbRemovableEPKNS0_15I3dl2ReverbTypeE'):
++    reg(_s, 'always removable')(lambda hz, r: ret(r, 1))
++_SETTERS = ('SetDelayTimeEPNS0_9DelayTypeENS_8TimeSpanE', 'SetDelayInGainEPNS0_9DelayTypeEf', 'SetDelayDryGainEPNS0_9DelayTypeEf', 'SetDelayEnabledEPNS0_9DelayTypeEb', 'SetDelayFeedbackGainEPNS0_9DelayTypeEf',
++           'SetDelayChannelSpreadEPNS0_9DelayTypeEf', 'SetDelayLowPassAmountEPNS0_9DelayTypeEf', 'SetDelayInputOutputEPNS0_9DelayTypeEPKaS4_i', 'SetBufferMixerVolumeEPNS0_15BufferMixerTypeEif',
++           'SetBufferMixerEnabledEPNS0_15BufferMixerTypeEb', 'SetBufferMixerInputOutputEPNS0_15BufferMixerTypeEPKaS4_i', 'SetI3dl2ReverbDryGainEPNS0_15I3dl2ReverbTypeEf', 'SetI3dl2ReverbEnabledEPNS0_15I3dl2ReverbTypeEb',
++           'SetI3dl2ReverbRoomGainEPNS0_15I3dl2ReverbTypeEf', 'SetI3dl2ReverbReverbGainEPNS0_15I3dl2ReverbTypeEf', 'SetI3dl2ReverbRoomHfGainEPNS0_15I3dl2ReverbTypeEf', 'SetI3dl2ReverbHfReferenceEPNS0_15I3dl2ReverbTypeEf',
++           'SetI3dl2ReverbInputOutputEPNS0_15I3dl2ReverbTypeEPKaS4_i', 'SetI3dl2ReverbReflectionsGainEPNS0_15I3dl2ReverbTypeEf', 'SetI3dl2ReverbLateReverbDensityEPNS0_15I3dl2ReverbTypeEf',
++           'SetI3dl2ReverbLateReverbDecayTimeEPNS0_15I3dl2ReverbTypeENS_8TimeSpanE', 'SetI3dl2ReverbLateReverbDelayTimeEPNS0_15I3dl2ReverbTypeENS_8TimeSpanE', 'SetI3dl2ReverbLateReverbDiffusionEPNS0_15I3dl2ReverbTypeEf',
++           'SetI3dl2ReverbReflectionDelayTimeEPNS0_15I3dl2ReverbTypeENS_8TimeSpanE', 'SetI3dl2ReverbLateReverbHfDecayRatioEPNS0_15I3dl2ReverbTypeEf', 'SetVoicePitchEPNS0_9VoiceTypeEf',
++           'SetVoiceMixVolumeEPNS0_9VoiceTypeEPNS0_12FinalMixTypeEfii', 'SetVoiceDestinationEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEPNS0_12FinalMixTypeE')
++for _s in _SETTERS:
++    _name, _rest = _s.split('EPNS0_', 1)   # the name ends where the first parameter type (a pointer to an nn::audio type) begins
++    reg(f'_ZN2nn5audio{len(_name)}{_name}EPNS0_' + _rest, 'an effect or voice setting: nothing is mixed')(lambda hz, r: ret(r))
++
++
++# ---- memory pools ----
++@reg('_ZN2nn5audio17AcquireMemoryPoolEPNS0_19AudioRendererConfigEPNS0_14MemoryPoolTypeEPvm', 'bool: acquired, detached until attached')
++def acquire_pool(hz, r): state(hz).pools[r[1]] = POOL_DETACHED; ret(r, 1)
++
++
++@reg('_ZN2nn5audio17ReleaseMemoryPoolEPNS0_19AudioRendererConfigEPNS0_14MemoryPoolTypeE', 'bool: released')
++def release_pool(hz, r): state(hz).pools.pop(r[1], None); ret(r, 1)
++
++
++@reg('_ZN2nn5audio23RequestAttachMemoryPoolEPNS0_14MemoryPoolTypeE', 'attached at once')
++def attach_pool(hz, r): state(hz).pools[r[0]] = POOL_ATTACHED; ret(r, 1)
++
++
++@reg('_ZN2nn5audio23RequestDetachMemoryPoolEPNS0_14MemoryPoolTypeE', 'detached at once')
++def detach_pool(hz, r): state(hz).pools[r[0]] = POOL_DETACHED; ret(r, 1)
++
++
++reg('_ZN2nn5audio18GetMemoryPoolStateEPKNS0_14MemoryPoolTypeE', 'the state the requests left')(lambda hz, r: ret(r, state(hz).pools.get(r[0], POOL_DETACHED)))
++
++
++# ---- voices ----
++@reg('_ZN2nn5audio16AcquireVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEiiNS0_12SampleFormatEiPKvm', 'bool: acquired')
++def acquire_voice(hz, r):
++    a = state(hz)
++    with a.lock: a.voices[r[1]] = Voice(r[2] & M32 or RATE)
++    ret(r, 1)
++
++
++@reg('_ZN2nn5audio16ReleaseVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeE', 'the voice is forgotten')
++def release_voice(hz, r):
++    a = state(hz)
++    with a.lock: a.voices.pop(r[1], None)
++
++
++reg('_ZN2nn5audio12IsVoiceValidEPKNS0_9VoiceTypeE', 'valid while acquired')(lambda hz, r: ret(r, int(r[0] in state(hz).voices)))
++
++
++@reg('_ZN2nn5audio17SetVoicePlayStateEPNS0_9VoiceTypeENS1_9PlayStateE', 'start plays, anything else stops consuming')
++def set_play_state(hz, r):
++    v = state(hz).voices.get(r[0])
++    if v: v.playing = (r[1] & M32) == PLAY_START
++
++
++@reg('_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE', 'queued; released when the voice has played its samples')
++def append_wave(hz, r):
++    a = state(hz); v = a.voices.get(r[0])
++    if v is None: ret(r, 0); return
++    start, end = struct.unpack('<ii', hz.rd(r[1] + 0x10, 8)); loop = hz.rd(r[1] + 0x18, 1)[0]
++    dur = None if loop else max(1, end - start)   # a looping buffer is never released
++    with a.lock: v.waves.append((r[1], dur))
++    ret(r, 1)
++
++
++@reg('_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE', 'the oldest buffer the voice finished, or null')
++def released_wave(hz, r):
++    a = state(hz); v = a.voices.get(r[0])
++    with a.lock: ret(r, v.released.pop(0) if v and v.released else 0)
++
++
++reg('_ZN2nn5audio18GetWaveBufferCountEPKNS0_9VoiceTypeE', 'buffers queued or playing')(lambda hz, r: ret(r, len(state(hz).voices[r[0]].waves) if r[0] in state(hz).voices else 0))
++reg('_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE', 'samples consumed while playing')(lambda hz, r: ret(r, state(hz).voices[r[0]].played if r[0] in state(hz).voices else 0))
++
++
++# ---- the audio output: a buffer is released after the time its samples take ----
++class Out:
++    def __init__(self): self.queue, self.free_at, self.started = [], 0.0, False
++
++
++def out_of(hz, addr):
++    a = state(hz)
++    if addr not in a.outs: a.outs[addr] = Out()
++    return a.outs[addr]
++
++
++reg('_ZN2nn5audio27InitializeAudioOutParameterEPNS0_17AudioOutParameterE', 'defaults: zeros')(lambda hz, r: hz.wr(r[0], bytes(8)))
++
++
++@reg('_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutERKNS0_17AudioOutParameterE', 'a token; 48 kHz stereo PCM16')
++def open_out(hz, r): out_of(hz, r[0]); hz.wr(r[0], struct.pack('<Q', 0xA0D20000)); ret(r)
++
++
++reg('_ZN2nn5audio21GetAudioOutSampleRateEPKNS0_8AudioOutE', '48 kHz')(lambda hz, r: ret(r, RATE))
++reg('_ZN2nn5audio23GetAudioOutChannelCountEPKNS0_8AudioOutE', 'stereo')(lambda hz, r: ret(r, 2))
++reg('_ZN2nn5audio23GetAudioOutSampleFormatEPKNS0_8AudioOutE', 'PCM16')(lambda hz, r: ret(r, 2))
++reg('_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE', 'plays (silently)')(lambda hz, r: (setattr(out_of(hz, r[0]), 'started', True), ret(r)))
++reg('_ZN2nn5audio12StopAudioOutEPNS0_8AudioOutE', 'stops')(lambda hz, r: setattr(out_of(hz, r[0]), 'started', False))
++reg('_ZN2nn5audio13CloseAudioOutEPNS0_8AudioOutE', 'closes')(lambda hz, r: state(hz).outs.pop(r[0], None))
++
++
++@reg('_ZN2nn5audio21SetAudioOutBufferInfoEPNS0_14AudioOutBufferEPvmm', 'pointer, capacity and size in the first 24 bytes of the struct')
++def set_out_buf(hz, r): hz.wr(r[0], struct.pack('<QQQ', r[1], r[2], r[3]))
++
++
++reg('_ZN2nn5audio28GetAudioOutBufferDataPointerEPKNS0_14AudioOutBufferE', 'pointer')(lambda hz, r: ret(r, hz.rd64(r[0])))
++reg('_ZN2nn5audio25GetAudioOutBufferDataSizeEPKNS0_14AudioOutBufferE', 'size')(lambda hz, r: ret(r, hz.rd64(r[0] + 16)))
++
++
++@reg('_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE', 'queued; playing takes the time of its samples (4 bytes a frame)')
++def append_out(hz, r):
++    o = out_of(hz, r[0]); size = hz.rd64(r[1] + 16)
++    now = time.monotonic(); o.free_at = max(o.free_at, now) + size / 4 / RATE
++    o.queue.append((r[1], o.free_at)); ret(r, 1)
++
++
++@reg('_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE', 'the oldest buffer whose time has passed, or null')
++def released_out(hz, r):
++    o = out_of(hz, r[0])
++    if o.queue and o.queue[0][1] <= time.monotonic(): ret(r, o.queue.pop(0)[0])
++    else: ret(r, 0)
++
++
++# ---- device names ----
++@reg('_ZN2nn5audio19ListAudioDeviceNameEPNS0_15AudioDeviceNameEi', 'one built-in speaker')
++def list_devices(hz, r):
++    if (r[1] & M32) <= 0 or not r[0]: ret(r, 0); return
++    hz.wr(r[0], b'AudioBuiltInSpeakerOutput'.ljust(0x80, b'\0')); ret(r, 1)
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index 55fc2cf..8d076d9 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -117,6 +117,9 @@ class Horizon:
+         self.display_factory = None   # () -> horizon_display.Display, called when the game first presents a frame
+         self.thread_faults = []
+         self.stub_calls = {}
++        self.thread_state = {}
++        import collections
++        self.ring = collections.deque(maxlen=200000) if os.environ.get('NX2LINUX_SVC_RING') else None   # the last synchronisation svcs, for a hang report
+         self.main_thread_obj = KThread(self, 0, 0, 0, 44, ms.TLS)
+         self.main_thread_obj.tid = 1
+         self._init_kernel()
+@@ -130,6 +133,25 @@ class Horizon:
+         self.fs = horizon_fs.FileSystem(self, romfs, title_id)
+ 
+     # ---- plumbing ----
++    def thread_report(self):
++        now = time.monotonic(); out = []
++        for tid, (name, orig, fp, lr, at) in sorted(self.thread_state.items()):
++            regs = [0] * 31; regs[29], regs[30] = fp, lr
++            try: chain = self.where(regs, 14 if tid in (1, 3, 4) else 5)
++            except Exception: chain = '?'
++            out.append(f'  thread {tid}: {name} {now - at:.1f} s ago: {chain}')
++        return '\n'.join(out)
++
++    def ring_report(self, tid, last=40):
++        """The last synchronisation svcs on the mutex and key that thread `tid` is blocked on"""
++        if self.ring is None: return ''
++        mine = [e for e in self.ring if e[1] == tid and e[2] == 'WaitProcessWideKeyAtomic']
++        if not mine: return ''
++        mutex, key = mine[-1][3], mine[-1][4]
++        rel = [e for e in self.ring if e[3] in (mutex, key) or e[4] == key]
++        t0 = rel[-1][0]
++        return f'thread {tid} waits on mutex {mutex:#x} key {key:#x}; last svcs on them:\n' + '\n'.join(f'    {e[0] - t0:+8.3f} s thread {e[1]} {e[2]}({e[3]:#x}, {e[4]:#x}, {e[5]:#x}, {e[6]:#x})' for e in rel[-last:])
++
+     def note(self, msg):
+         if self.verbose: self.log(msg)
+ 
+@@ -212,9 +234,13 @@ class Horizon:
+             r[0] = R_NOT_IMPLEMENTED
+             return
+         before = list(r[:4])
++        if self.ring is not None and name in ('WaitProcessWideKeyAtomic', 'SignalProcessWideKey', 'ArbitrateLock', 'ArbitrateUnlock'): self.ring.append((time.monotonic(), self.current().tid if self.current() else 1, name, before[0], before[1], before[2], before[3]))
++        t = self.current(); self.thread_state[t.tid if t else 1] = (name, orig, r[29], r[30], time.monotonic())   # where each guest thread last entered the kernel: the report shows who waits on what
+         try: f(r)
+         except AssertionError as e:   # a guest address the kernel cannot read or write: the call fails, as it does on the device, instead of raising inside the guest's thread
+-            self.log(f'{name}: invalid guest address ({e}) at {orig:#x}'); r[0] = R_INVALID_ADDRESS
++            self.invalid = getattr(self, 'invalid', 0) + 1
++            if self.invalid <= 5: self.log(f'{name}: invalid guest address ({e}) at {orig:#x} x0..x2={before[0]:#x},{before[1]:#x},{before[2]:#x}; {self.where(r)}')
++            r[0] = R_INVALID_ADDRESS
+         if self.verbose: self.log(f'{name}({", ".join(hex(x) for x in before)}) -> {r[0]:#x} {r[1]:#x}')
+ 
+     # ---- memory ----
+@@ -336,10 +362,26 @@ class Horizon:
+         self.local = threading.local()
+         self.threads, self.mutex_waiters, self.key_waiters = {}, {}, {}
+         self._tlr_next = 0
++        self._scratch_n = 0
+ 
+     def current(self):
+         return getattr(self.local, 'thread', None)
+ 
++    SCRATCH_BASE = 0x9_0000_0000
++    SCRATCH_SIZE = 0x20000
++
++    def call_guest(self, symbol, regs=None):
++        """Run an exported guest function from inside a service handler (a nested run on this thread, on a scratch stack of its own, with this thread's thread pointers). Returns x0; a fault raises"""
++        stack = getattr(self.local, 'scratch', None)
++        if stack is None:
++            with self.cv:
++                base = self.SCRATCH_BASE + self._scratch_n * self.SCRATCH_SIZE; self._scratch_n += 1
++            if not self.aot.try_map(base, self.SCRATCH_SIZE): raise RuntimeError('no room for a scratch stack')
++            stack = self.local.scratch = base + self.SCRATCH_SIZE
++        r = self.aot.run(self.ms.symbol(symbol), dict(regs or {}, x30=self.ms.STOP), 0, stack, self.aot.get_tls(0), self.aot.get_tls(1), snapshot=False)
++        if 'fault' in r: raise RuntimeError(f'{symbol}: {r["fault"]}')
++        return r['x0']
++
+     def svc_GetThreadId(self, r):
+         t = self.current(); r[0], r[1] = OK, (t.tid if t else self.thread_id)
+ 
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+index 46e8d1c..a52c635 100644
+--- a/dm/tools/horizon_nvn.py
++++ b/dm/tools/horizon_nvn.py
+@@ -3,7 +3,7 @@ host functions for the NVN names it asks for; the objects the game allocates (de
+ What exists: devices and limits (Tegra X1 values), memory pools and buffers over the game's own memory, texture storage sizes (nvn_layout.py), sync objects, events, queues, command buffers that record
+ and replay at submit (render targets, clears, copies), and the window whose textures are shown through horizon_display. Draws, state and shaders are accepted and counted, not rendered: the
+ picture is what the game clears and copies. Anything not implemented answers 0 and is logged once with its name and arguments, never faked as a result the game could act on."""
+-import re, struct, time
++import os, re, struct, threading, time
+ from pathlib import Path
+ 
+ import nvn_layout
+@@ -34,7 +34,8 @@ class Nvn:
+         self.o = {}          # guest address -> Obj
+         self.cmdlists = {}   # command handle -> recorded commands
+         self._handle = 0x1000
+-        self.unimpl = {}
++        self.unimpl, self.calls, self.clear_colors = {}, {}, {}
++        self.trace, self.trace_names = int(os.environ.get('NX2LINUX_NVN_TRACE', '0')), set(filter(None, os.environ.get('NX2LINUX_NVN_TRACE_NAMES', '*').split(',')))
+         self.stats = {'submits': 0, 'draws': 0, 'clears': 0, 'copies': 0, 'presents': 0}
+         self.display = None
+         self.display_factory = None   # called on the first present, on the presenting thread: SDL and Vulkan then live on one thread
+@@ -55,7 +56,12 @@ class Nvn:
+         if impl is None:
+             if name.endswith('Initialize'): impl = lambda nvn, r: r.__setitem__(0, OK_BOOL)
+             else: impl = self.unimplemented(name)
+-        fn = (lambda r, f=impl: f(self, r))
++        calls = self.calls
++        def fn(r, f=impl, name=name):
++            calls[name] = calls.get(name, 0) + 1
++            if self.trace and name in self.trace_names or (self.trace and self.trace_names == {'*'}):
++                self.trace -= 1; self.hz.log(f'[nvn.trace] {name}({r[0]:#x}, {r[1]:#x}, {r[2]:#x}) thread={threading.current_thread().name}')
++            f(self, r)
+         if self.hz.aot.register_import(a, fn, name): raise RuntimeError(f'cannot register {name}')
+         self.addr[name] = a
+         return a
+@@ -96,9 +102,13 @@ class Nvn:
+             elif op == 'signal': self.signal_event(*c[1:])
+             elif op == 'copy': self.stats['copies'] += 1
+ 
++    def window_textures(self):
++        return {t for w in self.o.values() if w.get('kind') == 'window' for t in w['textures']}
++
+     def fill(self, tex_ptr, color, mask):
+         t = self.o.get(tex_ptr)
+         if not t or not t.get('w'): return
++        self.clear_colors[(tex_ptr in self.window_textures(), tuple(round(v, 2) for v in color))] = self.clear_colors.get((tex_ptr in self.window_textures(), tuple(round(v, 2) for v in color)), 0) + 1
+         bm = self.texture_bitmap(t)
+         px = bytes(int(max(0.0, min(1.0, v)) * 255 + 0.5) for v in color)
+         if mask & 0xF == 0xF: bm[:] = px * (len(bm) // 4)
+@@ -120,18 +130,29 @@ class Nvn:
+         if not w or not w['textures']: return
+         t = self.o.get(w['textures'][index % len(w['textures'])])
+         if not t or not t.get('w'): return
++        dump = os.environ.get('NX2LINUX_DUMP_FRAME')   # NX2LINUX_DUMP_FRAME=<dir>: every 30th presented frame is written there as a PNG
++        if dump and self.stats['presents'] % 30 == 1:
++            os.makedirs(dump, exist_ok=True); write_png(os.path.join(dump, f'frame{self.stats["presents"]:05d}.png'), t['w'], t['h'], bytes(self.texture_bitmap(t)))
+         if self.display is None and self.display_factory is not None:
+-            try: self.display = self.display_factory()
++            try:
++                self.display = self.display_factory(); self.hz.log(f'[nvn] window open on {self.display.gpu}')
+             except Exception as e:
+                 self.hz.log(f'[nvn] cannot open the display: {e}'); self.display_factory = None
+         if self.display is not None:
+             try:
+                 self.display.present(bytes(self.texture_bitmap(t)), t['w'], t['h'])
+                 for ev in self.display.events():
+-                    if ev[0] == 'quit': self.hz.log('window closed'); import os; os._exit(0)
++                    if ev[0] == 'quit': self.hz.log('window closed'); os._exit(0)
+             except Exception as e: self.hz.log(f'[nvn] present failed: {e}')
+ 
+ 
++def write_png(path, w, h, rgba):
++    import zlib
++    def chunk(tag, data): return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xFFFFFFFF)
++    raw = b''.join(b'\0' + rgba[y * w * 4:(y + 1) * w * 4] for y in range(h))
++    open(path, 'wb').write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw, 1)) + chunk(b'IEND', b''))
++
++
+ IMPL = {}
+ 
+ 
+@@ -373,8 +394,12 @@ def _(n, r): c = n.get(r[0]); c['cmds'] = []; c['recording'] = True
+ @nvn('nvnCommandBufferEndRecording')
+ def _(n, r):
+     c = n.get(r[0]); c['recording'] = False
+-    h = n.new_handle(); n.cmdlists[h] = c['cmds']; c['cmds'] = []
++    h = n.new_handle(); n.cmdlists[h] = c['cmds']; c['used'] = 16 * (len(c['cmds']) + 1); c['cmds'] = []
+     ret(r, h)
++@nvn('nvnCommandBufferGetCommandMemoryUsed')
++def _(n, r): c = n.get(r[0]); ret(r, c.get('used', 0) if not c.get('recording') else 16 * (len(c.get('cmds', [])) + 1))
++@nvn('nvnCommandBufferGetControlMemoryUsed')
++def _(n, r): ret(r, 0)
+ @nvn('nvnCommandBufferIsRecording')
+ def _(n, r): ret(r, int(bool(n.get(r[0]).get('recording'))))
+ @nvn('nvnCommandBufferCopyCommands')
+diff --git a/dm/tools/horizon_overrides.py b/dm/tools/horizon_overrides.py
+index 5d94818..5fd8a23 100644
+--- a/dm/tools/horizon_overrides.py
++++ b/dm/tools/horizon_overrides.py
+@@ -53,7 +53,7 @@ def install_profile(horizon, profile):
+ 
+ def install(horizon):
+     """The table as {symbol: fn(regs)} for ModuleSet.build(overrides=...); symbols the loaded modules do not export are left out (the game may not use them)"""
+-    import horizon_fs, horizon_account, horizon_oe, horizon_vi, horizon_nvn, horizon_hid, horizon_fiber   # register the nn::fs, nn::account, nn::oe, nn::vi/nv and NVN entries
++    import horizon_fs, horizon_account, horizon_oe, horizon_vi, horizon_nvn, horizon_hid, horizon_fiber, horizon_audio, horizon_time   # register the nn::fs, nn::account, nn::oe, nn::vi/nv and NVN entries
+     import horizon_trivial
+     for sym, value, why, src in horizon_trivial.TRIVIAL:   # generated from the Mach host: entries that do nothing or return a constant; a hand-written port of the same symbol wins
+         if sym in TABLE: continue
+diff --git a/dm/tools/horizon_profile_xc2.py b/dm/tools/horizon_profile_xc2.py
+index 7079df3..cd31a89 100644
+--- a/dm/tools/horizon_profile_xc2.py
++++ b/dm/tools/horizon_profile_xc2.py
+@@ -9,7 +9,3 @@ PROFILE = {}
+ def workaround(symbol, why):
+     def deco(fn): PROFILE[symbol] = (fn, why); return fn
+     return deco
+-
+-
+-@workaround('_ZN3ssd9SoundCore4InitERKNS0_9InitParamE', 'no nn::audio renderer server on the host yet: the game\'s sound engine is not started (it would assert in ssd::SystemCorePlatform::QuitAudioDevice); sound is off')
+-def sound_init(hz, r): r[0] = 1
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index b8f9ed2..eac3f08 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -38,12 +38,20 @@ def main():
+         hz.display_factory = lambda: horizon_display.Display(a.title, 1280, 720, hidden=a.hidden)
+     # the boot runs on this thread; the game's own threads do the rest. A timer ends the run.
+     import threading
+-    threading.Timer(a.seconds, lambda: (print(f'[run] {a.seconds:.0f} s elapsed: stopping', flush=True), os._exit(0))).start()
++    def report():
++        print('frames presented:', getattr(hz, 'frames_presented', 0), '| svc calls:', hz.stats, '| not translated functions called:', hz.aot.stat('unlifted_calls'))
++        if hasattr(hz, 'nvn'): print('nvn:', hz.nvn.stats, '| not implemented NVN calls:', sorted(hz.nvn.unimpl)[:60])
++        if hasattr(hz, 'nvn'): print('NVN calls (most frequent):', sorted(hz.nvn.calls.items(), key=lambda kv: -kv[1])[:30])
++        if hasattr(hz, 'nvn'): print('NVN queue/window/recording calls:', {k: v for k, v in hz.nvn.calls.items() if any(x in k for x in ('Queue', 'Window', 'Recording', 'Commands', 'Sync'))})
++        if hasattr(hz, 'nvn'): print('NVN functions the game looked up:', len(hz.nvn.addr), '| Submit looked up:', 'nvnQueueSubmitCommands' in hz.nvn.addr, '| command lists recorded:', len(hz.nvn.cmdlists))
++        if hasattr(hz, 'nvn'): print('clear colors (on a window texture?, rgba): count:', sorted(hz.nvn.clear_colors.items(), key=lambda kv: -kv[1])[:12])
++        print('stubbed overrides called:', sorted(hz.stub_calls)); print('where the guest threads are:\n' + hz.thread_report()); print(hz.ring_report(1)); print('threads that stopped:', hz.thread_faults, flush=True)
++    def stop():
++        print(f'[run] {a.seconds:.0f} s elapsed: stopping', flush=True); report(); os._exit(0)
++    threading.Timer(a.seconds, stop).start()
+     r = hz.boot()
+     print('result', {k: (hex(v) if isinstance(v, int) else v) for k, v in r.items() if k in ('fault', 'x0', 'step')})
+-    print('frames presented:', getattr(hz, 'frames_presented', 0), '| svc calls:', hz.stats, '| not translated functions called:', hz.aot.stat('unlifted_calls'))
+-    if hasattr(hz, 'nvn'): print('nvn:', hz.nvn.stats, '| not implemented NVN calls:', sorted(hz.nvn.unimpl)[:40])
+-    print('stubbed overrides called:', sorted(hz.stub_calls))
++    report()   # the boot thread ended (nnMain returned or faulted); the other guest threads go on until the timer
+ 
+ 
+ if __name__ == '__main__': main()
+diff --git a/dm/tools/horizon_time.py b/dm/tools/horizon_time.py
+new file mode 100644
+index 0000000..5b12b09
+--- /dev/null
++++ b/dm/tools/horizon_time.py
+@@ -0,0 +1,70 @@
++"""nn::time on the Linux host (NX2Linux S7bis): the Python side of engine/dm/host/hle_time.c. The host has no time service: clocks are the host's own (user clock = the system clock, steady clock = CLOCK_MONOTONIC),
++the time zone is the host's. Layouts (public Horizon ABI): PosixTime = s64 seconds; CalendarTime = {s16 year; s8 month, day, hour, minute, second; pad}; CalendarAdditionalInfo = {u32 wday, yday; char tz[8]; u32 dst; s32 offset};
++SteadyClockTimePoint = {s64 seconds; 16-byte source id}. NX2LINUX_FIXED_TIME=<seconds> pins the user clock (deterministic runs)."""
++import os, struct, time
++
++from horizon_overrides import hle
++
++RES_OK = 0
++STEADY_SOURCE = b'nx2linux-steady1'
++
++
++def user_time():
++    f = os.environ.get('NX2LINUX_FIXED_TIME')
++    return int(f, 0) if f else int(time.time())
++
++
++def steady_seconds(): return int(time.monotonic())
++
++
++hle('_ZN2nn4time10InitializeEv', 'connect to the time service; clocks come from the host')(lambda hz, r: r.__setitem__(0, RES_OK))
++hle('_ZN2nn4time13IsInitializedEv', 'the time service is replaced, always initialized')(lambda hz, r: r.__setitem__(0, 1))
++
++
++@hle('_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyClockTimePointE', 'steady clock: host monotonic seconds, fixed source id')
++def steady_now(hz, r): hz.wr(r[0], struct.pack('<q', steady_seconds()) + STEADY_SOURCE); r[0] = RES_OK
++
++
++@hle('_ZN2nn4time38GetStandardSteadyClockCurrentTimePointEPNS0_20SteadyClockTimePointE', 'steady clock (SDK 20 free function): host monotonic seconds')
++def steady_now_fn(hz, r): steady_now(hz, r)
++
++
++@hle('_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE', 'user clock: the host clock')
++def user_now(hz, r): hz.wr64(r[0], user_time()); r[0] = RES_OK
++
++
++@hle('_ZN2nn4time25AdjustableUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE', 'adjustable user clock: the host clock')
++def adjustable_now(hz, r): user_now(hz, r)
++
++
++@hle('_ZN2nn4time23StandardUserSystemClock3nowEv', 'user clock: the host clock')
++def clock_now(hz, r): r[0] = user_time()
++
++
++def _timespec(hz, addr, real):
++    t = time.time_ns() if real else time.monotonic_ns()
++    hz.wr(addr, struct.pack('<qq', t // 10**9, t % 10**9))
++
++
++hle('_ZN2nn4time41GetStandardUserSystemClockCurrentTimespecEP8timespec', 'C library real-time clock: host real time')(lambda hz, r: (_timespec(hz, r[0], True), r.__setitem__(0, 0)))
++hle('_ZN2nn4time43GetAdjustableUserSystemClockCurrentTimespecEP8timespec', 'C library real-time clock (adjustable): host real time')(lambda hz, r: (_timespec(hz, r[0], True), r.__setitem__(0, 0)))
++hle('_ZN2nn4time37GetStandardSteadyClockCurrentTimespecEP8timespec', 'C library monotonic clock: host monotonic time')(lambda hz, r: (_timespec(hz, r[0], False), r.__setitem__(0, 0)))
++
++
++def _calendar(hz, ct, ai, posix):
++    tm = time.localtime(posix)
++    if ct: hz.wr(ct, struct.pack('<hbbbbbb', tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, 0))
++    if ai:
++        hz.wr(ai, struct.pack('<II8sIi', (tm.tm_wday + 1) % 7, tm.tm_yday - 1, (tm.tm_zone or 'UTC').encode()[:7], int(tm.tm_isdst > 0), tm.tm_gmtoff or 0))
++
++
++@hle('_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE', 'time zone rules of the time service; the host zone')
++def to_calendar(hz, r): _calendar(hz, r[0], r[1], hz.rd64(r[2])); r[0] = RES_OK
++
++
++@hle('_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeERKNS0_12TimeZoneRuleE', 'explicit time zone rule: the host zone')
++def to_calendar_rule(hz, r): _calendar(hz, r[0], r[1], hz.rd64(r[2])); r[0] = RES_OK
++
++
++hle('_ZN2nn4time16LoadTimeZoneRuleEPNS0_12TimeZoneRuleERKNS0_12LocationNameE', 'time zone rule from the time service; the host zone is used instead')(lambda hz, r: r.__setitem__(0, RES_OK))
++hle('_ZN2nn4time26StandardNetworkSystemClock20IsAccuracySufficientEv', 'network clock accuracy: offline, never sufficient')(lambda hz, r: r.__setitem__(0, 0))
+diff --git a/dm/tools/tests/test_horizon_services.py b/dm/tools/tests/test_horizon_services.py
+index 9fda5fc..5d17bf4 100644
+--- a/dm/tools/tests/test_horizon_services.py
++++ b/dm/tools/tests/test_horizon_services.py
+@@ -162,6 +162,47 @@ class Stubs(unittest.TestCase):
+         self.assertEqual((r[0], hz.stub_calls[sym]), (0, 1))
+ 
+ 
++class Audio(unittest.TestCase):
++    def test_a_started_voice_releases_its_wave_buffer_after_its_samples(self):
++        import horizon_audio as au
++        hz, aot = make(); a = au.state(hz); a.tick_samples, a.rate = 240, 48000
++        put(aot, 0x100, struct.pack('<QQiiB', 0x5000, 960, 0, 480, 0))   # a WaveBuffer of 480 samples (two ticks of 240)
++        call(hz, '_ZN2nn5audio16AcquireVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEiiNS0_12SampleFormatEiPKvm', 0x10, 0x20, 48000, 1, 2, 0, 0)
++        self.assertEqual(call(hz, '_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE', 0x20, 0x100)[0], 1)
++        a.tick(); self.assertEqual(call(hz, '_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE', 0x20)[0], 0)   # not playing: nothing is consumed
++        call(hz, '_ZN2nn5audio17SetVoicePlayStateEPNS0_9VoiceTypeENS1_9PlayStateE', 0x20, 0)
++        a.tick(); self.assertEqual(call(hz, '_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE', 0x20)[0], 0)   # half played
++        a.tick(); self.assertEqual(call(hz, '_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE', 0x20)[0], 0x100)
++        self.assertEqual(call(hz, '_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE', 0x20)[0], 480)
++
++    def test_memory_pools_attach_at_once(self):
++        hz, _ = make()
++        call(hz, '_ZN2nn5audio17AcquireMemoryPoolEPNS0_19AudioRendererConfigEPNS0_14MemoryPoolTypeEPvm', 0, 0x30, 0, 0)
++        self.assertEqual(call(hz, '_ZN2nn5audio18GetMemoryPoolStateEPKNS0_14MemoryPoolTypeE', 0x30)[0], 3)
++        call(hz, '_ZN2nn5audio23RequestAttachMemoryPoolEPNS0_14MemoryPoolTypeE', 0x30)
++        self.assertEqual(call(hz, '_ZN2nn5audio18GetMemoryPoolStateEPKNS0_14MemoryPoolTypeE', 0x30)[0], 5)
++
++    def test_an_audio_out_buffer_is_released_after_the_time_its_samples_take(self):
++        import time
++        hz, aot = make()
++        call(hz, '_ZN2nn5audio21SetAudioOutBufferInfoEPNS0_14AudioOutBufferEPvmm', 0x100, 0x5000, 4800, 4800)   # 1200 frames of PCM16 stereo = 25 ms
++        call(hz, '_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE', 0x40, 0x100)
++        self.assertEqual(call(hz, '_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE', 0x40)[0], 0)
++        time.sleep(0.04)
++        self.assertEqual(call(hz, '_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE', 0x40)[0], 0x100)
++
++
++class Time(unittest.TestCase):
++    def test_the_user_clock_and_the_calendar_follow_the_host(self):
++        import time
++        hz, aot = make()
++        call(hz, '_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE', 0x100)
++        self.assertLess(abs(hz.rd64(0x100) - time.time()), 2)
++        put(aot, 0x200, struct.pack('<q', 86400 * 365))   # 1971-01-01 UTC, whatever the zone gives
++        call(hz, '_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE', 0x300, 0x320, 0x200)
++        year, month = struct.unpack_from('<hb', aot.mem, 0x300); self.assertEqual((year, month), (1971, 1))
++
++
+ class Layout(unittest.TestCase):
+     def test_a_linear_render_target_is_stride_times_height(self):
+         d = nvn_layout.Desc(target=1, width=1280, height=720, depth=1, format=0x25, flags=0x40)   # RGBA8, LINEAR_RENDER_TARGET
