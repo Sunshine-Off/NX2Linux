@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 13:12:47 +0100
+Subject: [PATCH] elf_module: accept 8-byte relocations at 4-byte aligned
+ offsets (packed structures)
+
+Xenoblade Chronicles 2's main has 48 RELATIVE relocations at offsets that are 4 but not 8 aligned; the loader refused the module. Only the bounds matter.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: AArch64 -> x86_64 recompilation (NX2Linux S7): packed structures put pointers at 4-aligned offsets, found on Xenoblade 2; tests use a synthetic module, no game data
+Issue: none yet (NX2Linux, branch swann/jalon-s7-first-game)
+
+---
+ dm/tools/elf_module.py            |  2 +-
+ dm/tools/tests/test_elf_module.py | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/dm/tools/elf_module.py b/dm/tools/elf_module.py
+index d5a78b0..c7d20dc 100644
+--- a/dm/tools/elf_module.py
++++ b/dm/tools/elf_module.py
+@@ -245,7 +245,7 @@ class ModuleSet:
+     def _relocate(self, mod):
+         n = len(mod.image)
+         for off, t, si, add, _ in mod.relocs:
+-            if off % 8 or off + 8 > n: raise ModuleError(f'{mod.name}: relocation at {off:#x} is outside the module or not aligned')
++            if off % 4 or off + 8 > n: raise ModuleError(f'{mod.name}: relocation at {off:#x} is outside the module or not 4-byte aligned')   # packed structures put an 8-byte pointer at a 4-aligned offset (Xenoblade 2 has 48)
+             if t == R_RELATIVE: v = mod.base + add
+             elif t in (R_ABS64, R_GLOB_DAT, R_JUMP_SLOT):
+                 if si >= len(mod.symbols): raise ModuleError(f'{mod.name}: relocation at {off:#x} names symbol {si}, past the table')
+diff --git a/dm/tools/tests/test_elf_module.py b/dm/tools/tests/test_elf_module.py
+index 89bba4a..65c62d0 100644
+--- a/dm/tools/tests/test_elf_module.py
++++ b/dm/tools/tests/test_elf_module.py
+@@ -220,6 +220,34 @@ class Errors(unittest.TestCase):
+             with self.assertRaisesRegex(em.ModuleError, 'relocation type 1024'): em.ModuleSet(paths, HLE)
+         finally: d.cleanup()
+ 
++    def _first_relocation_at(self, off):
++        """a module whose first relocation (a RELATIVE one) is moved to image offset `off`"""
++        d, paths = make_dir(mf.module_a())
++        elf = Path(d.name) / 'a.elf'; data = bytearray(elf.read_bytes())
++        m = json.loads(Path(paths[0]).read_text())
++        rela = m['dynamic']['RELA'] + 0x1000
++        for i in range(m['relocations']['RELATIVE'] + m['relocations']['GLOB_DAT'] + m['relocations']['JUMP_SLOT']):
++            if struct.unpack_from('<Q', data, rela + 24 * i + 8)[0] & 0xFFFFFFFF == 1027: break
++        struct.pack_into('<Q', data, rela + 24 * i, off)
++        elf.write_bytes(data)
++        m['sha256'] = __import__('hashlib').sha256(bytes(data)).hexdigest()
++        Path(paths[0]).write_text(json.dumps(m))
++        return d, paths
++
++    def test_a_relocation_at_a_four_byte_aligned_offset_is_applied(self):
++        """packed structures hold a pointer at such an offset (Xenoblade 2 has 48)"""
++        d, paths = self._first_relocation_at(0x2004)
++        try:
++            ms = em.ModuleSet(paths, HLE)
++            self.assertNotEqual(struct.unpack_from('<Q', ms.modules[0].image, 0x2004)[0], 0)
++        finally: d.cleanup()
++
++    def test_a_relocation_off_the_four_byte_grid_is_an_explicit_error(self):
++        d, paths = self._first_relocation_at(0x2002)
++        try:
++            with self.assertRaisesRegex(em.ModuleError, 'not 4-byte aligned'): em.ModuleSet(paths, HLE)
++        finally: d.cleanup()
++
+     def test_two_modules_of_one_name_are_refused(self):
+         d, paths = make_dir(mf.module_a())
+         try:
