@@ -79,3 +79,4 @@
 0098-horizon-on-linux-textures-of-one-memory-are-one.patch
 0099-jump-tables-the-bound-of-a-dispatch-entered-by-a.patch
 0100-horizon-run-jit-dynarmic-fallback-test-aot-simd.patch
+0101-runtime-nx2-aes-for-the-aes-instructions-remill.patch

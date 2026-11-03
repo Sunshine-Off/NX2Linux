@@ -106,3 +106,7 @@ Not assumed, only unknown: how the Switch's retail modules lay out their code (t
 | H51 | dynarmic a466015 builds with clang 22 only with warnings not treated as errors (`__COUNTER__` is a C2y extension for clang 22). | The upstream `-Werror` fails on one line; nothing else is changed. | Rebuild with `-Werror` after a dynarmic or clang update. |
 | H52 | Boost headers taken from the Fedora `boost-devel` rpm (unpacked, no root) are enough for dynarmic. | Header-only use; it compiled and the JIT tests pass. | Same script on another distribution with system Boost. |
 | H53 | `--jit` turns the inline guest memory accesses off. | The JIT's write hook must see every store (existing rule in `Aot.__init__`). | `AOT_INLINE_MEM=1 horizon_run.py --jit`: the inline mode must be ignored. |
+| H54 | AESE/AESD/AESMC/AESIMC match the Arm pseudocode through `nx2_aes` (ShiftRows then SubBytes for AESE; the inverse order for AESD). | Same result as Unicorn on random inputs, and the FIPS-197 C.1 vector. | A second vector (AES-256) through the 14-round path. |
+| H55 | SHA-1, SHA-256 and PMULL behave as the pseudocode of the manual. | Equal to Unicorn on 200 random cases each; no published vector run through the instructions yet. | Run SHA-256("abc") through sha256h/h2/su0/su1 and compare with `hashlib`. |
+| H56 | FRSQRTE/FRSQRTS/FRECPS treat FPCR.FZ as 0 and a signalling NaN may not raise IOC for the Newton steps. | The game does not change FPCR.FZ; flags of the steps are not compared. | A flag comparison like the scalar batch, then a game that sets FZ. |
+

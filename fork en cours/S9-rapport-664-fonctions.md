@@ -62,3 +62,22 @@ Toutes dans `sdk`, toutes de `nn::crypto` sauf une :
 - Preuve dans un préfixe vide (`~/.cache/nx2linux/toolchain-clean`) : installation complète sans intervention, puis `test_aot_svc test_aot_realistic test_aot_stub test_elf_module test_aot_jit test_aot_simd test_aot_memory test_jump_tables` : 91 tests, 1 échec au premier passage (`faddp` ajouté au patch 0008 mais pas à la liste figée des écarts de drapeaux ; corrigé, patch 0100), puis `test_aot_simd` OK.
 - Reste : une construction complète de Xenoblade 2 avec `--jit` (clé de cache différente, tout se relifte) n'a pas été lancée ; les 27 fonctions ne sont donc pas encore prouvées sur le jeu (jalon B).
 
+## 6. Jalon B : les 27 fonctions non liftables (2026-11-04)
+
+Résultat : **0 des 27 fonctions de `nn::crypto` et `nn::hid` reste non traduite** (mesure : `lift27` ci-dessous, sur le module `sdk` réel de Xenoblade 2).
+
+Ce qui a changé :
+- Remill, patch `remill-patches/0009` : décodeurs et sémantiques de `AESE`, `AESD`, `AESMC`, `AESIMC`, `SHA1C/P/M/H/SU0/SU1`, `SHA256H/H2/SU0/SU1`, `PMULL`/`PMULL2` (8 bits et 64 bits), `FRSQRTE` (scalaire et vecteur, simple et double), `FRECPS` et `FRSQRTS` (marches de Newton, scalaire et vecteur). `FRSQRTS` n'était pas dans la liste de départ : une des 27 fonctions (le calcul d'un quaternion, `nn::hid`) l'utilise.
+- Les pas AES appellent `nx2_aes` (patch moteur 0101, `aot_runtime.cpp`) : la S-box est calculée depuis sa définition (inverse dans GF(2^8) puis transformation affine), sans table recopiée. SHA-1, SHA-256, PMULL, FRSQRTE, FRECPS et FRSQRTS sont du code entier ou flottant écrit d'après le pseudo-code du manuel Arm.
+- Aucun code ni donnée du jeu dans le dépôt.
+
+Preuves (environnement propre du jalon A, Remill 0001–0009) :
+- `test_aot_simd` : 14 tests, dont le lot crypto (20 instructions, 200 cas chacune), `frsqrte` (valeur **et** drapeaux FPSR, 5 formes, plus de 500 cas par forme, zéros, infinis, NaN, dénormalisés), `frecps`/`frsqrts` (64 cas sans NaN, 200 avec NaN) et le vecteur AES-128 de FIPS-197 annexe C.1, tous identiques à Unicorn (sauf le vecteur FIPS, qui est la réponse publiée). Suite complète : 92 tests OK avant ces ajouts + 14.
+- Les 27 vraies fonctions, liftées puis comparées à Unicorn par le worker de `module_validate.py` (800 cas aléatoires chacune, avec leurs appelés) : **26 égales, 1 non concluante** (`AesImpl::EncryptBlock` d'AES-128, dont tous les cas aléatoires font une faute des deux côtés parce qu'elle attend un pointeur vers une structure). Cette dernière a été exécutée à part avec des clés d'aller valides : elle produit le chiffré du vecteur FIPS-197 (`69c4e0d8…c55a`).
+- Ce qui n'est pas prouvé : l'exécution de ces fonctions par le jeu lui-même (aucune n'est appelée dans le parcours testé), et les drapeaux FPSR de `frecps`/`frsqrts` (les valeurs sont comparées, pas les drapeaux ; un SNaN ne lève peut-être pas IOC).
+
+Limites connues (écrites, pas contournées) :
+- Les formes demi-précision de `FRSQRTE`, `FRECPS`, `FRSQRTS` restent non décodées : `LiftError` explicite si un jeu en utilise. `FRECPE` et `FRECPX` aussi : à faire si un recensement (`module_validate.py census`) les montre.
+- `FRSQRTE`/`FRSQRTS` ignorent `FPCR.FZ` (mode de vidage des dénormalisés) : le jeu ne l'active pas, `Unicorn` non plus par défaut.
+- `FRSQRTS` : la moitié de `(3 - a*b)/2` est faite sur un opérande avant le produit pour ne pas déborder ; pour deux opérandes minuscules le résultat passe par le chemin fusionné classique.
+
