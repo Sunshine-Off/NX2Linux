@@ -54,3 +54,11 @@ Toutes dans `sdk`, toutes de `nn::crypto` sauf une :
 1. **Compter les appels réellement faits** : le journal `[stub] … is not ported, answers 0` existe déjà pour le premier appel de chaque ; sur une partie de plusieurs heures, la liste des fonctions appelées se réduira à quelques dizaines.
 2. **Porter par priorité** : `movie::Decoder` d'abord (décodage via ffmpeg/libav ou VAAPI, sortie vers un tampon que le jeu lit), puis les manques de `nn::hid` constatés.
 3. Les autres restent « répondre 0 » tant qu'aucun appel n'est vu.
+
+## 5. Jalon A : toolchain reproductible (2026-11-04)
+
+- `tools/setup_toolchain.sh [PREFIX]` installe, hors du dépôt : Remill `56918a8` + les 8 patches de `remill-patches/` (`git am`), dynarmic `a466015` (sous-modules, `-fPIC`, sans `-Werror`), et vérifie LLVM 22.x. Il écrit `PREFIX/env.sh` (`REMILL_BUILD`, `DYNARMIC_DIR`, `CPLUS_INCLUDE_PATH` si Boost a été dépaqueté).
+- `horizon_run.py --jit` : construit le repli dynarmic ; une des 27 fonctions non liftables s'exécute alors au lieu d'arrêter son thread. Les accès mémoire en ligne sont coupés avec le JIT.
+- Preuve dans un préfixe vide (`~/.cache/nx2linux/toolchain-clean`) : installation complète sans intervention, puis `test_aot_svc test_aot_realistic test_aot_stub test_elf_module test_aot_jit test_aot_simd test_aot_memory test_jump_tables` : 91 tests, 1 échec au premier passage (`faddp` ajouté au patch 0008 mais pas à la liste figée des écarts de drapeaux ; corrigé, patch 0100), puis `test_aot_simd` OK.
+- Reste : une construction complète de Xenoblade 2 avec `--jit` (clé de cache différente, tout se relifte) n'a pas été lancée ; les 27 fonctions ne sont donc pas encore prouvées sur le jeu (jalon B).
+

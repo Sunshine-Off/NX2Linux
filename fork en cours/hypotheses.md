@@ -97,3 +97,12 @@ Not assumed, only unknown: how the Switch's retail modules lay out their code (t
 | H47 | NEON floating-point lanes use the host's flags for the whole instruction (cleared once, read once), and never report the input-denormal flag. | One flag read per instruction is how the scalar forms work too. | Four forms differ in FPSR out of 678 (frozen in the test). |
 | H48 | Crypto instructions (AES, SHA, PMULL, CRC32), exclusive pairs, `cas`/`swp` and `mrs ctr_el0` are not translated and run in the JIT. | They are 0.02% of Balatro's instructions, 14 functions each at most. | Balatro's own use is in its bundled TLS/crypto code: a game that encrypts its saves or streams audio decoders through them would spend its time in the JIT. Translate them when a profile says so. |
 | H49 | `LDn`/`STn` of several registers move one element at a time through the memory intrinsics, in the interleaved order of the architecture. | Same order as the pseudocode of the manual (repetition, element, structure member). | 534 forms equal to Unicorn, with and without post-increment. Not atomic as a whole: the hardware does not guarantee it either. |
+
+## 2026-11-04 (jalon A : reproductibilité)
+
+| # | Assumption | Why it is made | How to confirm |
+|---|---|---|---|
+| H50 | LLVM 22.x of the system is the only LLVM validated; another major version is refused unless `NX2_ALLOW_LLVM=1`. | Remill and the lifted IR were only built and tested with 22.1.8. | Run `tools/setup_toolchain.sh` with LLVM 21 or 23 and the AOT tests. |
+| H51 | dynarmic a466015 builds with clang 22 only with warnings not treated as errors (`__COUNTER__` is a C2y extension for clang 22). | The upstream `-Werror` fails on one line; nothing else is changed. | Rebuild with `-Werror` after a dynarmic or clang update. |
+| H52 | Boost headers taken from the Fedora `boost-devel` rpm (unpacked, no root) are enough for dynarmic. | Header-only use; it compiled and the JIT tests pass. | Same script on another distribution with system Boost. |
+| H53 | `--jit` turns the inline guest memory accesses off. | The JIT's write hook must see every store (existing rule in `Aot.__init__`). | `AOT_INLINE_MEM=1 horizon_run.py --jit`: the inline mode must be ignored. |
