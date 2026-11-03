@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Tue, 3 Nov 2026 21:37:38 +0100
+Subject: [PATCH] horizon on linux: svc profile knobs and the update-wait count
+ in the GPU log
+
+NX2LINUX_SVC_PROFILE_MIN (seconds, 0 records every call), _DEPTH (frames of the call site), _WIDTH, _ROWS, and a log line of the waits inside fw::AnimationManager::samplePose next to the presents, which showed that the game runs one main-loop iteration per frame.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: measuring where the game's threads wait
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+---
+ dm/tools/horizon_hle.py | 15 +++++++++++----
+ dm/tools/horizon_nvn.py |  1 +
+ 2 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index bfd396e..c287dff 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -255,19 +255,24 @@ class Horizon:
+             r[0] = R_INVALID_ADDRESS
+         if self.svc_prof is not None:
+             dt = time.monotonic() - t0
+-            if dt > 0.0005:   # a call that blocked or took long: the site is looked up only then
+-                k = (name, ' <- '.join(x.split(' ')[0] + (' ' + x.split(' ')[1] if ' ' in x else '') for x in self.where(r, 5).split(' <- ')))
++            if dt > self.svc_prof_min:   # a call that blocked or took long: the site is looked up only then
++                k = (name, ' <- '.join(x.split(' ')[0] + (' ' + x.split(' ')[1] if ' ' in x else '') for x in self.where(r, self.svc_prof_depth).split(' <- ')))
+                 with self.svc_prof_lock:
+                     e = self.svc_prof.setdefault(k, [0, 0.0]); e[0] += 1; e[1] += dt
+         if self.verbose: self.log(f'{name}({", ".join(hex(x) for x in before)}) -> {r[0]:#x} {r[1]:#x}')
+ 
+-    def svc_profile_report(self, top=25):
++    def svc_site_count(self, *parts):
++        """The calls recorded by the svc profile whose site holds every one of parts (the game's update loop is counted this way)"""
++        if self.svc_prof is None: return 0
++        with self.svc_prof_lock: return sum(v[0] for (_, site), v in self.svc_prof.items() if all(p in site for p in parts))
++
++    def svc_profile_report(self, top=int(os.environ.get('NX2LINUX_SVC_PROFILE_ROWS', '25'))):
+         """NX2LINUX_SVC_PROFILE=1: the kernel calls that blocked or took over 0.5 ms, by call site, with the time the threads spent in them"""
+         if self.svc_prof is None: return
+         with self.svc_prof_lock: items = sorted(self.svc_prof.items(), key=lambda kv: -kv[1][1])
+         tot = sum(v[1] for _, v in items)
+         print(f'svc profile: {tot:.1f} s of thread time in {sum(v[0] for _, v in items)} slow calls')
+-        for (name, site), (n, sec) in items[:top]: print(f'  {sec:8.2f} s {n:7d}x  {name}: {site[:400]}')
++        for (name, site), (n, sec) in items[:top]: print(f'  {sec:8.2f} s {n:7d}x  {name}: {site[:int(os.environ.get('NX2LINUX_SVC_PROFILE_WIDTH', '400'))]}')
+ 
+     # ---- memory ----
+     def svc_SetHeapSize(self, r):
+@@ -385,6 +390,8 @@ class Horizon:
+ 
+     def _init_kernel(self):
+         self.cv = KernelLock()
++        self.svc_prof_depth = int(os.environ.get('NX2LINUX_SVC_PROFILE_DEPTH', '5'))
++        self.svc_prof_min = float(os.environ.get('NX2LINUX_SVC_PROFILE_MIN', '0.0005'))   # seconds
+         self.svc_prof, self.svc_prof_lock = ({} if os.environ.get('NX2LINUX_SVC_PROFILE') else None), threading.Lock()
+         self.local = threading.local()
+         self.threads, self.mutex_waiters, self.key_waiters = {}, {}, {}
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+index 9b0f241..3be5ceb 100644
+--- a/dm/tools/horizon_nvn.py
++++ b/dm/tools/horizon_nvn.py
+@@ -354,6 +354,7 @@ class Nvn:
+             import io, pstats
+             out = io.StringIO(); pstats.Stats(self.gpu_profile, stream=out).sort_stats(os.environ.get('NX2LINUX_GPU_PROFILE_SORT', 'cumulative')).print_stats(int(os.environ.get('NX2LINUX_GPU_PROFILE_LINES', '30'))); self.hz.log('[nvn] gpu profile by cumulative time:\n' + out.getvalue())
+         if self.creplay and self.stats['presents'] % 60 == 1: self.pull_stats()
++        if self.hz.svc_prof is not None and self.stats['presents'] % 60 == 1: self.hz.log(f"[hz] fw::AnimationManager::samplePose waits {self.hz.svc_site_count('samplePose', 'Framework6update')}, presents {self.stats['presents']}")
+         if self.gpu and self.stats['presents'] % 60 == 1: self.hz.log(f'[nvn] gpu: {self.gpu.stats} gpu lib {self.gpu.gpu.stats()} errors {self.gpu_errors} gpu seconds {self.gpu_seconds:.1f} write-back {self.gpu.stats.get("write_back_seconds", 0)} s lib draw {getattr(self.gpu, "lib_draw_seconds", 0):.1f} s queue idle {self.queue_idle:.1f} busy {self.queue_busy:.1f} (cpu {self.queue_cpu:.1f}) s, game blocked in SyncWait {self.sync_wait:.1f} s, in acquire {self.acquire_wait:.1f} s window frames {self.display.frames if self.display is not None else 0}')
+         if not w or not w['textures']: return
+         t = self.o.get(w['textures'][index % len(w['textures'])])

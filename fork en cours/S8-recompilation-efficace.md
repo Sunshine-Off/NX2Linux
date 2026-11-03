@@ -105,3 +105,15 @@ Mesure (même scénario, 110 s) : **339 images avant, 1 407 après (×4,1)**. Un
 Le patch réserve tout l'espace invité (2^37 octets, `nx2_gbase`), place chaque région à `nx2_gbase + adresse`, et définit les accesseurs `alwaysinline` dans chaque fonction (add + accès `volatile`, pas de compteur). Un accès hors région fait un SIGSEGV que le gestionnaire convertit en l'erreur habituelle (sans taille ni sens). Pas avec le JIT.
 
 Recompilation complète : **1 430 s** (97 763 objets, cache de plus ≈ 12 Go). Mesure (110 s, trois essais alternés) : **1 710–1 734 images contre 1 587–1 600 (+8 %)**. Gain modeste, comme prévu : le jeu attend plus qu'il ne calcule. Reste opt-in.
+
+## 11. Les « 7 mises à jour par image » : hypothèse réfutée
+
+Le désassemblage de `ml::WorkRootState::runSingle` montre une itération de la boucle principale par image (beginFrame, un seul `updateWork`, endFrame), et `FrameworkLauncher::update` n'appelle `Framework::update` qu'une fois. Les ≈ 13 « mises à jour » par image que j'avais déduites venaient du nombre d'**appels noyau** de chaque phase du pool d'animation (un signal et une attente par thread de travail, ≈ 13 threads), pas de mises à jour du jeu. Il n'y a donc pas de rattrapage de pas de temps fixe.
+
+Ce qui reste vrai : chaque image fait 8 phases du pool × ≈ 13 signaux et attentes, soit ≈ 200 appels noyau passant par Python, ≈ 0,3 ms l'attente en profil. Le chemin rapide en C des appels de synchronisation (étape 3 du plan) vise exactement cela.
+
+Nouvelles variables d'environnement du profil : `NX2LINUX_SVC_PROFILE_MIN` (secondes, 0 = tous les appels), `_DEPTH`, `_WIDTH`, `_ROWS`.
+
+## 12. Lancement avec fenêtre : ce qui s'affiche
+
+Run de 150 s avec `NX2LINUX_DUMP_FRAME` (une image sur 30) : noir jusqu'à ≈ 21 s (chargement), écran-titre « Press any button » ensuite, puis l'ouverture (ciel, créature, génériques). Aucun blocage dur. Points à examiner : le titre s'affiche sans logo ; la créature de l'ouverture est une silhouette noire uniforme (textures de remplacement ? `dummy: view type 1 of a 3D image` 62 dessins, `dummy: unknown texture` 27, `upload: depth` 37) ; des appuis de 0,2 s sur A sont perdus à 11 images/s alors que des appuis de 1 s passent (le tampon partagé ne garde que l'état le plus récent).
