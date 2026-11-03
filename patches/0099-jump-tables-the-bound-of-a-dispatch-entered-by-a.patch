@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Tue, 3 Nov 2026 23:37:31 +0100
+Subject: [PATCH] jump tables: the bound of a dispatch entered by a branch that
+ skips an earlier switch
+
+A conditional branch can enter a later dispatch after skipping another switch. In that shape the nearest linear cmp belongs to the skipped table, while the real bound is the cmp of the table's index register right before the incoming branch. The resolver now looks for a conditional branch into the small address/load/add suffix of the br and takes the cmp of the index register just before it, one more for slack; the table entry keeps the index register for that. Only a branch into that suffix and only a cmp of the index register count.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: a switch that was reached by a skipping branch got the bound of the switch it skipped
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+---
+ dm/tools/jump_tables.py            | 21 +++++++++++++++++++--
+ dm/tools/tests/test_jump_tables.py | 23 +++++++++++++++++++++++
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/dm/tools/jump_tables.py b/dm/tools/jump_tables.py
+index 259ee79..3f4c3f9 100644
+--- a/dm/tools/jump_tables.py
++++ b/dm/tools/jump_tables.py
+@@ -83,12 +83,12 @@ def _resolve(img, ins, i, start, end):
+             base = regs.get(_reg(mm.group(1))) if mm else None
+             if mm and base and base[0] == 'c':
+                 shift = int(mm.group(4)) if mm.group(4) else 0
+-                if shift in (0, width.bit_length() - 1): regs[d] = ('t', base[1], width, signed, shift); continue
++                if shift in (0, width.bit_length() - 1): regs[d] = ('t', base[1], width, signed, shift, _reg(mm.group(2))); continue
+         if m not in NO_WRITE and not m.startswith('b.') and d is not None: regs.pop(d, None)
+         if m in ('stp', 'ldp', 'ldpsw') and len(parts) > 1 and _reg(parts[1]) is not None: regs.pop(_reg(parts[1]), None)
+     j = regs.get(_reg(ins[i].op_str))
+     if not j or j[0] != 'j': return None
+-    _, base, (_, taddr, width, signed, ishift), kind, shift = j
++    _, base, (_, taddr, width, signed, ishift, index_reg), kind, shift = j
+     # the entry count: the nearest `cmp reg, #k` or `ccmp reg, #k, ...` before the br (the guard of the switch), one more for slack; else scan while the targets are inside the function
+     n = None
+     for k in range(i - 1, max(0, i - 120) - 1, -1):
+@@ -100,6 +100,23 @@ def _resolve(img, ins, i, start, end):
+                 mm = re.fullmatch(r'[xw]\d+, #(\w+)(?:, #\w+, \w+)?', y.op_str) if y.mnemonic in ('cmp', 'ccmp') else None
+                 if mm: n = max(n, _imm(mm.group(1)))
+             n = min(n + 2, CAP); break
++    # A conditional branch can enter a later dispatch after skipping another
++    # switch.  In that shape the nearest linear cmp belongs to the skipped
++    # table, while the real bound is immediately before the incoming branch.
++    # Accept only a branch into the small address/load/add suffix of this br,
++    # and only a cmp of the register used to index the table.
++    dispatch_lo = ins[max(0, i - 8)].address
++    incoming = None
++    for k, x in enumerate(ins[:i]):
++        if not x.mnemonic.startswith('b.') or not x.op_str.startswith('#'): continue
++        target = _imm(x.op_str)
++        if not dispatch_lo <= target <= ins[i].address: continue
++        for y in reversed(ins[max(0, k - 4):k]):
++            mm = re.fullmatch(r'[xw](\d+), #(\w+)', y.op_str) if y.mnemonic == 'cmp' else None
++            if mm and int(mm.group(1)) == index_reg:
++                incoming = max(incoming or 0, _imm(mm.group(2)) + 2)
++                break
++    if incoming is not None: n = min(max(n or 0, incoming), CAP)
+     targets, k = set(), 0
+     while k < (n or CAP):
+         at = taddr + k * width
+diff --git a/dm/tools/tests/test_jump_tables.py b/dm/tools/tests/test_jump_tables.py
+index 4ea48f1..2ce7361 100644
+--- a/dm/tools/tests/test_jump_tables.py
++++ b/dm/tools/tests/test_jump_tables.py
+@@ -21,6 +21,7 @@ ADD_LSL2 = lambda d, n, m: 0x8B000000 | (m << 16) | (2 << 10) | (n << 5) | d   #
+ ADD_SXTB2 = lambda d, n, m: 0x8B208800 | (m << 16) | (n << 5) | d              # add xd, xn, wm, sxtb #2
+ ADD = lambda d, n, m: 0x8B000000 | (m << 16) | (n << 5) | d                    # add xd, xn, xm
+ BHI = lambda frm, to: 0x54000008 | (((to - frm) >> 2 & 0x7FFFF) << 5)
++BLS = lambda frm, to: 0x54000009 | (((to - frm) >> 2 & 0x7FFFF) << 5)
+ 
+ 
+ def image(words, table=b''):
+@@ -110,6 +111,28 @@ class Tables(unittest.TestCase):
+         (t,) = self.find(words, struct.pack('<4i', *entries))
+         self.assertEqual(t.targets, tuple(base + 8 * k for k in range(4)))
+ 
++    def test_an_incoming_guard_bounds_a_second_dispatch_after_another_table(self):
++        # Xenoblade 2 branches over a small switch to a second dispatch that reuses
++        # w8.  The nearest linear cmp belongs to the skipped switch; the second
++        # table is bounded by the cmp immediately before the incoming b.ls.
++        table1, table2 = TABLE + 0x100, TABLE
++        second = F + 9 * 4
++        words = [CMP(8, 33), BLS(F + 4, second), CMP(8, 4),
++                 ADRP(9, F + 12, table1), ADDI(9, 9, table1 & 0xFFF),
++                 LDRSW(8, 9, 8), ADD(8, 8, 9), BR(8), RET,
++                 ADRP(9, second, table2), ADDI(9, 9, table2 & 0xFFF),
++                 LDRSW(8, 9, 8), ADD(8, 8, 9), BR(8)]
++        cases = F + 14 * 4
++        words += [NOP, RET] * 4
++        data = bytearray(0x200)
++        struct.pack_into('<5i', data, 0x100, *([cases - table1] * 5))
++        targets = [cases, cases + 8, cases + 16, cases + 24]
++        values = [targets[0]] * 34
++        values[12], values[32], values[33] = targets[1], targets[2], targets[3]
++        struct.pack_into('<34i', data, 0, *(x - table2 for x in values))
++        tables = self.find(words, data)
++        self.assertEqual(tables[1].targets, tuple(targets))
++
+     def test_a_ccmp_alone_after_a_float_compare_is_the_guard_not_an_older_cmp(self):
+         # Xenoblade 2's btl::EnemyParameter::HateProc: an unrelated cmp w0, #0 a few dozen instructions earlier, then fcmp ; and ; ccmp w8, #3, #2, ne ; b.hi default ; ... br. The older cmp gave a two-entry table
+         words = [0x7100001F] + [NOP] * 5 + [0x7A431902, BHI(F + 28, F + 4 * 17), ADRP(9, F + 32, TABLE), ADDI(9, 9, TABLE & 0xFFF), LDRSW(11, 9, 0), ADD(10, 11, 9), BR(10)]
