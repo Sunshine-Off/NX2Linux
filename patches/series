@@ -75,3 +75,4 @@
 0094-horizon-on-linux-a-signal-wakes-the-threads-that.patch
 0095-aot-guest-memory-accesses-inline-in-the-recompil.patch
 0096-horizon-on-linux-svc-profile-knobs-and-the-updat.patch
+0097-horizon-on-linux-an-8-mib-main-stack-and-a-ccmp.patch
