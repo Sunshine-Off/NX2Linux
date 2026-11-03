@@ -117,3 +117,20 @@ Nouvelles variables d'environnement du profil : `NX2LINUX_SVC_PROFILE_MIN` (seco
 ## 12. Lancement avec fenêtre : ce qui s'affiche
 
 Run de 150 s avec `NX2LINUX_DUMP_FRAME` (une image sur 30) : noir jusqu'à ≈ 21 s (chargement), écran-titre « Press any button » ensuite, puis l'ouverture (ciel, créature, génériques). Aucun blocage dur. Points à examiner : le titre s'affiche sans logo ; la créature de l'ouverture est une silhouette noire uniforme (textures de remplacement ? `dummy: view type 1 of a 3D image` 62 dessins, `dummy: unknown texture` 27, `upload: depth` 37) ; des appuis de 0,2 s sur A sont perdus à 11 images/s alors que des appuis de 1 s passent (le tampon partagé ne garde que l'état le plus récent).
+
+## 13. Saut de la cinématique : deux défauts du recompilateur, pas « la suite du jeu » (patch 0097)
+
+Le jeu entier est recompilé (103 435 fonctions, `main` + `sdk` + `subsdk0`) : la suite existe et tourne (premier combat, Rex contre King Crustip, HUD compris). Le plantage au saut venait de deux défauts, trouvés avec un scénario scripté (`NX2LINUX_PRESS`: A pour quitter le titre, Plus pour la pause, A pour sauter) :
+
+1. **Pile du thread principal de 64 Kio** (`ModuleSet.STACK_SIZE`) : `fw::ColiCheck::testLineChara` garde un `TColiCheckResult<256>` sur la pile et la dépasse dès le premier terrain construit (« fault in nnMain: guest access at 0xffec90 … »). Elle fait 8 Mio.
+2. **Table de sauts mal bornée** (`btl::EnemyParameter::HateProc`) : une garde `fcmp ; and ; ccmp w8, #9, #2, lt ; b.hi` prenait comme borne un `cmp w0, #0` plus ancien (2 entrées au lieu de 10), d'où « indirect jump to 0x806b8ec: not the entry of an AOT function » dans le premier combat. 172 cibles de plus dans les trois modules ; **les manifestes du cache doivent être refaits** (`elf_module.describe(data, name, elf, build_id)` pour chaque ELF, écrire le JSON, puis un lancement ne recompile que les nouvelles entrées : 172 objets).
+
+## 14. Les silhouettes noires : des textures sur une même mémoire (patch 0098)
+
+Méthode : rejeu Python (`NX2LINUX_NVN_REPLAY=py`) pour vider chaque cible (`NX2LINUX_GPU_DUMP`, maintenant aussi R11G11B10F, RGB10A2, RGBA16F, R32F, et les profondeurs), journal des dessins à partir d'une image (`NX2LINUX_DRAW_LOG_FROM`), désassemblage SPIR-V des shaders (`spirv-dis`). Le rendu est différé : G-buffer à 5 cibles, puis 5 dessins plein écran d'éclairage qui n'éclairent que les pixels dont la profondeur est **égale** (test EQUAL) à un identifiant de matériau (1 à 5, sur 16 bits) écrit avant par une passe qui lit le G-buffer et le **stencil** du tampon de profondeur. Trois défauts en chaîne :
+
+- Le jeu crée **plusieurs textures NVN sur la même mémoire** (le tampon de profondeur, ses vues pour l'échantillonner, une carte d'ombre et la vue qui la lit). Chacune devenait une image GPU distincte : celles qu'on échantillonnait n'étaient jamais écrites (nulles). Elles partagent maintenant une image (même mémoire, format, taille).
+- `nvnTextureBuilderSetDepthStencilMode(STENCIL)` n'était pas gardé : on échantillonnait la profondeur au lieu du stencil. Une texture en mode stencil est lue par l'aspect stencil (`Nx2Tex.aspect`, `gpu.c`).
+- Résultat : la passe d'identifiants écrivait 0 partout, aucun éclairage ne s'appliquait à la géométrie (silhouettes noires), la mer de nuages de l'ouverture manquait. Le même défaut est documenté pour l'hôte Mach (`games/0100F43008C44000/README.md`, éclairage différé en bandes).
+
+Vérifié sur le premier combat (grue, moulin, tonneau, rochers texturés et éclairés) et sur l'ouverture (mer de nuages, logos). Les textures d'un même emplacement mais de formats différents ne sont pas fusionnées (à traiter si un jeu en a besoin).

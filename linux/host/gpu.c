@@ -287,10 +287,11 @@ static VkImageView view_of(Image *im, VkImageViewType type, uint32_t level, uint
     uint64_t key = (uint64_t)type | (uint64_t)level << 8 | (uint64_t)nlevels << 16 | (uint64_t)layer << 24 | (uint64_t)nlayers << 44 | (uint64_t)(mode & 3) << 62;
     uint64_t swzkey = swz ? (swz[0] & 15) | (swz[1] & 15) << 4 | (swz[2] & 15) << 8 | (swz[3] & 15) << 12 : 0;
     key ^= swzkey * 0x9E3779B97F4A7C15ull;
+    if (mode & 4) key ^= 0x5851F42D4C957F2Dull;   /* the stencil aspect */
     for (uint32_t i = 0; i < im->nviews; i++) if (im->views[i].key == key) return im->views[i].v;
     VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->image, .viewType = type, .format = im->format,
                                  .components = { swz ? swz[0] : 0, swz ? swz[1] : 0, swz ? swz[2] : 0, swz ? swz[3] : 0 },
-                                 .subresourceRange = { .aspectMask = (mode & 2) ? im->aspect : im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = level, .levelCount = nlevels, .baseArrayLayer = layer, .layerCount = nlayers } };
+                                 .subresourceRange = { .aspectMask = (mode & 4) && (im->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_STENCIL_BIT : (mode & 2) ? im->aspect : im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = level, .levelCount = nlevels, .baseArrayLayer = layer, .layerCount = nlayers } };
     VkImageView v;
     VkResult r = vkCreateImageView(G.dev, &vi, NULL, &v);
     if (r != VK_SUCCESS) { fail("vkCreateImageView", r); return VK_NULL_HANDLE; }
@@ -491,7 +492,7 @@ static int fill_writes(Nx2Buf *bufs, uint32_t nb, const Nx2Tex *tex, uint32_t nt
         if (id >= G.nimages || !G.images[id].live) return 1;
         VkSampler s = sampler_for(&tex[i]);
         if (!s) return -1;
-        VkImageView v = view_of(&G.images[id], (VkImageViewType)tex[i].view_type, tex[i].base_level, tex[i].nlevels, tex[i].base_layer, tex[i].nlayers, 0, tex[i].swz);
+        VkImageView v = view_of(&G.images[id], (VkImageViewType)tex[i].view_type, tex[i].base_level, tex[i].nlevels, tex[i].base_layer, tex[i].nlayers, tex[i].aspect ? 4 : 0, tex[i].swz);
         if (!v) return -1;
         ii[i] = (VkDescriptorImageInfo){ s, v, VK_IMAGE_LAYOUT_GENERAL };
         wr[nw++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = tex[i].binding, .descriptorCount = 1,

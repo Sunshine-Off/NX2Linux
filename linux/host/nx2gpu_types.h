@@ -14,6 +14,7 @@ typedef struct {
     float lod_min, lod_max, lod_bias, aniso;
     uint32_t view_type /* VkImageViewType */, base_level, nlevels, base_layer, nlayers, border /* VkBorderColor */;
     uint32_t swz[4];   /* VkComponentSwizzle of r, g, b, a (0 identity) */
+    uint32_t aspect, pad_a;   /* aspect 1: the stencil of a depth-stencil image (NVN's STENCIL depth-stencil mode), read as raw bits in x */
 } Nx2Tex;
 typedef struct { uint32_t image, layer, level, pad; } Nx2Target;   /* layer: the array layer, cube face or 3D slice drawn into */
 typedef struct {

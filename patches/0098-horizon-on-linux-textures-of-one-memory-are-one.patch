@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Tue, 3 Nov 2026 23:23:04 +0100
+Subject: [PATCH] horizon on linux: textures of one memory are one image, and a
+ texture can sample the stencil
+
+A game makes several NVN textures on the same memory: one for the depth buffer and others to sample it (its depth, and its stencil, with nvnTextureBuilderSetDepthStencilMode(STENCIL)), one for a shadow map and one to read it. Each was its own GPU image, so the ones that were sampled were never written: in Xenoblade 2 every lit surface came out black (a silhouette) and the sea of clouds of the opening was missing. The textures of the same memory, format and size now share one image. A texture whose depth-stencil mode is STENCIL (the builder's, or the view's nvnTextureViewSetDepthStencilMode) is sampled through the stencil aspect (Nx2Tex.aspect, linux/host/gpu.c), which the deferred lighting pass reads as raw bits to select the pixels it lights.
+
+NX2LINUX_GPU_DUMP now writes R11G11B10F, RGB10A2, RGBA16F and R32F targets and tells what depth images hold; NX2LINUX_GPU_DUMP_ALL (every image of 128x128 or more), NX2LINUX_GPU_DUMP_FROM, NX2LINUX_DRAW_LOG_FROM, and a log line for each shader that is not translated.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: the 3D scenes of Xenoblade 2 were black silhouettes
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+---
+ dm/tools/horizon_gpu.py            |  2 +-
+ dm/tools/horizon_nvn.py            | 14 ++++--
+ dm/tools/nvn_gpu.py                | 81 ++++++++++++++++++++++++++----
+ dm/tools/nvn_state.py              |  3 +-
+ dm/tools/tests/test_horizon_gpu.py | 25 +++++++++
+ dm/tools/tests/test_horizon_nvn.py | 10 ++++
+ 6 files changed, 121 insertions(+), 14 deletions(-)
+
+diff --git a/dm/tools/horizon_gpu.py b/dm/tools/horizon_gpu.py
+index 353e6e1..5733397 100644
+--- a/dm/tools/horizon_gpu.py
++++ b/dm/tools/horizon_gpu.py
+@@ -34,7 +34,7 @@ class Img(C.Structure):
+ class Tex(C.Structure):
+     _fields_ = [(n, C.c_uint32) for n in ('binding', 'image', 'min_filter', 'mag_filter', 'mip_mode', 'wrap_s', 'wrap_t', 'wrap_r', 'compare_enable', 'compare_op')] + \
+                [(n, C.c_float) for n in ('lod_min', 'lod_max', 'lod_bias', 'aniso')] + \
+-               [(n, C.c_uint32) for n in ('view_type', 'base_level', 'nlevels', 'base_layer', 'nlayers', 'border')] + [('swz', C.c_uint32 * 4)]
++               [(n, C.c_uint32) for n in ('view_type', 'base_level', 'nlevels', 'base_layer', 'nlayers', 'border')] + [('swz', C.c_uint32 * 4), ('aspect', C.c_uint32), ('pad_a', C.c_uint32)]
+ 
+ 
+ class Target(C.Structure):
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+index 3be5ceb..40d2538 100644
+--- a/dm/tools/horizon_nvn.py
++++ b/dm/tools/horizon_nvn.py
+@@ -54,6 +54,7 @@ class Nvn:
+         self.rec = None          # a nvn_rec.Recorder: the hot calls are host functions in C and their commands are taken from there
+         self.draw_sink = None   # called with the described draw (describe_draw) of every draw at submit: the hook of a rendering backend
+         self.draw_log, self.draw_log_max = None, int(os.environ.get('NX2LINUX_DRAW_LOG_MAX', '2000'))
++        self.draw_log_from, self.draw_logged = int(os.environ.get('NX2LINUX_DRAW_LOG_FROM', '0')), 0   # NX2LINUX_DRAW_LOG_FROM=<n>: from the n-th present on
+         if os.environ.get('NX2LINUX_DRAW_LOG'): self.draw_log = open(os.environ['NX2LINUX_DRAW_LOG'], 'w')   # JSON lines, one per draw, the first NX2LINUX_DRAW_LOG_MAX of them
+         self.shader_dump = os.environ.get('NX2LINUX_SHADER_DUMP')   # a directory: <key>.ctl (control section) and <key>.code (Maxwell code) of every shader a program is given
+         self.display = None
+@@ -256,7 +257,8 @@ class Nvn:
+                 self.gpu_errors += 1
+             if self.gpu_profile: self.gpu_profile.disable()
+             self.gpu_seconds += time.monotonic() - t0
+-        want_log = self.draw_log is not None and self.stats['draws'] <= self.draw_log_max
++        want_log = self.draw_log is not None and self.stats['presents'] >= self.draw_log_from and self.draw_logged < self.draw_log_max
++        if want_log: self.draw_logged += 1
+         if not want_log and self.draw_sink is None: return
+         d = self.describe_draw(state, call)
+         if want_log: self.draw_log.write(json.dumps(d, sort_keys=True) + '\n'); self.draw_log.flush()
+@@ -348,7 +350,7 @@ class Nvn:
+         if self.input is None:
+             import horizon_input; self.input = horizon_input.Input(self.hz)
+         self.input.poll()
+-        if self.gpu and os.environ.get('NX2LINUX_GPU_DUMP') and self.stats['presents'] % 120 == 1:
++        if self.gpu and os.environ.get('NX2LINUX_GPU_DUMP') and self.stats['presents'] % 120 == 1 and self.stats['presents'] >= int(os.environ.get('NX2LINUX_GPU_DUMP_FROM', '0')):
+             import nvn_gpu; nvn_gpu.dump_targets(self.gpu, os.environ['NX2LINUX_GPU_DUMP'])
+         if self.gpu_profile and self.stats['presents'] % 150 == 1 and self.stats['presents'] > 1:   # the run ends with os._exit: the profile is printed while it goes
+             import io, pstats
+@@ -536,6 +538,10 @@ for _name, _key in (('Target', 'target'), ('Width', 'width'), ('Height', 'height
+     IMPL[f'nvnTextureBuilderSet{_name}'] = (lambda k: lambda n, r: n.get(r[0]).__setitem__(k, r[1] & M32))(_key)
+ @nvn('nvnTextureBuilderSetDevice')
+ def _(n, r): pass
++@nvn('nvnTextureBuilderSetDepthStencilMode')
++def _(n, r): n.get(r[0])['dsmode'] = r[1] & 3   # 0 depth, 1 stencil: which part of a depth-stencil texture a shader samples
++@nvn('nvnTextureBuilderGetDepthStencilMode')
++def _(n, r): ret(r, n.get(r[0]).get('dsmode', 0))
+ @nvn('nvnTextureBuilderSetSwizzle')
+ def _(n, r): n.get(r[0])['swz'] = tuple(v & M32 for v in r[1:5])
+ @nvn('nvnTextureBuilderSetSize1D')
+@@ -558,7 +564,7 @@ for _name, _key in (('Target', 'target'), ('Width', 'width'), ('Height', 'height
+ def _(n, r):
+     b = n.get(r[1])
+     d = desc_of(b)
+-    n.o[r[0]] = Obj(kind='texture', w=max(1, d.width), h=max(1, d.height) if d.target != 0 else 1, d=d, pool=b.get('pool', 0), off=b.get('off', 0), flags=d.flags, swz=b.get('swz', (2, 3, 4, 5)))
++    n.o[r[0]] = Obj(kind='texture', w=max(1, d.width), h=max(1, d.height) if d.target != 0 else 1, d=d, pool=b.get('pool', 0), off=b.get('off', 0), flags=d.flags, swz=b.get('swz', (2, 3, 4, 5)), dsmode=b.get('dsmode', 0))
+     ret(r, 1)
+ @nvn('nvnTextureFinalize')
+ def _(n, r): n.o.pop(r[0], None)
+@@ -566,6 +572,8 @@ for _name, _get in (('Width', lambda t: t['d'].width), ('Height', lambda t: t['d
+                     ('Format', lambda t: t['d'].format), ('Target', lambda t: t['d'].target), ('Flags', lambda t: t['d'].flags), ('Stride', lambda t: t['d'].stride),
+                     ('StorageSize', lambda t: nvn_layout.layout(t['d']).size), ('MemoryPool', lambda t: t['pool']), ('MemoryOffset', lambda t: t['off'])):
+     IMPL[f'nvnTextureGet{_name}'] = (lambda g: lambda n, r: ret(r, g(n.get(r[0])) if 'd' in n.get(r[0]) else 0))(_get)
++@nvn('nvnTextureGetDepthStencilMode')
++def _(n, r): ret(r, n.get(r[0]).get('dsmode', 0))
+ @nvn('nvnTextureGetTextureAddress')
+ def _(n, r): t = n.get(r[0]); ret(r, (n.pool_addr(t.get('pool', 0), t.get('off', 0)) if t else 0))
+ @nvn('nvnTextureGetZCullStorageSize')
+diff --git a/dm/tools/nvn_gpu.py b/dm/tools/nvn_gpu.py
+index f241ef3..358269e 100644
+--- a/dm/tools/nvn_gpu.py
++++ b/dm/tools/nvn_gpu.py
+@@ -3,7 +3,7 @@ textures are read from the game's memory (block-linear, deswizzled by the GPU li
+ What is converted: formats (NVN to Vulkan, nvn_layout.py for sizes), blend, depth, cull and winding, samplers, vertex streams and indices (quads become triangles in the library), the constant
+ buffers, the textures named by the shader's handle slots. What is not yet: tessellation and geometry stages, compute, cube / array / 3D textures (the draw is skipped and counted), mip levels
+ above 0, stencil, multisampling, transform feedback. A draw it cannot make is counted in stats['skipped'] by reason, never faked."""
+-import ctypes, struct, time, zlib
++import ctypes, os, struct, time, zlib
+ from array import array
+ 
+ import horizon_gpu as hg
+@@ -98,6 +98,7 @@ class GpuBackend:
+         self.images = {}     # texture pointer -> dict(id, w, h, fmt, uploaded, target)
+         self.dummies = {}
+         self.draw_texture_modules = None
++        self.alias = {}      # (memory address, format, target, size...) -> the image of the first texture there
+         self.target_draws = {}   # texture pointer -> draws made into it (diagnostics)
+         self.stats = {'draws': 0, 'skipped': {}, 'uploads': 0, 'translated': 0}
+ 
+@@ -122,6 +123,8 @@ class GpuBackend:
+                         if e['binding'] > 0: e['binding'] += base
+             try: self.shaders[k] = (self.gpu.shader(spv), stage, res); self.spirv[k] = spv; self.stats['translated'] += 1
+             except hg.GpuError as e: self.failed[k] = str(e)
++        for k, why in errors.items():   # a shader that is not translated is every draw that uses it missing from the picture: said once each
++            if k not in self.failed and len(self.failed) < 400: self.nvn.hz.log(f'[nvn] shader {k} not translated: {str(why)[:160]}')
+         self.failed.update(errors)
+ 
+     def constant_segment(self, key, stage_name):
+@@ -189,7 +192,13 @@ class GpuBackend:
+             elif d.target == 9: kind, layers, dep = 0, 6 * max(1, d.depth), 1
+             else: kind, layers, dep = 0, 1, 1
+             levels = min(levels, max(w, h, dep).bit_length())
++            # textures of the same memory, format and size are one image: a game makes one for the depth buffer and others to sample it (its depth, its stencil), or one for a shadow map and one to read it
++            alias = (n.pool_addr(t.get('pool', 0), t.get('off', 0)), d.format, d.target, w, h, d.depth, levels, d.samples) if t.get('pool') else None
++            if alias and alias in self.alias:
++                self.images[ptr] = self.alias[alias]; self.count('texture sharing the image of another')
++                return self.image_of(ptr, target)
+             im = self.images[ptr] = dict(id=self.gpu.image(w, h, vkf, dep, layers, levels, kind), w=w, h=h, fmt=vkf, depth=depth, kind=kind, layers=layers, levels=levels, uploaded=False, written=False)
++            if alias: self.alias[alias] = im
+         if target: im['written'] = True
+         elif not im['written']:
+             if not im['uploaded']:
+@@ -557,6 +566,7 @@ class GpuBackend:
+         if image is None: image, view_type, base_level, nlevels, base_layer, nlayers = self.dummy_image(view_type), view_type, 0, 0, 0, 0
+         sp = n.o.get(samppool, {}).get('samplers', {}).get(samp_id, {})
+         t.image = image
++        if image is not None and ptr and (view['dsmode'] == 1 if view and view['set_dsmode'] else (n.o.get(ptr) or {}).get('dsmode') == 1) and self.images.get(ptr, {}).get('depth'): t.aspect = 1; self.count('stencil-mode texture sampled')   # NVN's STENCIL mode: the stencil is read where a shader samples the depth-stencil texture
+         t.view_type, t.base_level, t.nlevels, t.base_layer, t.nlayers = view_type, base_level, nlevels, base_layer, nlayers
+         t.swz[:] = self.swizzle_of(ptr, view)
+         mn = sp.get('min_filter', 0)
+@@ -707,15 +717,68 @@ class GpuBackend:
+ BLEND_FACTOR = {0x1: 0, 0x2: 1, 0x3: 2, 0x4: 3, 0x5: 6, 0x6: 7, 0x7: 8, 0x8: 9, 0x9: 4, 0xA: 5, 0xB: 14, 0x10: 15, 0x11: 16, 0x12: 17, 0x13: 18, 0x61: 10, 0x62: 11, 0x63: 12, 0x64: 13}
+ 
+ 
++def _half(h):
++    e, m = h >> 10 & 31, h & 1023
++    v = (m / 1024 if e == 0 else (1 + m / 1024) * 2.0 ** (e - 15)) * (1 if h < 32768 else -1)
++    return 65504.0 if e == 31 else v
++
++
++def _ufloat(v, mant_bits):
++    e, m = v >> mant_bits, v & ((1 << mant_bits) - 1)
++    return m / (1 << mant_bits) * 2.0 ** -14 if e == 0 else (1 + m / (1 << mant_bits)) * 2.0 ** (e - 15) if e < 31 else 65504.0
++
++
++def png_pixels(fmt, px, w, h):
++    """The RGBA8 bytes of a render target of NVN format fmt for a PNG (what a person can look at: floating-point values are clamped to 0..1), or None for a format not shown"""
++    import struct
++    c8 = lambda x: int(max(0.0, min(1.0, x)) * 255 + 0.5)
++    n = w * h
++    if fmt in (0x25, 0x37, 0x6D): return bytes(px[:4 * n])
++    if fmt == 0x3F:
++        out = bytearray()
++        for (v,) in struct.iter_unpack('<I', px[:4 * n]): out += bytes((c8(_ufloat(v & 0x7FF, 6)), c8(_ufloat(v >> 11 & 0x7FF, 6)), c8(_ufloat(v >> 22, 5)), 255))
++        return bytes(out)
++    if fmt == 0x3D:
++        out = bytearray()
++        for (v,) in struct.iter_unpack('<I', px[:4 * n]): out += bytes(((v & 1023) * 255 // 1023, (v >> 10 & 1023) * 255 // 1023, (v >> 20 & 1023) * 255 // 1023, 255))
++        return bytes(out)
++    if fmt == 0x29:
++        out = bytearray()
++        for r, g, b, a in struct.iter_unpack('<4H', px[:8 * n]): out += bytes((c8(_half(r)), c8(_half(g)), c8(_half(b)), 255))
++        return bytes(out)
++    if fmt == 0x0A:
++        out = bytearray()
++        for (v,) in struct.iter_unpack('<f', px[:4 * n]): g = c8(v if v == v else 0.0); out += bytes((g, g, g, 255))
++        return bytes(out)
++    return None
++
++
+ def dump_targets(backend, directory):
+-    """Every render target drawn into, as PNG (NX2LINUX_GPU_DUMP=<dir> at each 120th present): which pass makes the picture"""
++    """Every render target drawn into, as PNG (NX2LINUX_GPU_DUMP=<dir> at each 120th present): which pass makes the picture. RGBA8, RGB10A2, R11G11B10F, RGBA16F and R32F targets are shown"""
+     import os
+     from horizon_nvn import write_png
+     os.makedirs(directory, exist_ok=True)
+-    for ptr, count in sorted(backend.target_draws.items(), key=lambda kv: -kv[1])[:24]:
+-        im = backend.images.get(ptr)
+-        if not im or im['depth'] or im['fmt'] not in (VK['RGBA8_UNORM'], VK['RGBA8_SRGB']): continue
+-        px = backend.gpu.read(im['id'], im['w'] * im['h'] * 4)
+-        lit = sum(1 for i in range(0, len(px), 4 * 97) if px[i] or px[i + 1] or px[i + 2])
+-        backend.nvn.hz.log(f'[nvn] target {ptr:#x} {im["w"]}x{im["h"]} draws={count} non-black samples={lit}')
+-        write_png(os.path.join(directory, f'{backend.nvn.stats["presents"]:05d}_{ptr:x}.png'), im['w'], im['h'], px)
++    every = os.environ.get('NX2LINUX_GPU_DUMP_ALL')   # every image of at least 128x128, not only the render targets
++    todo = [(p, backend.target_draws.get(p, 0)) for p, im in backend.images.items() if im['w'] >= 128 and im['h'] >= 128] if every else sorted(backend.target_draws.items(), key=lambda kv: -kv[1])[:48]
++    for ptr, count in todo:
++        try:
++            im = backend.images.get(ptr)
++            if im and im['depth']:   # a depth image: the values it holds, most common first (D16 as integers, D32 as floats)
++                import collections
++                nb = {VK['D16']: 2, VK['D32']: 4, VK['D32_S8']: 4}.get(im['fmt'])
++                if nb and im['w'] * im['h'] <= 1 << 21:
++                    px = backend.gpu.read(im['id'], im['w'] * im['h'] * nb)
++                    vals = [v for (v,) in struct.iter_unpack('<H' if nb == 2 else '<f', px)]
++                    c = collections.Counter(vals)
++                    backend.nvn.hz.log(f'[nvn] depth {ptr:#x} {im["w"]}x{im["h"]} fmt {im["fmt"]} distinct {len(c)} top {[(round(k, 6) if nb == 4 else k, n) for k, n in c.most_common(6)]}')
++                continue
++            if not im: continue
++            nfmt = {VK['RGBA8_UNORM']: 0x25, VK['RGBA8_SRGB']: 0x37, VK['A2B10G10R10_UNORM']: 0x3D, VK['B10G11R11_UFLOAT']: 0x3F, VK['RGBA16_SFLOAT']: 0x29, VK['R32_SFLOAT']: 0x0A}.get(im['fmt'])
++            bpp = {0x25: 4, 0x37: 4, 0x3F: 4, 0x3D: 4, 0x29: 8, 0x0A: 4}.get(nfmt)
++            if not bpp: continue
++            px = backend.gpu.read(im['id'], im['w'] * im['h'] * bpp)
++            rgba = png_pixels(nfmt, px, im['w'], im['h'])
++            lit = sum(1 for i in range(0, len(rgba), 4 * 97) if rgba[i] or rgba[i + 1] or rgba[i + 2])
++            backend.nvn.hz.log(f'[nvn] target {ptr:#x} {im["w"]}x{im["h"]} format {nfmt:#x} draws={count} non-black samples={lit}')
++            write_png(os.path.join(directory, f'{backend.nvn.stats["presents"]:05d}_{ptr:x}_f{nfmt:x}.png'), im['w'], im['h'], rgba)
++        except Exception as e: backend.nvn.hz.log(f'[nvn] dump of {ptr:#x} failed: {type(e).__name__}: {e}')
+diff --git a/dm/tools/nvn_state.py b/dm/tools/nvn_state.py
+index 475a541..8a14641 100644
+--- a/dm/tools/nvn_state.py
++++ b/dm/tools/nvn_state.py
+@@ -87,5 +87,6 @@ OBJECTS = {
+     'VertexStreamState': (VERTEX_STREAM, {'SetStride': lambda d, a: d.update(stride=a[0]), 'SetDivisor': lambda d, a: d.update(divisor=a[0])}),
+     'TextureView': (TEXTURE_VIEW, {'SetLevels': lambda d, a: d.update(set_levels=1, base_level=a[0], nlevels=a[1]), 'SetLayers': lambda d, a: d.update(set_layers=1, min_layer=a[0], nlayers=a[1]),
+                                    'SetFormat': lambda d, a: d.update(set_format=1, format=a[0]), 'SetTarget': lambda d, a: d.update(set_target=1, target=a[0]),
+-                                   'SetSwizzle': lambda d, a: d.update(set_swizzle=1, swz_r=a[0], swz_g=a[1], swz_b=a[2], swz_a=a[3])}),
++                                   'SetSwizzle': lambda d, a: d.update(set_swizzle=1, swz_r=a[0], swz_g=a[1], swz_b=a[2], swz_a=a[3]),
++                                   'SetDepthStencilMode': lambda d, a: d.update(set_dsmode=1, dsmode=a[0] & 3)}),
+ }
+diff --git a/dm/tools/tests/test_horizon_gpu.py b/dm/tools/tests/test_horizon_gpu.py
+index bcf4cc5..49be01d 100644
+--- a/dm/tools/tests/test_horizon_gpu.py
++++ b/dm/tools/tests/test_horizon_gpu.py
+@@ -66,6 +66,12 @@ layout(location=0) out vec4 o;
+ layout(binding=0) uniform SB { uint alpha_test; uint is_bgra[8]; vec4 viewport_inverse; vec4 viewport_size; int frag_scale_count; float render_scale[73]; ivec4 tfe_offset; int tfe_vertex_count; } support_buffer;
+ void main() { o = vec4(1.0, 0.0, 0.0, 0.5); }
+ """
++FRAG_STENCIL = """#version 450
++layout(location=0) in vec4 v;
++layout(location=0) out vec4 o;
++layout(binding=1) uniform usampler2D t;
++void main() { o = vec4(float(texelFetch(t, ivec2(0, 0), 0).x) / 255.0, 0.0, 0.0, 1.0); }
++"""
+ COMP = """#version 450
+ layout(local_size_x = 4, local_size_y = 1, local_size_z = 1) in;
+ layout(std430, binding = 2) buffer B { uint data[]; } b;
+@@ -281,6 +287,25 @@ class Gpu(unittest.TestCase):
+         px = g.read(out, 16 * 16 * 4)
+         self.assertEqual(tuple(px[(8 * 16 + 8) * 4:(8 * 16 + 8) * 4 + 4]), (30, 20, 10, 255))
+ 
++    def test_the_stencil_of_a_depth_stencil_image_is_sampled_when_a_texture_asks_for_it(self):
++        g = self.gpu
++        ds = g.image(4, 4, 130)   # D32_S8
++        g.clear_depth(ds, 0.5, 0x18)
++        out = g.image(16, 16, R8G8B8A8_UNORM)
++        vs, ps = g.shader(spirv(VERT, 'vert')), g.shader(spirv(FRAG_STENCIL, 'frag'))
++        verts = struct.pack('<18f', -1, -1, 1, 0, 0, 1, 3, -1, 1, 0, 0, 1, -1, 3, 1, 0, 0, 1)
++        keep = ctypes.create_string_buffer(verts)
++        d = hg.Draw(); d.vs, d.ps, d.ntargets = vs, ps, 1; d.targets[0].image = out
++        d.nattrs = 2; d.attrs[0] = hg.Attr(0, 0, 103, 0); d.attrs[1] = hg.Attr(1, 0, 109, 8)
++        d.nstreams = 1; d.streams[0] = hg.Stream(0, 24, 0, 0, ctypes.addressof(keep), len(verts))
++        d.topology, d.count, d.instances = 4, 3, 1
++        d.blend[0].mask = 0xF
++        d.viewport[:] = (0, 0, 16, 16); d.depth_range[:] = (0, 1); d.scissor[:] = (0, 0, 16, 16)
++        d.ntex = 1; t = d.tex[0]; t.binding, t.image, t.view_type, t.lod_max, t.aspect = 1, ds, 1, 0.25, 1
++        self.assertEqual(g.draw(d), 0)
++        px = g.read(out, 16 * 16 * 4)
++        self.assertEqual(px[(8 * 16 + 8) * 4], 0x18)
++
+     def test_an_integer_clear_keeps_its_bits(self):
+         g = self.gpu
+         img = g.image(4, 4, 98)   # R32_UINT
+diff --git a/dm/tools/tests/test_horizon_nvn.py b/dm/tools/tests/test_horizon_nvn.py
+index 4e32403..7dd5b59 100644
+--- a/dm/tools/tests/test_horizon_nvn.py
++++ b/dm/tools/tests/test_horizon_nvn.py
+@@ -49,6 +49,16 @@ class Recording(unittest.TestCase):
+         ds = nvn_state.DEPTH_STENCIL.unpack(self.hz.rd(0x14200, 8))
+         self.assertEqual([ds[k] for k in ('fail_f', 'zfail_f', 'zpass_f', 'fail_b', 'zfail_b', 'zpass_b')], [4, 5, 6, 4, 5, 6])
+ 
++    def test_the_depth_stencil_mode_of_a_texture_builder_and_a_view_is_kept(self):
++        call(self.n, 'nvnTextureBuilderSetDefaults', 0x16000)
++        call(self.n, 'nvnTextureBuilderSetDepthStencilMode', 0x16000, 1)
++        self.assertEqual(call(self.n, 'nvnTextureBuilderGetDepthStencilMode', 0x16000), 1)
++        call(self.n, 'nvnTextureViewSetDefaults', 0x16100)
++        self.assertEqual(nvn_state.TEXTURE_VIEW.unpack(self.hz.rd(0x16100, 16))['set_dsmode'], 0)
++        call(self.n, 'nvnTextureViewSetDepthStencilMode', 0x16100, 1)
++        v = nvn_state.TEXTURE_VIEW.unpack(self.hz.rd(0x16100, 16))
++        self.assertEqual((v['set_dsmode'], v['dsmode']), (1, 1))
++
+     def test_a_program_is_keyed_by_its_shader_and_dumped(self):
+         ctl = bytearray(hn.SHADER_CONTROL_SIZE); struct.pack_into('<I', ctl, hn.SHADER_CODE_SIZE_AT, 16); struct.pack_into('<I', ctl, hn.SHADER_OWN_LENGTH_AT, hn.SHADER_CONTROL_SIZE)
+         self.hz.wr(CTL, bytes(ctl)); self.hz.wr(CODE, bytes(range(16)))
