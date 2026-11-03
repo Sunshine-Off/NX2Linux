@@ -1,0 +1,325 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Tue, 3 Nov 2026 16:32:14 +0100
+Subject: [PATCH] horizon on linux: a signal wakes the threads that wait for
+ it, not all of them
+
+Every kernel wait shared one condition and every signal did notify_all, so a signal woke the 38 or so guest threads, which then fought for the lock and the GIL: SignalProcessWideKey took 1.85 ms and a thread pool phase of the game's update 1.7 ms. The kernel state keeps one lock; a thread that waits parks on an event of its own (Hle.park), and the unlock, the key signal, the event signal and a thread's exit set the events of the threads concerned only. NX2LINUX_SVC_PROFILE=1 prints the kernel calls that blocked or took over 0.5 ms, by call site. In the opening cinematic: 339 frames in 110 s before, 1407 after.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: the game's own threads spent most of their time waking one another through the shared condition
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+---
+ dm/tools/horizon_audio.py          |  2 +-
+ dm/tools/horizon_hle.py            | 84 +++++++++++++++++++++++-------
+ dm/tools/horizon_oe.py             |  5 +-
+ dm/tools/horizon_run.py            |  1 +
+ dm/tools/tests/test_horizon_hle.py | 55 +++++++++++++++++++
+ 5 files changed, 125 insertions(+), 22 deletions(-)
+
+diff --git a/dm/tools/horizon_audio.py b/dm/tools/horizon_audio.py
+index 3102fcd..d2d68bc 100644
+--- a/dm/tools/horizon_audio.py
++++ b/dm/tools/horizon_audio.py
+@@ -47,7 +47,7 @@ class Audio:
+                     wb, dur = v.waves.pop(0); v.consumed -= dur; v.released.append(wb)
+         ev = self.hz.handles.get(self.event_wh)
+         if ev is not None:
+-            with self.hz.cv: ev.signaled = True; self.hz.cv.notify_all()
++            self.hz.signal_event(ev)
+ 
+ 
+ def state(hz):
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index 431704f..bfd396e 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -35,9 +35,16 @@ class Obj:
+     def __init__(self): self.name = ''
+ 
+ 
++class KernelLock:
++    """The one lock of the kernel's state (handles, waiter lists, mutex words). Threads that wait do it on an event of their own (Hle.park), never on a shared condition"""
++    def __init__(self): self._l = threading.Lock(); self.acquire, self.release = self._l.acquire, self._l.release
++    def __enter__(self): self._l.acquire()
++    def __exit__(self, *a): self._l.release()
++
++
+ class Event(Obj):
+     kind = 'event'
+-    def __init__(self, signaled=False, auto=False): super().__init__(); self.signaled, self.auto = signaled, auto
++    def __init__(self, signaled=False, auto=False): super().__init__(); self.signaled, self.auto, self.waiters = signaled, auto, []
+ 
+ 
+ class KThread(Obj):
+@@ -50,6 +57,7 @@ class KThread(Obj):
+         self.hz, self.entry, self.arg, self.stack_top, self.priority, self.tlr = hz, entry, arg, stack_top, priority, tlr
+         self.tid, self.handle = next(self._ids), 0
+         self.done, self.started, self.granted, self.signaled, self.tag, self.result = False, False, False, False, 0, None
++        self.wake, self.waiters = threading.Event(), []   # wake: set by whoever hands this thread what it waits for; waiters: the threads in a WaitSynchronization on this one
+ 
+     def start(self):
+         if self.started: return
+@@ -68,7 +76,7 @@ class KThread(Obj):
+                 hz.thread_faults.append((self.tid, self.result['fault']))
+         finally:
+             with hz.cv:
+-                self.done = True; hz.cv.notify_all()
++                self.done = True; hz.wake_all(self.waiters)
+ 
+ 
+ class Session(Obj):
+@@ -239,13 +247,28 @@ class Horizon:
+         before = list(r[:4])
+         if self.ring is not None and name in ('WaitProcessWideKeyAtomic', 'SignalProcessWideKey', 'ArbitrateLock', 'ArbitrateUnlock'): self.ring.append((time.monotonic(), self.current().tid if self.current() else 1, name, before[0], before[1], before[2], before[3]))
+         t = self.current(); self.thread_state[t.tid if t else 1] = (name, orig, r[29], r[30], time.monotonic())   # where each guest thread last entered the kernel: the report shows who waits on what
++        t0 = time.monotonic() if self.svc_prof is not None else 0.0
+         try: f(r)
+         except AssertionError as e:   # a guest address the kernel cannot read or write: the call fails, as it does on the device, instead of raising inside the guest's thread
+             self.invalid = getattr(self, 'invalid', 0) + 1
+             if self.invalid <= 5: self.log(f'{name}: invalid guest address ({e}) at {orig:#x} x0..x2={before[0]:#x},{before[1]:#x},{before[2]:#x}; {self.where(r)}')
+             r[0] = R_INVALID_ADDRESS
++        if self.svc_prof is not None:
++            dt = time.monotonic() - t0
++            if dt > 0.0005:   # a call that blocked or took long: the site is looked up only then
++                k = (name, ' <- '.join(x.split(' ')[0] + (' ' + x.split(' ')[1] if ' ' in x else '') for x in self.where(r, 5).split(' <- ')))
++                with self.svc_prof_lock:
++                    e = self.svc_prof.setdefault(k, [0, 0.0]); e[0] += 1; e[1] += dt
+         if self.verbose: self.log(f'{name}({", ".join(hex(x) for x in before)}) -> {r[0]:#x} {r[1]:#x}')
+ 
++    def svc_profile_report(self, top=25):
++        """NX2LINUX_SVC_PROFILE=1: the kernel calls that blocked or took over 0.5 ms, by call site, with the time the threads spent in them"""
++        if self.svc_prof is None: return
++        with self.svc_prof_lock: items = sorted(self.svc_prof.items(), key=lambda kv: -kv[1][1])
++        tot = sum(v[1] for _, v in items)
++        print(f'svc profile: {tot:.1f} s of thread time in {sum(v[0] for _, v in items)} slow calls')
++        for (name, site), (n, sec) in items[:top]: print(f'  {sec:8.2f} s {n:7d}x  {name}: {site[:400]}')
++
+     # ---- memory ----
+     def svc_SetHeapSize(self, r):
+         size = r[1]
+@@ -361,7 +384,8 @@ class Horizon:
+     THREAD_REGIONS = 0x7_0000_0000
+ 
+     def _init_kernel(self):
+-        self.cv = threading.Condition()
++        self.cv = KernelLock()
++        self.svc_prof, self.svc_prof_lock = ({} if os.environ.get('NX2LINUX_SVC_PROFILE') else None), threading.Lock()
+         self.local = threading.local()
+         self.threads, self.mutex_waiters, self.key_waiters = {}, {}, {}
+         self._tlr_next = 0
+@@ -370,6 +394,18 @@ class Horizon:
+     def current(self):
+         return getattr(self.local, 'thread', None)
+ 
++    def park(self, me, timeout=None):
++        """Sleep until another thread wakes this one (its `wake` event) or the timeout ends, with self.cv released meanwhile; the caller holds self.cv and checks its condition again afterwards.
++        Whoever changes what a thread waits for sets that one thread's event, so a signal wakes the threads concerned and not every waiter of the process"""
++        me.wake.clear()
++        self.cv.release()
++        try: me.wake.wait(timeout)
++        finally: self.cv.acquire()
++
++    @staticmethod
++    def wake_all(threads):
++        for t in threads: t.wake.set()
++
+     SCRATCH_BASE = 0x9_0000_0000
+     SCRATCH_SIZE = 0x20000
+ 
+@@ -421,14 +457,24 @@ class Horizon:
+         ptr, n, timeout = r[1], r[2] & 0xFFFFFFFF, r[3]
+         hs = struct.unpack(f'<{n}I', self.rd(ptr, 4 * n)) if n else ()
+         deadline = None if timeout >= (1 << 63) or timeout == M64 else time.monotonic() + timeout / 1e9
++        me = self.current() or self.main_thread_obj
+         with self.cv:
+-            while True:
+-                for i, h in enumerate(hs):
+-                    o = self.handles.get(h)
+-                    if o is None: r[0] = R_INVALID_HANDLE; return
+-                    if self._ready(o): self._take(o); r[0], r[1] = OK, i; return
+-                if deadline is not None and time.monotonic() >= deadline: r[0] = R_TIMEOUT; return
+-                self.cv.wait(None if deadline is None else max(0.0, deadline - time.monotonic()))
++            registered = []
++            try:
++                while True:
++                    for i, h in enumerate(hs):
++                        o = self.handles.get(h)
++                        if o is None: r[0] = R_INVALID_HANDLE; return
++                        if self._ready(o): self._take(o); r[0], r[1] = OK, i; return
++                    if deadline is not None and time.monotonic() >= deadline: r[0] = R_TIMEOUT; return
++                    if not registered:   # the objects that can become ready wake this thread from now on
++                        for h in hs:
++                            w = getattr(self.handles.get(h), 'waiters', None)
++                            if w is not None and me not in w: w.append(me); registered.append(w)
++                    self.park(me, None if deadline is None else max(0.0, deadline - time.monotonic()))
++            finally:
++                for w in registered:
++                    if me in w: w.remove(me)
+ 
+     def svc_ResetSignal(self, r):
+         o = self.handles.get(r[0])
+@@ -443,9 +489,13 @@ class Horizon:
+         o = self.handles.get(r[0])
+         if not isinstance(o, Event): r[0] = R_INVALID_HANDLE; return
+         with self.cv:
+-            o.signaled = True; self.cv.notify_all()
++            o.signaled = True; self.wake_all(o.waiters)
+         r[0] = OK
+ 
++    def signal_event(self, o):
++        """Signal an event from the host (the audio tick and the like)"""
++        with self.cv: o.signaled = True; self.wake_all(o.waiters)
++
+     def svc_CreateEvent(self, r):   # -> (writable handle, readable handle) of one event
+         e = Event(); r[1] = self.new_handle(e); r[2] = self.new_handle(e); r[0] = OK
+ 
+@@ -459,8 +509,7 @@ class Horizon:
+             v = self.rd32(addr)
+             if self.cas32(addr, v, new) == v: break
+         if t:
+-            t.granted = True
+-            self.cv.notify_all()
++            t.granted = True; t.wake.set()
+ 
+     def _lock(self, addr, tag, owner=None):
+         """Take the mutex word, or wait until an unlock hands it to this thread (caller holds self.cv)"""
+@@ -475,7 +524,7 @@ class Horizon:
+                 if self.cas32(addr, v, v | self.LISTENERS) != v: continue
+             me.granted, me.tag = False, tag
+             self.mutex_waiters.setdefault(addr, []).append(me)
+-            while not me.granted: self.cv.wait()
++            while not me.granted: self.park(me)
+             return
+ 
+     def svc_ArbitrateLock(self, r):   # (owner thread handle, mutex addr, requesting thread's tag)
+@@ -486,7 +535,7 @@ class Horizon:
+             me = self.current() or self.main_thread_obj
+             me.granted, me.tag = False, tag
+             self.mutex_waiters.setdefault(addr, []).append(me)
+-            while not me.granted: self.cv.wait()
++            while not me.granted: self.park(me)
+         r[0] = OK
+ 
+     def svc_ArbitrateUnlock(self, r):
+@@ -506,7 +555,7 @@ class Horizon:
+                 if deadline is not None and time.monotonic() >= deadline:
+                     if me in self.key_waiters.get(key, []): self.key_waiters[key].remove(me)
+                     result = R_TIMEOUT; break
+-                self.cv.wait(None if deadline is None else max(0.0, deadline - time.monotonic()))
++                self.park(me, None if deadline is None else max(0.0, deadline - time.monotonic()))
+             self._lock(mutex, tag)
+         r[0] = result
+ 
+@@ -516,8 +565,7 @@ class Horizon:
+         with self.cv:
+             q = self.key_waiters.get(key, [])
+             for t in (q[:] if count == 0 else q[:count]):
+-                q.remove(t); t.signaled = True
+-            self.cv.notify_all()
++                q.remove(t); t.signaled = True; t.wake.set()
+         r[0] = OK
+ 
+     def svc_CreateThread(self, r):   # (entry, arg, stack top, priority, core) -> handle
+diff --git a/dm/tools/horizon_oe.py b/dm/tools/horizon_oe.py
+index bda57d5..86a4812 100644
+--- a/dm/tools/horizon_oe.py
++++ b/dm/tools/horizon_oe.py
+@@ -1,6 +1,6 @@
+ """nn::oe (the applet environment) on the Linux host (NX2Linux S7bis): the Python side of engine/dm/host/hle_oe.c. The recompiled game asks the SDK for the operation mode, focus, language and region;
+ the SDK would ask the am/apm/set services, so these functions are replaced with host answers. Settings come from the environment: NX2LINUX_OPMODE (1 docked, the default; 0 handheld), NX2LINUX_LANG (default en-US)."""
+-import os, struct
++import threading, os, struct
+ 
+ from horizon_overrides import hle
+ 
+@@ -57,8 +57,7 @@ def try_pop(hz, r): r[0] = 0
+ 
+ @hle('_ZN2nn2oe22PopNotificationMessageEv', 'system notification queue (blocking): nothing ever arrives, the thread waits')
+ def pop_blocking(hz, r):
+-    with hz.cv:
+-        while True: hz.cv.wait()
++    threading.Event().wait()   # nothing ever arrives
+ 
+ 
+ @hle('_ZN2nn2oe18GetDesiredLanguageEv', 'system language query; nn::settings::LanguageCode, 8 bytes in x0')
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 212e823..01d6d4b 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -43,6 +43,7 @@ def main():
+     def report():
+         print('frames presented:', getattr(hz, 'frames_presented', 0), '| svc calls:', hz.stats, '| not translated functions called:', hz.aot.stat('unlifted_calls'))
+         if hasattr(hz, 'nvn'): hz.nvn.pull_stats()
++        hz.svc_profile_report()
+         if hasattr(hz, 'nvn'): print('nvn:', hz.nvn.stats, '| not implemented NVN calls:', sorted(hz.nvn.unimpl)[:60])
+         if hasattr(hz, 'nvn'): print('NVN calls (most frequent):', sorted(hz.nvn.all_calls().items(), key=lambda kv: -kv[1])[:30])
+         if hasattr(hz, 'nvn'): print('NVN queue/window/recording calls:', {k: v for k, v in hz.nvn.all_calls().items() if any(x in k for x in ('Queue', 'Window', 'Recording', 'Commands', 'Sync'))})
+diff --git a/dm/tools/tests/test_horizon_hle.py b/dm/tools/tests/test_horizon_hle.py
+index 7ecf675..8e1d0da 100644
+--- a/dm/tools/tests/test_horizon_hle.py
++++ b/dm/tools/tests/test_horizon_hle.py
+@@ -144,6 +144,61 @@ class Sync(unittest.TestCase):
+         self.assertEqual(out, [0])
+ 
+ 
++class TargetedWakeups(unittest.TestCase):
++    """A signal wakes the threads that wait for it and no others: every thread parks on an event of its own"""
++    def call(self, hz, num, *args):
++        r = [0] * 31
++        for i, a in enumerate(args): r[i] = a
++        hz.svc(num, r, 0); return r
++
++    def run_thread(self, hz, fn):
++        import threading
++        def body(): hz.local.thread = hh.KThread(hz, 0, 0, 0, 44, 0); fn()
++        t = threading.Thread(target=body, daemon=True); t.start(); return t
++
++    def test_signal_wakes_only_the_waiters_of_that_key(self):
++        import time
++        hz, _ = make(); out = {}
++        hz.wr32(0x200, 0x22); hz.wr32(0x204, 0x23)
++        a = self.run_thread(hz, lambda: out.__setitem__('a', self.call(hz, 0x1c, 0x200, 0x300, 0x22, (1 << 64) - 1)[0]))
++        b = self.run_thread(hz, lambda: out.__setitem__('b', self.call(hz, 0x1c, 0x204, 0x310, 0x23, (1 << 64) - 1)[0]))
++        time.sleep(0.1); self.call(hz, 0x1d, 0x300, 1); a.join(2)
++        self.assertEqual(out, {'a': 0}); self.assertTrue(b.is_alive())
++        self.call(hz, 0x1d, 0x310, 1); b.join(2); self.assertEqual(out, {'a': 0, 'b': 0})
++
++    def test_wait_synchronization_returns_when_the_event_is_signaled(self):
++        import time
++        hz, aot = make(); r = self.call(hz, 0x45); w = r[1]
++        aot.mem[0x100:0x104] = struct.pack('<I', w); out = []
++        t = self.run_thread(hz, lambda: out.append(self.call(hz, 0x18, 0, 0x100, 1, (1 << 64) - 1)[:2]))
++        time.sleep(0.1); self.assertEqual(out, [])
++        self.call(hz, 0x11, w); t.join(2); self.assertEqual(out, [[0, 0]])
++        self.assertEqual(hz.handles[w].waiters, [])   # the waiter took itself off the list
++
++    def test_wait_synchronization_reports_which_of_two_events_and_times_out(self):
++        import time
++        hz, aot = make(); e1, e2 = self.call(hz, 0x45)[1], self.call(hz, 0x45)[1]
++        aot.mem[0x100:0x108] = struct.pack('<II', e1, e2); out = []
++        t = self.run_thread(hz, lambda: out.append(self.call(hz, 0x18, 0, 0x100, 2, (1 << 64) - 1)[:2]))
++        time.sleep(0.1); self.call(hz, 0x11, e2); t.join(2)
++        self.assertEqual(out, [[0, 1]])
++        r = self.call(hz, 0x18, 0, 0x100, 1, 2_000_000)   # e1 is not signaled: the wait ends by timeout
++        self.assertEqual(r[0], hh.R_TIMEOUT); self.assertEqual(hz.handles[e1].waiters, [])
++
++    def test_a_host_signal_wakes_a_waiter(self):
++        import time
++        hz, aot = make(); w = self.call(hz, 0x45)[1]; aot.mem[0x100:0x104] = struct.pack('<I', w); out = []
++        t = self.run_thread(hz, lambda: out.append(self.call(hz, 0x18, 0, 0x100, 1, (1 << 64) - 1)[0]))
++        time.sleep(0.1); hz.signal_event(hz.handles[w]); t.join(2); self.assertEqual(out, [0])
++
++    def test_an_auto_reset_event_lets_one_of_two_waiters_through(self):
++        import time
++        hz, aot = make(); e = hh.Event(auto=True); w = hz.new_handle(e); aot.mem[0x100:0x104] = struct.pack('<I', w); out = []
++        ts = [self.run_thread(hz, lambda: out.append(self.call(hz, 0x18, 0, 0x100, 1, (1 << 64) - 1)[0])) for _ in range(2)]
++        time.sleep(0.1); self.call(hz, 0x11, w); time.sleep(0.2)
++        self.assertEqual(out, [0]); self.call(hz, 0x11, w); [t.join(2) for t in ts]; self.assertEqual(out, [0, 0])
++
++
+ class Ipc(unittest.TestCase):
+     def connect(self, hz):
+         r = [0] * 31; hz.aot.mem[0x200:0x204] = b'sm:\0'; r[1] = 0x200

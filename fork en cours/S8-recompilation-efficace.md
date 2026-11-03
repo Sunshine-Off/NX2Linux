@@ -89,3 +89,11 @@ L'échantillonnage gdb du thread de rejeu avait montré que **44 % de son temps 
 - `NX2LINUX_NVN_REPLAY=py` rétablit le rejeu en Python.
 
 Mesure (100 s, deux essais chacun) : **446 et 455 images contre 357 et 364 en Python (+25 %)**. Le thread de rejeu est maintenant inactif 49 % du temps et le jeu n'attend plus que 3 s sur 100 la présentation : **le goulot est passé du côté du jeu**.
+
+## 9. Le goulot côté jeu : les réveils entre threads (patch 0094)
+
+`NX2LINUX_SVC_PROFILE=1` chronomètre les appels noyau qui bloquent plus de 0,5 ms, par site d'appel. Sur la cinématique d'ouverture (110 s) : la mise à jour du jeu (`fw::Framework::update`) attend huit fois par passage la fin du pool de threads d'animation (`anm::ThreadPool::waitForCompletion`), ≈ 2 500 passages × ≈ 1,7 ms par attente, soit ≈ 35 s, alors que le travail du pool est minuscule. Cause : tous les threads attendaient sur **une seule condition** et chaque signal faisait `notify_all` ; `SignalProcessWideKey` prenait 1,85 ms par appel (les ≈ 38 threads du jeu se réveillaient, se disputaient le verrou et le GIL).
+
+Correctif : un verrou pour l'état du noyau, mais chaque thread qui attend se parque sur **un événement à lui** (`Hle.park`) ; le déverrouillage d'un mutex, le signal d'une clé, le signal d'un événement et la fin d'un thread ne réveillent que les threads concernés. Six tests (clé A ne réveille pas B, attente de plusieurs événements, délai, événement à remise à zéro automatique, signal venu de l'hôte).
+
+Mesure (même scénario, 110 s) : **339 images avant, 1 407 après (×4,1)**. Un run de 280 s donne 3 398 images (≈ 12 images par seconde de moyenne depuis le démarrage), sans thread arrêté ni erreur de rappel.
