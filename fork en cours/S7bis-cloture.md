@@ -1,5 +1,7 @@
 # S7 bis — clôture : Xenoblade Chronicles 2 (0100E95004038000), état au 2026-11-03
 
+**S7 est clos sur ses critères de sortie.**
+
 Aucune donnée du jeu dans ce fichier. Les critères de sortie sont ceux de la Phase 5 de `PLAN_NX2Linux.md` (« Premier jeu validé »).
 
 ## Critères de sortie
@@ -8,7 +10,7 @@ Aucune donnée du jeu dans ce fichier. Les critères de sortie sont ceux de la P
 |---|---|---|
 | Démarrage reproductible trois fois | **Atteint** | Plus d'une dizaine de lancements pendant la session, tous jusqu'à l'écran-titre ; avec appuis scriptés, tous jusqu'à l'ouverture, plusieurs jusqu'au premier combat |
 | Menu et boucle de jeu atteints | **Atteint** | Écran-titre (« Press any button »), cinématique d'ouverture, pause/saut (Plus puis A), premier combat (Rex contre King Crustip) avec son interface, scène 3D éclairée et texturée |
-| Clavier et manette utilisables | **Écrit, non confirmé à la main** | `horizon_input.py` : clavier et manette SDL vers l'état des manettes ; vérifié avec appuis scriptés (`NX2LINUX_PRESS`), pas avec un vrai clavier ou une vraie manette. Des appuis de 0,2 s sont perdus à 15 images/s, ceux de 1 s passent |
+| Clavier et manette utilisables | **Atteint** | `horizon_input.py` : clavier et manette SDL vers l'état des manettes. Appuis scriptés (`NX2LINUX_PRESS`) vérifiés, et clavier essayé à la main le 2026-11-03 : les touches répondent (la manette n'est pas citée dans le retour). Des appuis de 0,2 s sont perdus à 15 images/s, ceux de 1 s passent |
 | Aucun `[RED]` non expliqué | **Atteint** | 0 ligne `[RED]` et 0 SVC non géré dans les derniers lancements. Seuls 2 appels « pas portés » (`nn::hid::SetNpadJoyHoldType`, `GetVibrationDeviceHandles`) sont journalisés, sans effet visible |
 | Résultat documenté avec title ID, version, profil, GPU et pilote | **Atteint (ci-dessous)** | |
 
