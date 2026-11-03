@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Tue, 3 Nov 2026 17:30:50 +0100
+Subject: [PATCH] aot: guest memory accesses inline in the recompiled code
+ (AOT_INLINE_MEM=1)
+
+The guest address space is one 2^37-byte reservation (nx2_gbase) and a region at guest address A is mapped at nx2_gbase + A. With AOT_INLINE_MEM=1 (not with the JIT, whose write hook must see every store) each lifted function gets its own always-inline __remill_read/write_memory_* as an add and a volatile load or store, instead of a call that searches the region table and counts. An address no region covers faults; a SIGSEGV handler inside the span turns that into the explicit error of the region check (without the size and direction). The accesses are not counted in this mode. Every object is built again: the cache keys carry the mode.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: the accessors were most of the CPU time the recompiled code still takes
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+---
+ dm/tools/aot_lift.py              | 31 +++++++++++++++++++---
+ dm/tools/aot_runtime.cpp          | 43 ++++++++++++++++++++++++++++---
+ dm/tools/tests/test_aot_memory.py |  4 ++-
+ 3 files changed, 70 insertions(+), 8 deletions(-)
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index 9decbbe..c1a1988 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -114,6 +114,26 @@ def lift_function(code, address, ll, entry=None):
+ 
+ _counter = itertools.count()
+ 
++_ACCESS = {'8': 'i8', '16': 'i16', '32': 'i32', '64': 'i64', 'f32': 'float', 'f64': 'double'}
++
++
++def inline_accessors(ll):
++    """Replace the declarations of the __remill_read/write_memory_* intrinsics in a lifted function by definitions that are always inlined: a guest address is an offset into the one reservation the runtime
++    makes (nx2_gbase in aot_runtime.cpp), so an access is an add and a load or store. The accesses are volatile: the compiler may neither merge nor hoist them (a spin on a plain load, as on hardware).
++    An address no region covers faults, and the runtime's SIGSEGV handler gives the explicit error"""
++    text = Path(ll).read_text()
++    defs = []
++    def drop(m):
++        kind, n = m.group(1), m.group(2)
++        t = _ACCESS[n]
++        if kind == 'read':
++            defs.append(f'define internal {t} @__remill_read_memory_{n}(ptr noundef %m, i64 noundef %a) alwaysinline nounwind {{\n  %b = load ptr, ptr @nx2_gbase, align 8\n  %p = getelementptr i8, ptr %b, i64 %a\n  %v = load volatile {t}, ptr %p, align 1\n  ret {t} %v\n}}\n')
++        else:
++            defs.append(f'define internal ptr @__remill_write_memory_{n}(ptr noundef %m, i64 noundef %a, {t} noundef %v) alwaysinline nounwind {{\n  %b = load ptr, ptr @nx2_gbase, align 8\n  %p = getelementptr i8, ptr %b, i64 %a\n  store volatile {t} %v, ptr %p, align 1\n  ret ptr %m\n}}\n')
++        return ''
++    text = re.sub(r'^declare [^\n]*@__remill_(read|write)_memory_(8|16|32|64|f32|f64)\(.*\n', drop, text, flags=re.M)
++    if defs: Path(ll).write_text(text + '\n@nx2_gbase = external hidden global ptr\n' + ''.join(defs))
++
+ 
+ _toolkey = None
+ 
+@@ -153,7 +173,7 @@ def needs_symbols(path, symbols):
+ 
+ 
+ class Aot:
+-    def __init__(self, functions, tmp=None, jit=False, jit_entries=0, jit_ticks=0, jit_depth=8, stub_unliftable=False, jobs=None, cache=None, overrides=()):
++    def __init__(self, functions, tmp=None, jit=False, jit_entries=0, jit_ticks=0, jit_depth=8, stub_unliftable=False, jobs=None, cache=None, overrides=(), inline_mem=None):
+         """functions: [(address, bytes)] or [(entry address, bytes, address of the first byte)]: the three-item form lifts from an entry inside the bytes (the targets of a jump table, jump_tables.py).
+         Builds and loads the library. LiftError / LinkError otherwise.
+         stub_unliftable: a function Remill cannot lift, or whose code needs a runtime symbol that is not defined (svc...), no longer fails the build: it gets a stub `sub_<address>` (so that its direct
+@@ -167,13 +187,15 @@ class Aot:
+         d = tmp or self.dir.name
+         n = next(_counter)
+         functions = [(f[0], f[1], f[2] if len(f) > 2 else f[0]) for f in functions]
++        if inline_mem is None: inline_mem = os.environ.get('AOT_INLINE_MEM', '0') == '1'
++        inline_mem = inline_mem and not jit   # the JIT's write hook must see every store
+         replaced = set(overrides)   # functions the host replaces: not lifted, their stub calls the host function registered at the address (register_import)
+         functions = [f for f in functions if not (f[0] == f[2] and f[0] in replaced)]
+         lls, self.unlifted = {}, {}
+         cache = cache or os.environ.get('AOT_CACHE') or None
+         self.cache_hits = self.cache_misses = 0
+         if cache:
+-            tk = toolchain_key()
++            tk = toolchain_key() + ('|inline' if inline_mem else '')
+             fkeys = {a: hashlib.sha256(f'{tk}|{a:x}|{o:x}|'.encode() + c).hexdigest() for a, c, o in functions}
+             runtime = ''.join(hashlib.sha256(Path(HERE / f).read_bytes()).hexdigest() for f in ('aot_runtime.cpp', 'aot_runtime.h') + (('aot_jit.cpp',) if jit else ()))
+             key0 = hashlib.sha256(f'{tk}|{int(jit)}|{int(stub_unliftable)}|{runtime}|{os.environ.get("DYNARMIC_DIR") if jit else ""}|{sorted(replaced)}|'.encode() + ''.join(sorted(fkeys.values())).encode()).hexdigest()
+@@ -187,7 +209,10 @@ class Aot:
+         def lift_item(item):
+             addr, code, origin = item
+             ll = os.path.join(d, f'f{n}_{addr:x}.ll')
+-            try: lift_function(code, origin, ll, addr if addr != origin else None); return addr, ll, None
++            try:
++                lift_function(code, origin, ll, addr if addr != origin else None)
++                if inline_mem: inline_accessors(ll)
++                return addr, ll, None
+             except LiftError as e: return addr, ll, e
+         def compile_ll(ll, obj):
+             r = subprocess.run(['clang++', '-c', '-O2', '-fPIC', '-Wno-override-module', ll, '-o', obj], capture_output=True, text=True, errors='replace')
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index ec80ba2..a832ea5 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -16,6 +16,8 @@
+ #include <ctime>
+ #include <mutex>
+ #include <vector>
++#include <csignal>
++#include <sys/mman.h>
+ 
+ struct AotEntry { uint64_t addr; AotFn fn; };
+ extern "C" const AotEntry aot_table[];   // generated by aot_lift.py, sorted by address
+@@ -35,6 +37,13 @@ namespace {
+ enum { MAX_REGIONS = 512 };
+ struct Region { std::atomic<uint64_t> base, size; uint8_t *host; };
+ Region g_regions[MAX_REGIONS];
++// The guest address space is one reservation of 2^37 bytes: a region at guest address A lives at nx2_gbase + A, so the lifted code can reach it with one add (aot_lift.py, inline_mem: the accessors are
++// defined inside each function). Nothing mapped is PROT_NONE, an access there faults and the handler below turns the fault into the same explicit error as an access outside every region.
++enum : uint64_t { SPAN = 1ull << 37, PAGE = 4096 };
++}
++extern "C" __attribute__((visibility("hidden"))) uint8_t *nx2_gbase;
++uint8_t *nx2_gbase = (uint8_t *)mmap(nullptr, SPAN, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++namespace {
+ std::atomic<unsigned> g_nregions;
+ std::mutex g_regions_mu;
+ thread_local jmp_buf *g_jb;
+@@ -57,12 +66,30 @@ inline void count_read() { mem_counts().reads++; }
+ inline void count_write() { mem_counts().writes++; }
+ 
+ [[noreturn]] void fail(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++void segv(int, siginfo_t *si, void *);
++
+ [[noreturn]] void fail(const char *fmt, ...) {
+     va_list ap; va_start(ap, fmt); vsnprintf(g_err, sizeof g_err, fmt, ap); va_end(ap);
+     if (!g_jb) { fprintf(stderr, "[RED] aot: %s (outside aot_run)\n", g_err); abort(); }
+     longjmp(*g_jb, 1);
+ }
+ 
++// A fault inside the guest span is a guest access to an address no region covers: the same explicit error as guest() gives. Any other fault is the host's own and goes on to crash.
++void segv(int, siginfo_t *si, void *) {
++    const uintptr_t f = (uintptr_t)si->si_addr, g = (uintptr_t)nx2_gbase;
++    if (g_jb && f >= g && f - g < SPAN) {
++        snprintf(g_err, sizeof g_err, "guest access at %#llx is outside every mapped region", (unsigned long long)(f - g));
++        longjmp(*g_jb, 1);
++    }
++    signal(SIGSEGV, SIG_DFL);   // the access is repeated and kills the process with the default action
++}
++void install_segv() {   // by every thread's first run: another library (the GPU driver) may have installed its own handler since
++    struct sigaction cur; sigaction(SIGSEGV, nullptr, &cur);
++    if ((cur.sa_flags & SA_SIGINFO) && cur.sa_sigaction == segv) return;
++    struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = segv; sa.sa_flags = SA_SIGINFO | SA_NODEFER; sigemptyset(&sa.sa_mask);
++    sigaction(SIGSEGV, &sa, nullptr);
++}
++
+ uint8_t *guest(uint64_t a, uint64_t n, const char *what) {
+     static thread_local unsigned last = 0;   // most accesses hit the region the previous one did (the stack, the heap): look there first
+     if (last < MAX_REGIONS) { const Region &r = g_regions[last]; const uint64_t base = r.base, size = r.size; if (a >= base && n <= size && a - base <= size - n && size) return r.host + (a - base); }
+@@ -264,8 +291,14 @@ int aot_try_map(uint64_t base, uint64_t size) {
+     unsigned n = g_nregions.load();
+     if (n == MAX_REGIONS || !size || size > UINT64_MAX - base) return 1;
+     for (unsigned i = 0; i < n; i++) { const uint64_t b = g_regions[i].base, z = g_regions[i].size; if (z && base < b + z && b < base + size) return 1; }
+-    uint8_t *host = (uint8_t *)calloc(1, size);
+-    if (!host) return 1;
++    const uint64_t lo = base & ~(PAGE - 1), hi = (base + size + PAGE - 1) & ~(PAGE - 1);
++    if (hi > SPAN || nx2_gbase == MAP_FAILED) return 1;
++    for (unsigned i = 0; i < n; i++) {   // two regions never share a page: the pages are what is mapped
++        const uint64_t b = g_regions[i].base, z = g_regions[i].size; if (!z) continue;
++        if (lo < ((b + z + PAGE - 1) & ~(PAGE - 1)) && (b & ~(PAGE - 1)) < hi) return 1;
++    }
++    if (mmap(nx2_gbase + lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) == MAP_FAILED) return 1;   // zeroed, and zeroed again over an old unmapped region
++    uint8_t *host = nx2_gbase + base;
+     g_regions[n].base = base; g_regions[n].size = size; g_regions[n].host = host;
+     g_nregions.store(n + 1, std::memory_order_release); g_stats[S_REGIONS]++;
+     return 0;
+@@ -276,14 +309,14 @@ void aot_map(uint64_t base, uint64_t size) {
+ // Unmap the region that starts at base (0, or 1 when there is none). Its host memory stays until aot_unmap_all: a guest thread may be in the middle of an access to it.
+ int aot_unmap(uint64_t base) {
+     std::lock_guard<std::mutex> g(g_regions_mu);
+-    for (unsigned i = 0, n = g_nregions.load(); i < n; i++) if (g_regions[i].size && g_regions[i].base == base) { g_regions[i].size = 0; return 0; }
++    for (unsigned i = 0, n = g_nregions.load(); i < n; i++) if (g_regions[i].size && g_regions[i].base == base) { const uint64_t lo = base & ~(PAGE - 1), hi = (base + g_regions[i].size + PAGE - 1) & ~(PAGE - 1); g_regions[i].size = 0; mprotect(nx2_gbase + lo, hi - lo, PROT_NONE); return 0; }
+     return 1;
+ }
+ void aot_unregister_imports();
+ void aot_unmap_all() {
+     aot_unregister_imports();
+     std::lock_guard<std::mutex> g(g_regions_mu);
+-    for (unsigned i = 0, n = g_nregions.load(); i < n; i++) { free(g_regions[i].host); g_regions[i].size = 0; g_regions[i].host = nullptr; }
++    for (unsigned i = 0, n = g_nregions.load(); i < n; i++) { const Region &r = g_regions[i]; const uint64_t lo = r.base & ~(PAGE - 1), hi = (r.base + (r.size.load() ? r.size.load() : 1) + PAGE - 1) & ~(PAGE - 1); mmap(nx2_gbase + lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0); g_regions[i].size = 0; g_regions[i].host = nullptr; }
+     g_nregions.store(0);
+ }
+ int aot_poke(uint64_t a, const uint8_t *src, uint64_t n) { jmp_buf jb, *outer = g_jb; g_jb = &jb; if (setjmp(jb)) { g_jb = outer; return 1; } memcpy(guest(a, n, "poke"), src, n); g_jb = outer; if (aot_write_hook) aot_write_hook(a, n); return 0; }
+@@ -329,6 +362,8 @@ void aot_stats_reset() { memset(g_stats, 0, sizeof g_stats); std::lock_guard<std
+ 
+ // Run the AOT function at pc on the registers of g; 0 when it returned, else 1 with the reason in err
+ int aot_run(Guest *g, uint64_t pc, char *err, uint64_t errn) {
++    static thread_local bool segv_ok = false;
++    if (!segv_ok) { install_segv(); segv_ok = true; }
+     State st; memset(&st, 0, sizeof st);
+ #define X(i) st.gpr.x##i.qword = g->x[i];
+     X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30)
+diff --git a/dm/tools/tests/test_aot_memory.py b/dm/tools/tests/test_aot_memory.py
+index 92c8b57..fe1d6ac 100644
+--- a/dm/tools/tests/test_aot_memory.py
++++ b/dm/tools/tests/test_aot_memory.py
+@@ -1,7 +1,7 @@
+ """T3, memory instruction by instruction: loads and stores of 8 to 64 bits, signed and unsigned, unaligned, with a scaled, unscaled, pre-indexed, post-indexed or register offset, and pairs, lifted by Remill, compiled to x86_64
+ (aot_lift.py) and compared with the Unicorn ARM64 reference on registers, NZCV and the whole guest memory. An access outside the guest memory is an explicit error (address, size, read or write); the reference faults too.
+ Each word is checked against Capstone's text first. Needs REMILL_BUILD, clang++ and unicorn; skipped otherwise."""
+-import itertools, struct, sys, unittest
++import os, itertools, struct, sys, unittest
+ from pathlib import Path
+ 
+ HERE = Path(__file__).resolve().parent
+@@ -73,6 +73,7 @@ class Memory(unittest.TestCase):
+                 self.assertLess(faulted, len(cases) // 10, f'{text}: too many cases leave the guest memory: they test nothing')
+             finally: aot.close()
+ 
++    @unittest.skipIf(os.environ.get('AOT_INLINE_MEM') == '1', 'inline accesses are not counted, and a fault does not know the size or the direction')
+     def test_stores_reach_the_memory(self):
+         """A guard against a comparison that passes because nothing is written: str x1,[x0] changes exactly the 8 bytes"""
+         aot = aot_lift.Aot([(ADDR, snippet(INSNS[0][0]))])
+@@ -85,6 +86,7 @@ class Memory(unittest.TestCase):
+             self.assertEqual((aot.stat('writes'), aot.stat('reads')), (1, 0))
+         finally: aot.close()
+ 
++    @unittest.skipIf(os.environ.get('AOT_INLINE_MEM') == '1', 'inline accesses are not counted, and a fault does not know the size or the direction')
+     def test_access_outside_the_guest_memory_is_an_explicit_error(self):
+         cases = [(DATA + DATA_SIZE - 4, 'write', 8, INSNS[0][0]),   # str x1,[x0]: 8 bytes, the last 4 beyond the region
+                  (DATA - 1, 'read', 8, INSNS[4][0]),                 # ldr x2,[x0] one byte below it

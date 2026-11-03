@@ -73,3 +73,4 @@
 0092-horizon-on-linux-where-the-queue-thread-and-the.patch
 0093-horizon-on-linux-the-draws-of-a-command-stream-a.patch
 0094-horizon-on-linux-a-signal-wakes-the-threads-that.patch
+0095-aot-guest-memory-accesses-inline-in-the-recompil.patch

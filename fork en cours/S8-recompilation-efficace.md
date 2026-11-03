@@ -97,3 +97,11 @@ Mesure (100 s, deux essais chacun) : **446 et 455 images contre 357 et 364 en Py
 Correctif : un verrou pour l'état du noyau, mais chaque thread qui attend se parque sur **un événement à lui** (`Hle.park`) ; le déverrouillage d'un mutex, le signal d'une clé, le signal d'un événement et la fin d'un thread ne réveillent que les threads concernés. Six tests (clé A ne réveille pas B, attente de plusieurs événements, délai, événement à remise à zéro automatique, signal venu de l'hôte).
 
 Mesure (même scénario, 110 s) : **339 images avant, 1 407 après (×4,1)**. Un run de 280 s donne 3 398 images (≈ 12 images par seconde de moyenne depuis le démarrage), sans thread arrêté ni erreur de rappel.
+
+## 10. Accès mémoire en ligne (patch 0095, `AOT_INLINE_MEM=1`)
+
+Échantillonnage gdb après le patch 0094 (25 instantanés, 1 250 échantillons de threads) : 97 % attendent ; sur les ≈ 39 qui tournent, les accesseurs `__remill_*_memory_*`, `__tls_get_addr` (compteurs par thread) et `feclearexcept` pèsent près de 70 %, le code recompilé lui-même presque rien.
+
+Le patch réserve tout l'espace invité (2^37 octets, `nx2_gbase`), place chaque région à `nx2_gbase + adresse`, et définit les accesseurs `alwaysinline` dans chaque fonction (add + accès `volatile`, pas de compteur). Un accès hors région fait un SIGSEGV que le gestionnaire convertit en l'erreur habituelle (sans taille ni sens). Pas avec le JIT.
+
+Recompilation complète : **1 430 s** (97 763 objets, cache de plus ≈ 12 Go). Mesure (110 s, trois essais alternés) : **1 710–1 734 images contre 1 587–1 600 (+8 %)**. Gain modeste, comme prévu : le jeu attend plus qu'il ne calcule. Reste opt-in.
