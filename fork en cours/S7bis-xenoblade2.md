@@ -1,5 +1,7 @@
 # S7 bis — Xenoblade Chronicles 2 (0100E95004038000)
 
+> **Mise à jour du 2026-11-03** : l'état ci-dessous est celui du 2026-11-02 (trames noires). Le jeu affiche maintenant le titre, l'ouverture et le premier combat éclairé : voir [S7bis-cloture.md](S7bis-cloture.md).
+
 Branche `swann/jalon-s7bis-xc2`, issue de `swann/jalon-s7-first-game`. Même objectif que S7 (un jeu qui tourne en x86_64), avec Xenoblade Chronicles 2. Aucune donnée du jeu n'est dans le dépôt : l'extraction va dans `~/.cache/nx2linux/extract/`, la recompilation dans `~/.cache/nx2linux/aot-xc2/` et `aot-cache/`, la chaîne Remill dans `~/.cache/nx2linux/toolchain/`.
 
 ## État (honnête)
