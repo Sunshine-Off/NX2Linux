@@ -15,3 +15,9 @@ patch	earlier patch	file
 0108-env-switches-the-table-lists-dm-font-cache-and.patch	0049-dm-framework-env-switch-row.patch	docs/env_switches.tsv
 0108-env-switches-the-table-lists-dm-font-cache-and.patch	0054-front-mac-start-with-the-pointer-hidden-when-the.patch	docs/env_switches.tsv
 0109-tests-the-apple-only-tests-are-skipped-off-macos.patch	0034-metal-a-newer-compiler-of-the-recorded-generatio.patch	dm/tools/tests/test_own_compilers.py
+0111-test-elf-module-the-switch-test-is-skipped-when.patch	0065-aot-elf-modules-and-a-manifest-instead-of-the-ma.patch	dm/tools/tests/test_elf_module.py
+0111-test-elf-module-the-switch-test-is-skipped-when.patch	0066-aot-validation-on-a-real-module-plt-split-lift-l.patch	dm/tools/tests/test_elf_module.py
+0111-test-elf-module-the-switch-test-is-skipped-when.patch	0067-aot-jump-tables-resolved-at-translation-time-tra.patch	dm/tools/tests/test_elf_module.py
+0111-test-elf-module-the-switch-test-is-skipped-when.patch	0072-elf-module-accept-8-byte-relocations-at-4-byte-a.patch	dm/tools/tests/test_elf_module.py
+0111-test-elf-module-the-switch-test-is-skipped-when.patch	0074-horizon-on-linux-svcs-ipc-and-sm-nn-init-start-b.patch	dm/tools/tests/test_elf_module.py
+0111-test-elf-module-the-switch-test-is-skipped-when.patch	0076-aot-host-overrides-of-sdk-functions-thread-exit.patch	dm/tools/tests/test_elf_module.py

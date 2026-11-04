@@ -89,3 +89,4 @@ file	class	note
 0108-env-switches-the-table-lists-dm-font-cache-and.patch	common	Table of DM_* switches, platform neutral
 0109-tests-the-apple-only-tests-are-skipped-off-macos.patch	common	Skips Apple-only tests off macOS. Helps every non-Mac runner
 0110-docs-linux-architecture-md-the-stages-the-host-t.patch	linux	by the paths it touches
+0111-test-elf-module-the-switch-test-is-skipped-when.patch	common	A test that needs Remill skips without it. Helps any runner without the toolchain
