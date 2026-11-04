@@ -12,6 +12,12 @@ python3 linux/cli/nx2linux.py verify --require-vulkan
 python3 linux/cli/nx2linux.py run
 ```
 
+`doctor` also checks that the interpreter of the engine workers imports `capstone`,
+`unicorn` and `lz4`. The workers run with `python3 -I`, which ignores the user site,
+so these packages must live in a venv. `tools/setup_toolchain.sh` makes it
+(`~/.cache/nx2linux/venv`, or `NX2_VENV`) from `tools/linux-requirements.txt` and
+exports `NX2_PYTHON` in `env.sh`.
+
 `verify` accepts a skipped Vulkan test by default so it can run in headless CI.
 `--require-vulkan` turns that skip into a failure, which is useful on a real
 desktop or GPU test runner.
