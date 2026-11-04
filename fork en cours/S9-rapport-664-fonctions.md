@@ -95,5 +95,5 @@ Mesures sur Xenoblade 2 (103 665 fonctions : main 49 909, subsdk0 13 379, sdk 27
 
 Écart trouvé en route : brancher `app_pool` / `mem_used` du profil sur `GetInfo` (types 6 et 7) fait échouer `mtl::MemManager::Region::addChild` au démarrage de Xenoblade 2. Ces deux clés décrivent la partition mémoire de l'hôte Mac ; l'hôte Linux garde ses totaux. Seuls `program_id` et `sys_resource` viennent du profil.
 
-Reste : l'ordre de chargement du profil (`main subsdk0 sdk`) n'a été exécuté qu'à travers le survey, pas encore par un lancement du jeu ; la liste des 243 fonctions « pas portées » n'est pas encore rapprochée de ce que le jeu appelle réellement (jalons D et E).
+Le jeu lancé avec l'ordre du profil (`main subsdk0 sdk`, sans `--order`, cache complet du nouveau Remill) : 507 trames présentées en 60 s, 637 fonctions non traduites au sens « remplacées », aucun arrêt. Reste : la liste des 243 fonctions « pas portées » n'est pas encore rapprochée de ce que le jeu appelle réellement (jalons D et E).
 
