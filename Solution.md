@@ -1,5 +1,7 @@
 # Solutions pour NX2Linux x86_64
 
+> **Status note (2026-11-04).** This is the plan written before the work. The decisions taken since are in `engine/docs/linux/architecture.md`: the host stays Python with C libraries (not a C `dm/host/linux/`), `tools/setup_toolchain.sh` is the official toolchain route, and `engine/` is synchronised, not tracked.
+
 ## Décision recommandée
 
 Retenir une architecture à frontend Qt partagé et backend Linux natif. Le frontend

@@ -51,6 +51,15 @@ It is a community fork of **[nxnative](https://github.com/seedds/nxnative)**, wh
 work (the code rewriter, the Horizon host, NVN on Metal and every game's profile); this fork adds the
 launcher and a short list of patches, and follows nxnative every day.
 
+## NX2Linux (Linux x86_64)
+
+This fork also carries NX2Linux, a Linux x86_64 port. It translates a game's ARM64 code ahead of time
+with Remill and LLVM (dynarmic as fallback) and runs it on a Python host with C libraries and a Vulkan
+renderer. It is a work in progress: Xenoblade Chronicles 2 reaches its first battle at about half the
+target frame rate, and there is no one click path from a game package to a running game yet. See
+`docs/linux/architecture.md` in the engine (`engine/docs/linux/architecture.md` after
+`python3 tools/engine.py sync`), and the Linux section of [BUILDING.md](BUILDING.md).
+
 ## Requirements
 
 - **An Apple silicon Mac.** The launcher opens on **macOS 13 or later**. Building needs Xcode with

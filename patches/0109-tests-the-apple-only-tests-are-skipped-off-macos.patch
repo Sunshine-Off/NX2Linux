@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 22:40:57 +0100
+Subject: [PATCH] Tests: the Apple-only tests are skipped off macOS, with the
+ reason
+
+PackReuse (renamex_np), the regress tests (libproc.dylib), the pinned spirv-cross
+(Mach-O, lipo) and check_metal (Xcode 27.1) fail on Linux for reasons that are not
+defects. They are skipped, not removed.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: Linux test suite: stale tests fixed, Apple-only tests skipped off macOS
+Issue: Sunshine-Off/NX2Linux#4
+
+---
+ dm/tools/tests/test_host_msl.py        |  1 +
+ dm/tools/tests/test_nsp_mac_app.py     |  1 +
+ dm/tools/tests/test_own_compilers.py   |  1 +
+ dm/tools/tests/test_regress.py         | 14 ++++++++++----
+ dm/tools/tests/test_spirv_cross_pin.py |  2 ++
+ 5 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/dm/tools/tests/test_host_msl.py b/dm/tools/tests/test_host_msl.py
+index 2c80a3e..6322376 100644
+--- a/dm/tools/tests/test_host_msl.py
++++ b/dm/tools/tests/test_host_msl.py
+@@ -123,6 +123,7 @@ class HostMSL(unittest.TestCase):
+         self.make('MACOS_MIN=26.7')
+         self.assertEqual(len(self.compiles()), 5)
+ 
++    @unittest.skipUnless(sys.platform == 'darwin', "scripts/regress.py loads macOS's /usr/lib/libproc.dylib")
+     def test_regress_cache_refreshes_shaders_before_reusing_a_host(self):
+         regress = script('regress')
+         self.host_dirs(regress.HOST_DIRS)
+diff --git a/dm/tools/tests/test_nsp_mac_app.py b/dm/tools/tests/test_nsp_mac_app.py
+index 958926b..e479a2d 100644
+--- a/dm/tools/tests/test_nsp_mac_app.py
++++ b/dm/tools/tests/test_nsp_mac_app.py
+@@ -101,6 +101,7 @@ class CloneProbe(unittest.TestCase):
+             self.assertEqual(sorted(p.name for p in (t / 'app').iterdir()), [])   # no probe left behind
+ 
+ 
++@unittest.skipUnless(sys.platform == 'darwin', "packs a macOS app: the real pack entry point replaces the bundle with macOS's renamex_np")
+ class PackReuse(unittest.TestCase):
+     """Call the real pack entry point; only external compiler, icon and signing tools are faked. No host is run."""
+     def setUp(self):
+diff --git a/dm/tools/tests/test_own_compilers.py b/dm/tools/tests/test_own_compilers.py
+index 7d08101..1d0e16e 100644
+--- a/dm/tools/tests/test_own_compilers.py
++++ b/dm/tools/tests/test_own_compilers.py
+@@ -145,6 +145,7 @@ class NspScript(unittest.TestCase):
+             nsp.check_metal(sys.executable, REPO, {})
+         run.assert_not_called()
+ 
++    @unittest.skipUnless(sys.platform == 'darwin', 'the real --check-metal needs Xcode 27.1, which only exists on macOS')
+     def test_check_metal_runs(self):   # the real tool with the real lock: exit 0 or 1 with the message, never a traceback (no Xcode: no compiler, which dmsh_build.py reports)
+         r = subprocess.run([sys.executable, str(REPO / 'dm/gfx/tools/own_compilers.py'), '--check-metal'], capture_output=True, text=True,
+                            env={k: v for k, v in os.environ.items() if k != own_compilers.ALLOW})
+diff --git a/dm/tools/tests/test_regress.py b/dm/tools/tests/test_regress.py
+index 4172002..90166ab 100644
+--- a/dm/tools/tests/test_regress.py
++++ b/dm/tools/tests/test_regress.py
+@@ -1,15 +1,19 @@
+ #!/usr/bin/env python3
+ # scripts/regress.py: the parts that need no game, GPU or git revision: the MSL interface reader (GitHub issue #283), the [RED] normalization, the routes, and the comparisons
+-import importlib.util, json, tempfile, unittest
++import importlib.util, json, sys, tempfile, unittest
+ from contextlib import ExitStack
+ from pathlib import Path
+ from types import SimpleNamespace as NS
+ from unittest.mock import patch
+ 
+ REPO = Path(__file__).resolve().parents[3]
+-spec = importlib.util.spec_from_file_location('regress', REPO / 'scripts/regress.py')
+-assert spec is not None and spec.loader is not None
+-regress = importlib.util.module_from_spec(spec); spec.loader.exec_module(regress)
++APPLE = sys.platform == 'darwin'   # scripts/regress.py loads macOS's /usr/lib/libproc.dylib when it is imported
++SKIP_REASON = "scripts/regress.py loads macOS's /usr/lib/libproc.dylib at import"
++regress = None
++if APPLE:
++    spec = importlib.util.spec_from_file_location('regress', REPO / 'scripts/regress.py')
++    assert spec is not None and spec.loader is not None
++    regress = importlib.util.module_from_spec(spec); spec.loader.exec_module(regress)
+ 
+ VS = '''struct main0_out
+ {
+@@ -49,6 +53,7 @@ fragment main0_out main0(main0_in in [[stage_in]], constant spvDescriptorSetBuff
+ '''
+ 
+ 
++@unittest.skipUnless(APPLE, SKIP_REASON)
+ class Regress(unittest.TestCase):
+     def test_impact_without_machine_paths(self):
+         env = {k: v for k, v in regress.os.environ.items() if k not in ('REGRESS_ROOT', 'REGRESS_GAMES')}
+@@ -533,6 +538,7 @@ class Regress(unittest.TestCase):
+             self.assertEqual(finish.call_args.args[0]['games']['game']['status'], 'NEW-FAIL')
+ 
+ 
++@unittest.skipUnless(APPLE, SKIP_REASON)
+ class Validated(unittest.TestCase):
+     """--record: dm/games/<id>/validated.tsv, the chain a game was last green on"""
+     def run_record(self, td, status, record=True, dirty=False, mode='quick', smoke=True, chain='aaaa11112222', runs=None, command='check', derived=False):
+diff --git a/dm/tools/tests/test_spirv_cross_pin.py b/dm/tools/tests/test_spirv_cross_pin.py
+index 9ca6ca3..6f6ca23 100644
+--- a/dm/tools/tests/test_spirv_cross_pin.py
++++ b/dm/tools/tests/test_spirv_cross_pin.py
+@@ -24,6 +24,7 @@ class Pin(unittest.TestCase):
+         with open(dmsh_chain.LOCK) as f: lock = dict(l.rstrip('\n').split('\t', 1) for l in f if '\t' in l and not l.startswith('#'))
+         self.assertEqual(lock['spirv-cross'], tool_lock.sha16(BIN / 'spirv-cross'))
+ 
++    @unittest.skipUnless(sys.platform == 'darwin', 'the pinned spirv-cross is a Mach-O binary')
+     def test_pinned_release_and_licences(self):
+         m = re.search(r'^TAG=(\S+)', (BIN / 'build.sh').read_text(), re.M)
+         assert m, 'build.sh pins no TAG'
+@@ -33,6 +34,7 @@ class Pin(unittest.TestCase):
+         self.assertTrue(os.access(BIN / 'spirv-cross', os.X_OK))
+         for f in ('LICENSE', 'LICENSES/Apache-2.0.txt', 'LICENSES/MIT.txt'): self.assertTrue((BIN / f).is_file(), f)
+ 
++    @unittest.skipUnless(sys.platform == 'darwin', 'lipo and the Mach-O binary exist on macOS only')
+     def test_universal(self):   # an Intel Mac runs it too, as the translator's launcher
+         r = subprocess.run(['lipo', '-archs', str(BIN / 'spirv-cross')], capture_output=True, text=True)
+         self.assertEqual(sorted(r.stdout.split()), ['arm64', 'x86_64'])

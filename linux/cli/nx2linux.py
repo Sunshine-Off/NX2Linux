@@ -48,11 +48,42 @@ def pkg_config(package: str) -> str | None:
     return tool_version(['pkg-config', '--modversion', package])
 
 
+WORKER_MODULES = ('capstone', 'unicorn', 'lz4')
+
+
+def worker_python() -> str:
+    """The interpreter of the engine workers: NX2_PYTHON, else the venv of tools/setup_toolchain.sh, else this one (same rule as module_validate.worker_python)."""
+    if os.environ.get('NX2_PYTHON'):
+        return os.environ['NX2_PYTHON']
+    venv = Path(os.environ.get('NX2_VENV') or Path.home() / '.cache' / 'nx2linux' / 'venv') / 'bin' / 'python'
+    return str(venv) if venv.exists() else sys.executable
+
+
+def missing_worker_modules(python: str) -> list[str]:
+    """The worker modules `python -I` cannot import (-I ignores the user site, as the workers do)."""
+    missing = []
+    for module in WORKER_MODULES:
+        try:
+            ok = subprocess.run([python, '-I', '-c', f'import {module}'], capture_output=True, timeout=30).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        if not ok:
+            missing.append(module)
+    return missing
+
+
 def doctor_report() -> dict[str, dict[str, str | bool]]:
     checks: dict[str, dict[str, str | bool]] = {}
 
     py = tool_version([sys.executable, '--version'])
     checks['python'] = {'ok': py is not None, 'detail': py or 'Python unavailable'}
+    worker = worker_python()
+    missing = missing_worker_modules(worker)
+    checks['worker-python'] = {
+        'ok': not missing,
+        'detail': f'{worker} imports {", ".join(WORKER_MODULES)}' if not missing
+        else f'{worker} cannot import {", ".join(missing)} (run tools/setup_toolchain.sh, it makes the venv)',
+    }
     checks['cmake'] = {'ok': shutil.which('cmake') is not None,
                        'detail': tool_version(['cmake', '--version']) or 'CMake unavailable'}
     checks['pkg-config'] = {'ok': shutil.which('pkg-config') is not None,
@@ -94,7 +125,7 @@ def print_doctor(report: dict[str, dict[str, str | bool]], as_json: bool) -> int
             else:
                 state = 'OPTIONAL'
             print(f'[{state:7}] {name}: {check["detail"]}')
-    required = ('python', 'cmake', 'pkg-config', 'sdl3', 'vulkan', 'egl', 'glslc')
+    required = ('python', 'worker-python', 'cmake', 'pkg-config', 'sdl3', 'vulkan', 'egl', 'glslc')
     return 0 if all(bool(report[name]['ok']) for name in required) else 1
 
 

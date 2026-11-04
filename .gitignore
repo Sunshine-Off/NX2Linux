@@ -39,6 +39,7 @@ frontend/NX2Apple.app/
 
 # The committed engine tree is gone (issue #214, step 2): dm/, scripts/, docs/ and ref/ live in engine/ (and upstream's AGENTS.md
 # there), so a stray copy at the root, from an older checkout or a direct edit, is never committed. CI's pr-scope check says why.
+/engine/
 /dm/
 /scripts/
 /docs/
@@ -47,3 +48,9 @@ frontend/NX2Apple.app/
 /ProdKeys.-v22.5.0/
 .Balatro [0100CD801CE5E000][USA][v0].nsp
 /engine/.git.backup/
+
+# Game packages: never commit a game (a teammate's NSP used to be excluded only by their local .git/info/exclude)
+*.nsp
+
+# Probe outputs (DmProbe.ipa and friends): built locally, never committed
+/probe-out/
