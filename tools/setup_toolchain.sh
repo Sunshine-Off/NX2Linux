@@ -5,7 +5,8 @@
 #   LLVM     the system one, checked against the version the work was validated with (22.x)
 # Usage: tools/setup_toolchain.sh [PREFIX]   (default: $NX2_TOOLCHAIN or ~/.cache/nx2linux/toolchain)
 # Needs: git cmake ninja clang clang++ llvm-config (system LLVM dev packages), and either the Boost headers or dnf + rpm2cpio (to unpack them without root).
-# Ends by writing PREFIX/env.sh, which exports REMILL_BUILD and DYNARMIC_DIR, and by printing a verification.
+# Also makes the Python venv of the workers ($NX2_VENV or ~/.cache/nx2linux/venv, packages in tools/linux-requirements.txt). The workers run with `python3 -I`, which ignores the user site.
+# Ends by writing PREFIX/env.sh, which exports REMILL_BUILD, DYNARMIC_DIR and NX2_PYTHON, and by printing a verification.
 set -euo pipefail
 
 REMILL_COMMIT=56918a8
@@ -75,11 +76,19 @@ for f in src/dynarmic/libdynarmic.a externals/mcl/src/libmcl.a externals/fmt/lib
   [ -e "build/$f" ] || die "dynarmic: build/$f is missing (aot_lift.py links it)"
 done
 
+say "Python venv (capstone, unicorn, lz4)"
+venv=$(realpath -m "${NX2_VENV:-$HOME/.cache/nx2linux/venv}")
+[ -x "$venv/bin/python" ] || python3 -m venv "$venv" || die "cannot create the venv $venv (Debian and Ubuntu need the python3-venv package)"
+"$venv/bin/python" -m pip install --quiet -r "$here/tools/linux-requirements.txt" || die "pip install failed in $venv"
+"$venv/bin/python" -I -c "import capstone, unicorn, lz4" || die "the venv $venv cannot import capstone, unicorn and lz4 with -I"
+echo "venv: $venv"
+
 say "env.sh"
 cat > "$prefix/env.sh" <<EOF
 # made by tools/setup_toolchain.sh: Remill @ $REMILL_COMMIT (+ patches), dynarmic @ $DYNARMIC_COMMIT, LLVM $llvm
 export REMILL_BUILD="$prefix/remill/build"
 export DYNARMIC_DIR="$prefix/dynarmic"
+export NX2_PYTHON="$venv/bin/python"
 ${boostinc:+export CPLUS_INCLUDE_PATH="$boostinc\${CPLUS_INCLUDE_PATH:+:\$CPLUS_INCLUDE_PATH}"}
 EOF
 cat "$prefix/env.sh"

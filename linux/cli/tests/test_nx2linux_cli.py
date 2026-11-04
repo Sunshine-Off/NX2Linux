@@ -31,6 +31,27 @@ class CliTests(unittest.TestCase):
         self.assertIn('vulkan', report)
         self.assertIn('xdg-state', report)
 
+    def test_worker_python_prefers_nx2_python_then_the_venv(self):
+        with patch.dict(os.environ, {'NX2_PYTHON': '/opt/py/bin/python'}, clear=False):
+            self.assertEqual(nx2linux.worker_python(), '/opt/py/bin/python')
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'bin').mkdir()
+            (Path(tmp) / 'bin' / 'python').write_text('')
+            env = {k: v for k, v in os.environ.items() if k != 'NX2_PYTHON'}
+            with patch.dict(os.environ, dict(env, NX2_VENV=tmp), clear=True):
+                self.assertEqual(nx2linux.worker_python(), str(Path(tmp) / 'bin' / 'python'))
+            with patch.dict(os.environ, dict(env, NX2_VENV=str(Path(tmp) / 'none'), HOME=tmp), clear=True):
+                self.assertEqual(nx2linux.worker_python(), sys.executable)
+
+    def test_doctor_reports_the_worker_modules(self):
+        with patch.object(nx2linux, 'missing_worker_modules', return_value=['capstone']):
+            check = nx2linux.doctor_report()['worker-python']
+        self.assertFalse(check['ok'])
+        self.assertIn('capstone', check['detail'])
+        self.assertIn('setup_toolchain.sh', check['detail'])
+        with patch.object(nx2linux, 'missing_worker_modules', return_value=[]):
+            self.assertTrue(nx2linux.doctor_report()['worker-python']['ok'])
+
     def test_build_dir_resolves_relative_to_repository(self):
         self.assertEqual(nx2linux.build_dir('build/test-cli'), ROOT / 'build' / 'test-cli')
 

@@ -1,0 +1,5 @@
+# Python packages of the NX2Linux workers (engine/dm/tools). The workers run with `python3 -I`, which ignores the
+# user site, so tools/setup_toolchain.sh installs these into a venv (default ~/.cache/nx2linux/venv, NX2_VENV overrides).
+capstone==5.0.9
+unicorn==2.1.4
+lz4==4.4.5

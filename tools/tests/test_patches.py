@@ -2,6 +2,7 @@
 chain rule read from the engine's AGENTS.md, and the engine sources that carry the fork's patch list. The series itself is
 applied and checked by tools/tests/test_engine.py. No game files, no network."""
 import importlib.util, os, shutil, subprocess, sys, tempfile, unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -120,7 +121,8 @@ class ApplySeries(unittest.TestCase):
         mkgit(self.wt, 'commit', '-q', '-am', 'upstream')
         text = '\n'.join('index 1234567..7654321 100644' if l.startswith('index ') else l for l in p.path.read_text().splitlines()) + '\n'
         p.path.write_text(text)
-        applied, landed, conflicts = P.apply_series(self.wt, [p])
+        with mock.patch.dict(os.environ, {'LC_ALL': 'C'}):   # the assertion below reads git's English message
+            applied, landed, conflicts = P.apply_series(self.wt, [p])
         self.assertEqual(([x.name for x, _ in applied], [x.name for x in landed]), ([], []))
         self.assertEqual([x.name for x, _ in conflicts], [p.name])
         self.assertIn('Patch failed', conflicts[0][1])

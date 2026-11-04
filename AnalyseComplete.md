@@ -1,5 +1,7 @@
 # Analyse complète de NX2Apple
 
+> **Status note (2026-11-04).** This analysis dates from 2026-10-31 and describes the repository before the Linux work: 36 patches, no recompiler, no Linux path. Today there are 89 patches, an ARM64 to x86_64 recompiler (Remill and LLVM with a dynarmic fallback) and a Vulkan renderer. For the current state read `engine/docs/linux/architecture.md` (after `python3 tools/engine.py sync`) and `RESTE_A_FAIRE.md`.
+
 ## Périmètre et méthode
 
 Analyse réalisée sur l’état du dépôt au 31 octobre 2026 et sur le commit upstream
