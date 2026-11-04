@@ -126,3 +126,26 @@ Reste, par gravité :
 5. Le mode `check` signale 0,9 % de dessins différents (même état, contenu d'un tampon différent) ; le même écart existait avant (premier écart à 13 s) : la mémoire du jeu change entre les deux passes. Non attribué plus précisément.
 6. Un parcours plus long (combat, ville, carte) n'est pas fait : les chiffres ci-dessus valent pour le parcours testé.
 
+## 9. Jalon E : audio, sauvegardes, vidéo (2026-11-04)
+
+**Audio** (patch moteur 0104 ; `linux/host/audio.c`, nouvelle bibliothèque `libnx2linux_audio.so`)
+- Avant : un tic réglé sur l'horloge, aucune sortie. Maintenant : chaque tic, les voix démarrées rééchantillonnent leurs tampons (interpolation linéaire, hauteur de la voix) vers les bus de leurs volumes de mixage ; les entrées du « device sink » font les canaux de sortie (stéréo directe, mono, 5.1 mixé en stéréo) ; le bloc part vers un périphérique SDL3, un fichier WAV (`NX2LINUX_AUDIO=wav:<fichier>`), ou nulle part (`null`, `off`). Les tampons d'`AudioOut` (PCM 16 bits stéréo) sont mixés dans la même sortie.
+- Formats : PCM 8 bits, 16 bits, flottant, et l'ADPCM DSP de Nintendo (décodé à la mise en file, coefficients donnés à l'acquisition de la voix, historique reporté d'un tampon à l'autre). Tout autre format laisse la voix muette, la compte et le dit une fois.
+- Mesure sur Xenoblade 2 (même parcours que le jalon D, 150 s) : **le jeu ouvre 3 voix de 48 kHz dont une ADPCM, 145 s de son envoyés, 88 % des trames non silencieuses, crête 0,28**. Le signal est lisse (rapport entre la différence d'échantillons consécutifs et l'amplitude : 0,07, alors que 1,41 serait du bruit blanc), sans décalage continu ni saturation. Le périphérique par défaut de la machine (casque Bluetooth) s'ouvre et reçoit un son de test.
+- Non prouvé : l'écoute (personne n'a entendu) ; la justesse de l'ADPCM sur le contenu réel est jugée au spectre, pas à une référence. Les tests (12) vérifient niveaux, hauteur, conversion de fréquence, boucle, 5.1, ADPCM sur des vecteurs calculés à la main.
+
+**Sauvegardes** (même patch)
+- `SaveDir` : le dossier `saves/<titre>/` contient `committed/` (l'état sauvé) et `work/` (la copie que le jeu lit et écrit). `nn::fs::CommitSaveData` / `Commit` (3 formes) bâtissent le nouvel état à côté de l'ancien puis le mettent en place par deux renommages ; une panne au milieu laisse l'ancien état (testé). Un redémarrage, un `Unmount` sans commit, ou la fin du programme perdent ce qui n'a pas été validé, comme sur la console, et la fin de l'exécution le dit.
+- Fonctions ajoutées : `SetFileSize`, `RenameFile`, `RenameDirectory`, `DeleteDirectory` (refus si non vide), `DeleteDirectoryRecursively`, `CleanDirectoryRecursively`, `GetFreeSpaceSize`, `GetTotalSpaceSize`, `CreateFile` avec option, quatre formes de `MountSaveData`, `MountSaveDataReadOnly` (l'état sauvé, lecture seule), `MountCacheStorage`. Un dossier de sauvegardes d'avant le journal est repris comme état sauvé.
+- Mesure avec le vrai jeu : à partir d'un dossier vide, le jeu monte `save:`, crée son fichier d'options et appelle `CommitSaveData` (« committed, commit 1 »). Aucun enregistrement de partie n'a été atteint sur le parcours.
+- Reste : `ResultDirectoryNotEmpty` (0x1002) vient de ma mémoire de la documentation, pas d'une mesure ; l'écriture au-delà de la fin d'un fichier agrandit le fichier (la console exige le mode d'ajout) ; `ExtendSaveData`, `DeleteSaveData`, le compte de plusieurs utilisateurs ne sont pas faits.
+
+**Vidéo**
+- Les 154 films de Xenoblade 2 sont du WebM (VP9, son Vorbis). L'hôte Mac décode par libvpx et stb_vorbis (`hle_movie.c`) ; ce portage n'est pas fait. À la place, `horizon_movie.py` : l'ouverture d'un film (`Extractor::SetDataSource`, trois formes, et `NnExtractor`) échoue avec le code que le SDK renvoie sans objet d'implémentation (0x1000), la première fois en clair (chemin du film), et la fin de l'exécution dit combien d'ouvertures ont été refusées. Avant, un décodeur « pas porté » répondait 0 à tout, et le lecteur du jeu aurait attendu des images qui ne viennent pas.
+- Sur le parcours testé (titre, ouverture, début de partie), le jeu n'ouvre **aucun** film (« the game opened no movie ») : le refus n'a pas été exercé par le jeu, seulement par les tests.
+
+Reste, par gravité :
+1. Les films ne se décodent pas (aucune image ni son de film). Le portage de `hle_movie.c` (VP9 par libvpx, Vorbis par stb_vorbis, protocole d'événements du décodeur) est le chantier.
+2. Le son n'est pas comparé à une référence ; seuls l'ADPCM et le mixage sont vérifiés par calcul et par spectre. Les voix PCM 24/32 bits et les effets (délai, réverbération, filtres) ne sont pas appliqués.
+3. Aucune partie sauvegardée n'a été atteinte : le chemin « le jeu écrit une partie, redémarre, la relit » n'est pas exercé par le jeu (seulement par les tests et par le fichier d'options).
+

@@ -116,3 +116,8 @@ if(BUILD_TESTING)
     add_test(NAME nx2linux_gl_on_vulkan COMMAND nx2linux_gl_vulkan_test)
     set_tests_properties(nx2linux_gl_on_vulkan PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+# the audio mixer and output (audio.c): loaded by dm/tools/horizon_mix.py beside the display and the GPU libraries
+add_library(nx2linux_audio SHARED audio.c)
+target_compile_options(nx2linux_audio PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(nx2linux_audio PRIVATE PkgConfig::SDL3 m pthread)

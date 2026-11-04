@@ -82,3 +82,4 @@
 0101-runtime-nx2-aes-for-the-aes-instructions-remill.patch
 0102-linux-host-the-game-s-constants-and-workarounds.patch
 0103-gpu-path-line-loops-quad-strips-and-polygons-a-c.patch
+0104-linux-host-nn-audio-is-mixed-and-played-voices-a.patch
