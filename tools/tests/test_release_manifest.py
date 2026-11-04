@@ -353,7 +353,8 @@ class ReleaseCandidate(unittest.TestCase):
     def test_the_candidate_manifest_is_the_stable_manifest_of_the_release_under_its_own_tag(self):
         m = json.loads(self.publish_rc().read_text())
         self.assertEqual((m['version'], m['channel'], m['pin'], m['engine_id']), ('0.8.0', 'stable', PIN, EID))
-        self.assertEqual(m['sources'], ['https://github.com/LNPANDY/NX2Apple/releases/download/v0.8.0-rc1/'])
+        repo = os.environ.get('GITHUB_REPOSITORY') or 'LNPANDY/NX2Apple'   # release_manifest.py's --repo default: CI on a fork sets it
+        self.assertEqual(m['sources'], [f'https://github.com/{repo}/releases/download/v0.8.0-rc1/'])
         final = self.tmp / 'final'
         self.run_main(['publish', '--engine-zip', str(self.engine), '--app-zip', str(self.app), '--version', '0.8.0', '--channel', 'stable',
                        '--tag', 'v0.8.0', '--out', str(final), '--pub', str(self.pubfile), '--built', '2026-10-31T02:00:00Z'])
