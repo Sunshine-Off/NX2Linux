@@ -134,6 +134,12 @@ class ExtractAndSmokeTests(unittest.TestCase):
             with self.subTest(script=script), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(nx2linux.smoke(self.smoke_args(script)), 1)
 
+    def test_survey_hands_its_arguments_to_the_engine_script(self):
+        with patch.object(nx2linux.subprocess, 'run', return_value=subprocess.CompletedProcess([], 3)) as run:
+            code = nx2linux.main(['survey', '--', '--modules', 'm', '--title', '0100000000000000'])
+        self.assertEqual(code, 3)
+        self.assertEqual(run.call_args.args[0], [sys.executable, str(nx2linux.SURVEY), '--modules', 'm', '--title', '0100000000000000'])
+
     def test_smoke_without_a_command_is_a_usage_error(self):
         args = self.smoke_args('')
         args.command_line = []

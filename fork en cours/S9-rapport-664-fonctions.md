@@ -81,3 +81,19 @@ Limites connues (écrites, pas contournées) :
 - `FRSQRTE`/`FRSQRTS` ignorent `FPCR.FZ` (mode de vidage des dénormalisés) : le jeu ne l'active pas, `Unicorn` non plus par défaut.
 - `FRSQRTS` : la moitié de `(3 - a*b)/2` est faite sur un opérande avant le produit pour ne pas déborder ; pour deux opérandes minuscules le résultat passe par le chemin fusionné classique.
 
+## 7. Jalon C : un profil par jeu, et le rapport de couverture (2026-11-04)
+
+Ce qui a changé (patch moteur 0102) :
+- `horizon_game.py` : tout ce qui est propre à un titre vient de `dm/games/<id>/` (le dossier que l'hôte Mac et les outils de shaders lisent déjà, via `game.py` ; `DM_GAMES_DIR` ajoute des dossiers hors dépôt). Clés lues : `program_id`, `modules` (ordre de chargement, sans `rtld`), `sys_resource`. Un fichier optionnel `linux_profile.py` porte les contournements du jeu. `PROFILES` a disparu de `horizon_run.py`, l'identifiant `0x0100E95004038000` de `svc_GetInfo` aussi. `horizon_profile_xc2.py` est devenu `dm/games/0100E95004038000/linux_profile.py` (vide : aucun contournement n'est nécessaire).
+- Un titre sans profil tourne avec des valeurs Horizon génériques et le dit (`[profile] no profile …`).
+- `survey.py` (et `nx2linux.py survey -- …`) : pour un jeu, combien de fonctions sont liftées, remplacées (par origine et par espace de noms), repliées sur le JIT (`--jit`), non traduites avec leur raison, et combien sont sans raison ; `--census` ajoute les classes d'instructions que Remill ne lift pas.
+
+Mesures sur Xenoblade 2 (103 665 fonctions : main 49 909, subsdk0 13 379, sdk 27 342) :
+- Avec l'ancien Remill (sans 0009) : 637 remplacées (230 écrites à la main, 164 triviales, 243 « pas portées »), **27 non traduites** (instructions sans sémantique : aese 8, aesd 4, sha256su0 4, pmull 4, aesimc 3, sha1h 2, sha1su0 1, frsqrte 1), 0 sans raison. C'est le rapport S9 retrouvé par une commande.
+- Avec le Remill du jalon B, construction complète à froid (1 541 s sur 16 cœurs, 0 en cache) : 103 028 liftées, 637 remplacées, **0 non traduite, 0 sans raison**.
+- Le jeu lancé avec le profil : 211 trames présentées en 60 s, comme avant.
+
+Écart trouvé en route : brancher `app_pool` / `mem_used` du profil sur `GetInfo` (types 6 et 7) fait échouer `mtl::MemManager::Region::addChild` au démarrage de Xenoblade 2. Ces deux clés décrivent la partition mémoire de l'hôte Mac ; l'hôte Linux garde ses totaux. Seuls `program_id` et `sys_resource` viennent du profil.
+
+Reste : l'ordre de chargement du profil (`main subsdk0 sdk`) n'a été exécuté qu'à travers le survey, pas encore par un lancement du jeu ; la liste des 243 fonctions « pas portées » n'est pas encore rapprochée de ce que le jeu appelle réellement (jalons D et E).
+

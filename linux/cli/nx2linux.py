@@ -211,6 +211,15 @@ def extract(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+SURVEY = ROOT / 'engine' / 'dm' / 'tools' / 'survey.py'
+
+
+def survey(args: argparse.Namespace) -> int:
+    """Coverage of a game's recompilation: lifted, replaced by the host, JIT fallback, not translated and why (engine/dm/tools/survey.py)"""
+    rest = [a for a in args.survey_args if a != '--'] if args.survey_args[:1] == ['--'] else args.survey_args
+    return subprocess.run([sys.executable, str(SURVEY), *rest], cwd=ROOT).returncode
+
+
 RED_RE = re.compile(r'\[RED\]')
 
 
@@ -273,6 +282,9 @@ def parser() -> argparse.ArgumentParser:
     ext.add_argument('--keys', required=True, help='prod.keys, or the folder that holds it')
     ext.add_argument('--out', help='output folder (default: the XDG cache), never inside the repository')
 
+    sv = sub.add_parser('survey', help='how every function of a game is handled (lifted, replaced, JIT, not translated) and why')
+    sv.add_argument('survey_args', nargs=argparse.REMAINDER, help='survey.py arguments: --modules DIR --title ID [--jit] [--census] [--json OUT]')
+
     sm = sub.add_parser('smoke', help='run the host on a game several times and report exits and [RED] lines')
     sm.add_argument('--runs', type=int, default=3)
     sm.add_argument('--timeout', type=int, default=120, help='seconds per run')
@@ -296,6 +308,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return verify(args)
     if args.command == 'extract':
         return extract(args)
+    if args.command == 'survey':
+        return survey(args)
     if args.command == 'smoke':
         args.command_line = [a for a in args.command_line if a != '--'] if args.command_line[:1] == ['--'] else args.command_line
         return smoke(args)
