@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 22:40:57 +0100
+Subject: [PATCH] env_switches: the table lists DM_FONT_CACHE and
+ DM_SHARED_FONT_SMALL
+
+Both are read by the code and had no row, so test_env_switches failed. The five
+names the check prints as quoted in the docs but read nowhere are a notice, not a
+failure.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: Linux test suite: stale tests fixed, Apple-only tests skipped off macOS
+Issue: Sunshine-Off/NX2Linux#4
+
+---
+ docs/env_switches.tsv | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index 4c0519b..e27a462 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -34,6 +34,7 @@ DM_ENV_FILE_KEYS	switch	Set by the iOS app and the Mac launcher at launch to the
+ DM_ENV_LAUNCH_KEYS	switch	Set at launch by the Mac launcher (the launcher settings already in the environment) and the iOS app (every DM_* variable already in it) to the space-separated names; the settings screen keeps those values and shows them greyed out
+ DM_FD_LOG	diagnostic	`=<seconds>` logs, every that many seconds, the number and kinds of file descriptors the process has open
+ DM_FIXED_TIME	switch	`=<seconds>`: the user clock always returns that time and the host time zone is pinned to UTC, for deterministic comparison
++DM_FONT_CACHE	path	Folder where compact_font.py caches the font it downloads (default ~/Library/Caches/nxnative/fonts), so only the first build downloads it.
+ DM_FONT_DIR	path	Folder of the shared-font stand-ins (`standard.ttf`, `nintendo_ext.ttf` with the button icons); the app, the Mac launcher and the NSP script set it
+ DM_FORCE_STRICT	diagnostic	`=1` makes the loader fail on forced-hook entries no module references, instead of only noting them (for checking a mistyped list)
+ DM_FORK_PATCHES	path	the fork patches a build carries, comma separated (build_ipa.sh and build_shell.sh read dm/fork_patches.txt into it): `DMForkPatches` in the app's Info.plist and the first log line
+@@ -280,6 +281,7 @@ DM_SF_TRACE	diagnostic	`=1` logs every request on the game's own HIPC client ses
+ DM_SHAKE_G	switch	`=<G>`: on iOS, the acceleration beyond gravity above which a flick of the phone shakes the controller's six-axis sensor (default 1.5)
+ DM_SHARED_FONT	path	Font file served for every shared-font type except the Nintendo extension (default `$DM_FONT_DIR/standard.ttf`, then macOS's Arial Unicode)
+ DM_SHARED_FONT_EXT	path	Font file served for shared-font type 5, the Nintendo extension with the button icons (default `$DM_FONT_DIR/nintendo_ext.ttf`, made by `make_ext_font.py`)
++DM_SHARED_FONT_SMALL	path	The compact stand-in font (Noto Sans Regular) for a font engine that cannot load the standard one, instead of $DM_FONT_DIR/standard_small.ttf.
+ DM_SHELL_FRAMEWORKS	path	the game frameworks build_shell.sh embeds in the shell app, one folder per line
+ DM_SHELL_NAME	switch	the shell app's name under its icon (build_shell.sh, default NX2Apple)
+ DM_SHELL_PACKAGE	path	the frontend-ios Swift package build_shell.sh links into the shell app (default: frontend-ios in this checkout)

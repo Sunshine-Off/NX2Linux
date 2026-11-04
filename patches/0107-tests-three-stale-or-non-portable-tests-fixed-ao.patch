@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 22:40:57 +0100
+Subject: [PATCH] Tests: three stale or non-portable tests fixed (aot_tailcall,
+ audio out, romfs_image)
+
+test_aot_tailcall expected a LiftError for aese, which Remill patch 0009 lifts: it
+uses eor3 (FEAT_SHA3, still unlifted) and checks that aese lifts.
+test_horizon_services released an AudioOut buffer without opening or starting the
+output, but since patch 0104 the mixer's ticker plays the buffers, so the test opens
+and starts the output, polls for the release, and a second test checks that a
+stopped output keeps its buffer.
+test_romfs_image built C with an if and a declaration on one line, which gcc rejects
+under -Werror=misleading-indentation.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: Linux test suite: stale tests fixed, Apple-only tests skipped off macOS
+Issue: Sunshine-Off/NX2Linux#4
+
+---
+ dm/tools/tests/test_aot_tailcall.py     |  6 +++++-
+ dm/tools/tests/test_horizon_services.py | 25 ++++++++++++++++++++++---
+ dm/tools/tests/test_romfs_image.py      |  7 +++++--
+ 3 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/dm/tools/tests/test_aot_tailcall.py b/dm/tools/tests/test_aot_tailcall.py
+index 38f5c0b..d198de6 100644
+--- a/dm/tools/tests/test_aot_tailcall.py
++++ b/dm/tools/tests/test_aot_tailcall.py
+@@ -70,9 +70,13 @@ class Traps(unittest.TestCase):
+ 
+     def test_an_instruction_remill_lacks_but_that_exists_still_makes_the_function_unliftable(self):
+         with self.assertRaises(aot_lift.LiftError):
+-            a = aot_lift.Aot([(0x1000, words(0x4E284800, RET, 0xE7FFDEFE))])   # aese v0.16b, v0.16b
++            a = aot_lift.Aot([(0x1000, words(0xCE000000, RET, 0xE7FFDEFE))])   # eor3 v0.16b, v0.16b, v0.16b, v0.16b (FEAT_SHA3, which Remill patch 0009 does not cover)
+             a.close()
+ 
++    def test_the_cryptographic_instructions_of_remill_patch_0009_lift(self):
++        a = aot_lift.Aot([(0x1000, words(0x4E284800, RET, 0xE7FFDEFE))])   # aese v0.16b, v0.16b: this used to be the unliftable example
++        a.close()
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/dm/tools/tests/test_horizon_services.py b/dm/tools/tests/test_horizon_services.py
+index 5d17bf4..541e833 100644
+--- a/dm/tools/tests/test_horizon_services.py
++++ b/dm/tools/tests/test_horizon_services.py
+@@ -183,14 +183,33 @@ class Audio(unittest.TestCase):
+         self.assertEqual(call(hz, '_ZN2nn5audio18GetMemoryPoolStateEPKNS0_14MemoryPoolTypeE', 0x30)[0], 5)
+ 
+     def test_an_audio_out_buffer_is_released_after_the_time_its_samples_take(self):
++        """Since patch 0104 a buffer is played by the mixer's ticker, so the output must be open (it starts the ticker) and started, as on the console"""
+         import time
+         hz, aot = make()
++        self.addCleanup(lambda: setattr(hz.audio, 'running', False))
++        call(hz, '_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutERKNS0_17AudioOutParameterE', 0x40, 0x60)
+         call(hz, '_ZN2nn5audio21SetAudioOutBufferInfoEPNS0_14AudioOutBufferEPvmm', 0x100, 0x5000, 4800, 4800)   # 1200 frames of PCM16 stereo = 25 ms
++        put(aot, 0x5000, bytes(4800))
++        call(hz, '_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE', 0x40)
+         call(hz, '_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE', 0x40, 0x100)
++        t0 = time.monotonic()
++        self.assertEqual(call(hz, '_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE', 0x40)[0], 0)   # 25 ms of samples are not played yet
++        released = 0
++        while not released and time.monotonic() - t0 < 3:
++            time.sleep(0.01); released = call(hz, '_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE', 0x40)[0]
++        self.assertEqual(released, 0x100)
++        self.assertGreaterEqual(time.monotonic() - t0, 0.015)
++
++    def test_an_audio_out_that_was_not_started_keeps_its_buffer(self):
++        import time
++        hz, aot = make()
++        self.addCleanup(lambda: setattr(hz.audio, 'running', False))
++        call(hz, '_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutERKNS0_17AudioOutParameterE', 0x40, 0x60)
++        call(hz, '_ZN2nn5audio21SetAudioOutBufferInfoEPNS0_14AudioOutBufferEPvmm', 0x100, 0x5000, 4800, 4800)
++        put(aot, 0x5000, bytes(4800))
++        call(hz, '_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE', 0x40, 0x100)
++        time.sleep(0.1)
+         self.assertEqual(call(hz, '_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE', 0x40)[0], 0)
+-        time.sleep(0.04)
+-        self.assertEqual(call(hz, '_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE', 0x40)[0], 0x100)
+-
+ 
+ class Time(unittest.TestCase):
+     def test_the_user_clock_and_the_calendar_follow_the_host(self):
+diff --git a/dm/tools/tests/test_romfs_image.py b/dm/tools/tests/test_romfs_image.py
+index d7a812e..8478ba2 100644
+--- a/dm/tools/tests/test_romfs_image.py
++++ b/dm/tools/tests/test_romfs_image.py
+@@ -24,8 +24,11 @@ class Images(unittest.TestCase):
+         root = Path(cls.tools.name)
+         source = root / 'validate.c'
+         source.write_text('#include "romfs_image.h"\nint main(int argc, char **argv) {\n'
+-                          'if (argc != 2) return 2; romfs_img *m = romfs_image_open(argv[1]);\n'
+-                          'if (!m) return 1; romfs_image_close(m); return 0; }\n')
++                          'if (argc != 2) return 2;\n'   # one statement a line: gcc's -Wmisleading-indentation rejects "if (...) return 2; romfs_img *m = ..." under -Werror
++                          'romfs_img *m = romfs_image_open(argv[1]);\n'
++                          'if (!m) return 1;\n'
++                          'romfs_image_close(m);\n'
++                          'return 0; }\n')
+         cls.validator = root / 'validate'
+         subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/host'),
+                         str(source), '-o', str(cls.validator)], check=True)
