@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 23:59:50 +0100
+Subject: [PATCH] Linux host: a test that the Linux chain reaches no Xcode,
+ Metal or xcrun
+
+elf_module, horizon_run and what they import (followed through every import statement) neither include the Apple chain (build_ipa_from_nsp, patch_nso, sdk_patches) nor name xcrun, xcodebuild or Metal tools. A clean interpreter imports them without loading an Apple module, and stubs of xcrun and xcodebuild on PATH record no call.
+
+Upstream-Status: fork-only
+Reason: Proves the Linux chain never reaches Xcode, Metal or xcrun
+Issue: Sunshine-Off/NX2Linux#10
+
+---
+ dm/tools/tests/test_linux_path_no_apple.py | 112 +++++++++++++++++++++
+ 1 file changed, 112 insertions(+)
+ create mode 100644 dm/tools/tests/test_linux_path_no_apple.py
+
+diff --git a/dm/tools/tests/test_linux_path_no_apple.py b/dm/tools/tests/test_linux_path_no_apple.py
+new file mode 100644
+index 0000000..9841b47
+--- /dev/null
++++ b/dm/tools/tests/test_linux_path_no_apple.py
+@@ -0,0 +1,112 @@
++"""The Linux chain (extraction output -> elf_module -> lift -> horizon_run) never reaches Xcode, Metal or xcrun.
++
++Static: the modules the Linux entry points import, followed through every `import` statement (also those inside functions), are neither an Apple-only module nor mention an Apple tool.
++Dynamic: importing the entry points in a clean interpreter loads no Apple-only module, and a PATH that holds recording stubs for xcrun and xcodebuild sees no call.
++No game file or key is needed."""
++import ast
++import os
++import re
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++TOOLS = HERE.parent
++DM = TOOLS.parent
++REPO = DM.parent
++# The files the Linux chain starts from: the module converter, the runner and what the runner registers
++ENTRIES = ('elf_module', 'horizon_run', 'horizon_hle', 'horizon_overrides', 'aot_lift', 'horizon_game')
++# Modules of the Apple chain: they must stay out of the Linux closure
++APPLE_ONLY = {'build_ipa_from_nsp', 'patch_nso', 'sdk_patches'}
++APPLE_TOOL = re.compile(r'\b(xcrun|xcodebuild|xcode-select|metallib|metal-ar|metal)\b(?!\w)')
++SEARCH = (TOOLS, DM / 'games', REPO / 'scripts')
++
++
++def source_of(name):
++    for d in SEARCH:
++        p = d / f'{name}.py'
++        if p.is_file(): return p
++    return None
++
++
++def imported_names(path):
++    names = set()
++    for node in ast.walk(ast.parse(path.read_text(), str(path))):
++        if isinstance(node, ast.Import): names.update(a.name.split('.')[0] for a in node.names)
++        elif isinstance(node, ast.ImportFrom) and node.module and not node.level: names.add(node.module.split('.')[0])
++    return names
++
++
++def closure(entries):
++    """{module name: path} of the local modules reachable from entries"""
++    seen, todo = {}, list(entries)
++    while todo:
++        n = todo.pop()
++        if n in seen: continue
++        p = source_of(n)
++        if p is None: continue   # standard library or an installed package
++        seen[n] = p; todo.extend(imported_names(p))
++    return seen
++
++
++def code_without_comments(path):
++    """The source with comments and docstrings removed: a word in prose is not a call"""
++    tree = ast.parse(path.read_text(), str(path))
++    for node in ast.walk(tree):
++        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body \
++                and isinstance(node.body[0], ast.Expr) and isinstance(getattr(node.body[0], 'value', None), ast.Constant) \
++                and isinstance(node.body[0].value.value, str):
++            node.body[0].value.value = ''
++    return ast.unparse(tree)
++
++
++class Static(unittest.TestCase):
++    def test_entries_exist(self):
++        for e in ENTRIES: self.assertIsNotNone(source_of(e), e)
++
++    def test_closure_has_no_apple_module(self):
++        c = closure(ENTRIES)
++        self.assertGreater(len(c), 8, sorted(c))   # a broken walk would pass vacuously
++        self.assertEqual(sorted(APPLE_ONLY & set(c)), [])
++
++    def test_closure_never_names_an_apple_tool(self):
++        hits = {n: sorted(set(APPLE_TOOL.findall(code_without_comments(p)))) for n, p in closure(ENTRIES).items()}
++        self.assertEqual({n: h for n, h in hits.items() if h}, {})
++
++    def test_the_walk_sees_a_forbidden_import(self):   # the check itself can fail
++        with tempfile.TemporaryDirectory() as d:
++            (Path(d) / 'a_mod.py').write_text('def f():\n    import patch_nso\n')
++            self.assertIn('patch_nso', imported_names(Path(d) / 'a_mod.py'))
++        self.assertIsNotNone(APPLE_TOOL.search(code_without_comments(TOOLS / 'patch_nso.py')) or APPLE_TOOL.search('subprocess.run(["xcrun"])'))
++
++
++STUBS = r'''#!/bin/sh
++echo "$0 $*" >> "$NX2_APPLE_CALLS"
++exit 127
++'''
++
++
++class Dynamic(unittest.TestCase):
++    def test_imports_load_no_apple_module_and_run_no_apple_tool(self):
++        with tempfile.TemporaryDirectory() as d:
++            calls, bindir = Path(d) / 'calls.txt', Path(d) / 'bin'
++            bindir.mkdir()
++            for tool in ('xcrun', 'xcodebuild', 'xcode-select', 'metal', 'metallib'):
++                (bindir / tool).write_text(STUBS); (bindir / tool).chmod(0o755)
++            code = ('import sys, json\n'
++                    f'sys.path[:0] = {[str(TOOLS), str(DM / "games")]!r}\n'
++                    f'for m in {list(ENTRIES)!r}: __import__(m)\n'
++                    f'print(json.dumps(sorted(set(sys.modules) & set({sorted(APPLE_ONLY)!r}))))\n')
++            env = dict(os.environ, PATH=f'{bindir}{os.pathsep}{os.environ["PATH"]}', NX2_APPLE_CALLS=str(calls))
++            r = subprocess.run([sys.executable, '-I', '-c', code], capture_output=True, text=True, env=env, timeout=300)
++            if r.returncode != 0 and 'No module named' in r.stderr:
++                self.skipTest('the Linux chain needs a module that is not installed here: ' + r.stderr.strip().splitlines()[-1])
++            self.assertEqual(r.returncode, 0, r.stderr)
++            self.assertEqual(r.stdout.strip().splitlines()[-1], '[]')
++            self.assertFalse(calls.exists(), calls.read_text() if calls.exists() else '')
++
++
++if __name__ == '__main__':
++    unittest.main()

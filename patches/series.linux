@@ -51,3 +51,4 @@
 0105-linux-host-movie-decoder-decodes-vp8-vp9-by-libv.patch
 0106-module-validate-workers-run-with-the-venv-interp.patch
 0110-docs-linux-architecture-md-the-stages-the-host-t.patch
+0112-linux-host-a-test-that-the-linux-chain-reaches-n.patch
