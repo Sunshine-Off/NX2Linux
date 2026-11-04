@@ -8,6 +8,7 @@ pattern, shared with the Swift tests. A sync of scripts/ or dm/ that rewords a m
 from __future__ import annotations
 
 import errno
+import locale
 import importlib.util
 import json
 import os
@@ -51,7 +52,12 @@ class Classifier(unittest.TestCase):
         for f in FIXTURES:
             with self.subTest(pattern=f['id']):
                 if f['source'] == 'errno':   # the system's own text, not the script's
-                    self.assertEqual(os.strerror(errno.ENOSPC), f['fragment'])
+                    old = locale.setlocale(locale.LC_ALL)   # the fragment is the C locale's text: a French or German libc says it otherwise
+                    try:
+                        locale.setlocale(locale.LC_ALL, 'C')
+                        self.assertEqual(os.strerror(errno.ENOSPC), f['fragment'])
+                    finally:
+                        locale.setlocale(locale.LC_ALL, old)
                     continue
                 if f['source'] == 'codesign':   # Apple's text, from a tool the script runs
                     continue
