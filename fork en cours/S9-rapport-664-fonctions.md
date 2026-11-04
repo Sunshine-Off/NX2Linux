@@ -149,3 +149,21 @@ Reste, par gravité :
 2. Le son n'est pas comparé à une référence ; seuls l'ADPCM et le mixage sont vérifiés par calcul et par spectre. Les voix PCM 24/32 bits et les effets (délai, réverbération, filtres) ne sont pas appliqués.
 3. Aucune partie sauvegardée n'a été atteinte : le chemin « le jeu écrit une partie, redémarre, la relit » n'est pas exercé par le jeu (seulement par les tests et par le fichier d'options).
 
+## 10. Jalon E (suite) : les films se décodent (2026-11-04)
+
+Ce qui est fait (patch moteur 0105 ; `linux/host/movie.c`, bibliothèque `libnx2linux_movie.so`)
+- `horizon_movie.py` remplace le `movie::Decoder` du SDK par le protocole de l'hôte Mac (`hle_movie.c`) : 4 entrées de 4 Mo, 16 sorties vidéo (64 audio), les quatre événements du client (entrée disponible, sortie prête, format changé, erreur) signalés par le `nn::os::SignalEvent` du SDK lui-même, la fin de flux qui porte son drapeau, `Flush`, `Stop` et `Reset`, le constructeur du SDK 3 (celui de Xenoblade 2 : formats numérotés un cran plus bas, second résultat de `GetOutputBufferSize` = alignement 0x20). Le décodage est synchrone sur le fil du jeu qui appelle.
+- `movie.c` : VP8 / VP9 par libvpx (chargée à l'exécution : `libvpx.so.9`, aucune dépendance à la compilation) en NV12 (une image plus petite est complétée de noir, une plus grande rognée) ; Vorbis par stb_vorbis (chaque paquet du démultiplexeur devient une page Ogg, comme sur l'hôte Mac).
+- L'extracteur (`movie::Extractor`, le démultiplexeur) n'est plus remplacé : il tourne comme code du SDK sur le RomFS. Les « pas portés » de la liste de l'hôte Mac le laissent tranquille quand les décodeurs existent (`sdk_owns`). Sans `libnx2linux_movie.so`, l'ouverture d'un film reste refusée avec le code 0x1000, nommée et comptée.
+- H.264, AAC et le mode « texture native » ne sont pas décodés : le décodeur répond 0x1000 partout et le journal dit lequel on lui a demandé.
+
+Preuves
+- Le fichier de test `test_movie_codec` : des flux VP9 et VP8 faits par ffmpeg à partir d'une mire (aucune donnée de jeu) ressortent **octet pour octet** comme le décodage de ffmpeg (même libvpx) ; Vorbis à l'erreur d'arrondi près ; une image d'une autre taille est complétée ou rognée ; des octets quelconques sont une erreur, pas une image.
+- `test_movie_decoder` (8 tests) joue le protocole comme un lecteur : événements, ordre des temps, 16 sorties tenues qui arrêtent le décodeur jusqu'à ce que le client en rende une, fin de flux sans données (sortie noire portant le drapeau 4), `Flush` / `Stop`, le destructeur qui rend l'objet au `operator delete` du jeu, un type non décodé qui répond 0x1000.
+- **Avec le vrai jeu** : `NX2LINUX_MOVIE_PROBE=<chemin dans le RomFS>[:paquets]` fait jouer un film par le démultiplexeur du jeu (type de conteneur 1 = WebM) et le décodeur de l'hôte, 20 s après le démarrage, sur un fil du jeu, puis compare à ffmpeg. Trois films de Xenoblade 2 (1280×720, VP9 + Vorbis) : **273, 585, 468 et 390 images décodées, toutes identiques au décodage de ffmpeg** (une série d'essais par film ; un film est lu jusqu'à 600 images). L'audio : les pistes son de ces films sont du silence numérique (−91 dB dans ffmpeg aussi) ; la sortie est silencieuse de même (crête 0). La justesse de Vorbis sur un signal réel ne repose donc que sur le test synthétique.
+
+Ce qui n'est pas prouvé
+- Le jeu lui-même n'a joué aucun film : aucun n'est atteint avant l'histoire avancée. Le lecteur du jeu (qui consomme les images NV12 et les affiche) n'est pas exercé ; la sonde joue le rôle du lecteur.
+- Pas de contrôle d'ordre : la sonde envoie un paquet puis prend les sorties ; un lecteur qui garde ses sorties plus longtemps (16 en main) est couvert par un test, pas par le jeu.
+- L'événement « entrée disponible » est signalé dans `Start` même (l'hôte Mac le diffère de 2 ms : un jeu a planté sur un signal trop tôt, avant d'avoir lié ses sémaphores). Si Xenoblade 2 en fait autant, le plantage se verra à `SignalEvent` dans `MultiWaitImpl`.
+

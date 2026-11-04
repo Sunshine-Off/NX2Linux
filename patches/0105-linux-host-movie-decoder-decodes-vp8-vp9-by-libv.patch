@@ -1,0 +1,1112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 21:15:34 +0100
+Subject: [PATCH] Linux host: movie::Decoder decodes (VP8 / VP9 by libvpx,
+ Vorbis by stb_vorbis) and a probe plays a RomFS movie through the SDK's own
+ extractor
+
+horizon_movie.py follows the Mach host's protocol (inputs, output slots, four events, SDK 3 constructor numbering); linux/host/movie.c decodes (libvpx loaded at run time). The SDK's Extractor is left to run as lifted code. movie_probe.py (NX2LINUX_MOVIE_PROBE) verifies against ffmpeg: Xenoblade 2's movies come out picture for picture identical. Without the decoders the openings are still refused explicitly.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux milestone E: the game's movies decode (the Decoder behind the SDK's movie player was a stub answering 0)
+Issue: none yet (NX2Linux, branch Téo/jalon-e-audio-saves-video)
+
+---
+ dm/tools/horizon_audio.py            |   6 +-
+ dm/tools/horizon_movie.py            | 450 ++++++++++++++++++++++++++-
+ dm/tools/horizon_overrides.py        |   4 +-
+ dm/tools/movie_codec.py              |  74 +++++
+ dm/tools/movie_probe.py              | 141 +++++++++
+ dm/tools/tests/test_horizon_movie.py |  19 +-
+ dm/tools/tests/test_movie_codec.py   |  85 +++++
+ dm/tools/tests/test_movie_decoder.py | 214 +++++++++++++
+ 8 files changed, 983 insertions(+), 10 deletions(-)
+ create mode 100644 dm/tools/movie_codec.py
+ create mode 100644 dm/tools/movie_probe.py
+ create mode 100644 dm/tools/tests/test_movie_codec.py
+ create mode 100644 dm/tools/tests/test_movie_decoder.py
+
+diff --git a/dm/tools/horizon_audio.py b/dm/tools/horizon_audio.py
+index 8f528b1..a81d1dd 100644
+--- a/dm/tools/horizon_audio.py
++++ b/dm/tools/horizon_audio.py
+@@ -190,7 +190,11 @@ def open_renderer(hz, r):
+ 
+ reg('_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE', 'nothing to start')(lambda hz, r: ret(r))
+ reg('_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE', 'nothing to stop')(lambda hz, r: ret(r))
+-reg('_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE', 'the update is accepted; voices and pools are advanced by the host')(lambda hz, r: ret(r))
++@reg('_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE', 'the update is accepted; voices and pools are advanced by the host')
++def request_update(hz, r):
++    if os.environ.get('NX2LINUX_MOVIE_PROBE'):   # a guest thread that calls often: where the movie probe runs (movie_probe.py)
++        import movie_probe; movie_probe.probe_once(hz)
++    ret(r)
+ 
+ 
+ @reg('_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE', 'stops the host tick')
+diff --git a/dm/tools/horizon_movie.py b/dm/tools/horizon_movie.py
+index 76c5945..1c87b4d 100644
+--- a/dm/tools/horizon_movie.py
++++ b/dm/tools/horizon_movie.py
+@@ -1,7 +1,12 @@
+-"""The SDK's movie library on the Linux host (NX2Linux S7bis, milestone E). A game plays a movie by opening it with a movie::Extractor (SetDataSource: the SDK's own demuxer), then feeding the packets to a movie::Decoder, which on the
+-Switch is NVIDIA's hardware decoder. The host has no decoder behind that interface yet (the Mach host's hle_movie.c decodes VP8 / VP9 with libvpx and Vorbis with stb_vorbis; it has not been ported), and a Decoder that answers 0
+-to everything would let the player wait for pictures that never come. So the opening of a movie fails here, explicitly and with the code the SDK itself returns when it has no implementation object (0x1000): the game's own
+-player reports that it could not open the movie, and goes on without it. Every refusal is counted and named, and the end of the run says how many movies the game asked for."""
++"""The SDK's movie library on the Linux host (NX2Linux S7bis, milestone E). A game plays a movie by opening it with a movie::Extractor (the SDK's own demuxer, which runs as lifted code on the RomFS), then feeding the packets to a
++movie::Decoder, which on the Switch is NVIDIA's hardware decoder. Here the Decoder is replaced (the protocol of the Mach host's hle_movie.c): VP8 / VP9 pictures are decoded by libvpx into NV12 and Vorbis packets by stb_vorbis into
++PCM 16-bit (linux/host/movie.c, loaded by movie_codec.py); the inputs, the output slots and the four events (input available, output ready, format changed, error) follow MediaCodec's behaviour, which movie::Decoder wraps.
++What is not decoded here (H.264, AAC, the native-texture output mode) leaves the decoder without an implementation: every method returns the SDK's failure code and the log says which decoder was asked for. When the
++decoders themselves are missing (libnx2linux_movie.so not built, no libvpx), the opening of a movie is refused with the SDK's own "no implementation" code (0x1000) instead, named and counted, so the game's player gives up on
++the movie and goes on. Decoding is synchronous on the calling guest thread; events are signalled by the SDK's own nn::os::SignalEvent, called on that thread."""
++import os, struct, threading, time
++
++import movie_codec
+ from horizon_overrides import hle
+ 
+ NO_IMPLEMENTATION = 0x1000   # what the SDK returns for a data source it has no implementation object for (engine/dm/host/hle_movie.c)
+@@ -17,8 +22,18 @@ def refuse(hz, what):
+     return NO_IMPLEMENTATION
+ 
+ 
++def sdk_owns(symbol):
++    """True for what the SDK's own code does when the decoders are there: the extractor (the demuxer) runs as lifted code on the RomFS, so the not-ported stubs of the Mach host's list leave it alone"""
++    return bool(movie_codec.library_path()) and symbol.startswith(('_ZN5movie9Extractor', '_ZN5movie11NnExtractor'))
++
++
+ def report(hz):
+     n = refused(hz)
++    if movie_codec.library_path():
++        decs, bad = getattr(hz, 'movie_decs', {}), getattr(hz, 'movie_unsupported', [])
++        made = getattr(hz, 'movie_ndec', 0)
++        if not made and not bad: return 'movie: the game opened no movie decoder'
++        return f'movie: {made} decoders made, {len(decs)} still open, {len(bad)} asked for a type that is not decoded here {bad[:3] or ""}'
+     if not n: return 'movie: the game opened no movie'
+     return f'movie: {len(n)} openings refused, no decoder on the Linux host (first: {n[0]})'
+ 
+@@ -35,4 +50,429 @@ def _install():
+         hle(sym, 'the host has no movie decoder: opening fails with the SDK\'s own "no implementation" code')(lambda hz, r, who=who: r.__setitem__(0, refuse(hz, f'{who} {hz.cstring(r[2], 0x200)!r}' if r[2] else who)))
+ 
+ 
+-_install()
++# ======================================================================== the decoder ========================================================================
++M32, M64 = 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF
++MD_NIN, MD_INCAP = 4, 4 << 20          # input buffers, and the bytes of each (a 1080p VP9 packet is far smaller)
++MD_NO_INPUT, MD_NO_OUTPUT, MD_FAIL, MD_BAD_ARG = 0x1011, 0x100E, 0x1000, 0x100B   # the SDK's codes: no free input, no output ready, no implementation, a bad argument
++T_AVC, T_VP8, T_VP9, T_AAC, T_VORBIS = 1, 2, 3, 4, 5
++F_PCM16, F_ABGR, F_NV12 = 1, 3, 4      # the output formats as later SDKs number them (SDK 3 numbers ARGB 2 and NV12 3: its constructor converts)
++MODE_CPU, MODE_TEXTURE = 1, 2
++PCM_CAP = 8192 * 8 * 2                 # the bytes of one audio output: a Vorbis packet gives at most 4096 samples a channel, 8 channels
++SLOTS_VIDEO, SLOTS_AUDIO = 16, 64      # output slots (what the Mach host settled on for the players of many games)
++MOVIE_BASE = 0xA_0000_0000             # guest memory the host gives the movie library: key strings and scratch words, then the input buffers of each decoder
++KEYS_SIZE = 0x10000
++IN_BASE = MOVIE_BASE + KEYS_SIZE
++MAX_DECODERS = 16
++
++
++class Guest:
++    """The SDK's own movie::Buffer, movie::MediaData and nn::os functions, called on the calling guest thread, so the host needs no knowledge of their layouts"""
++    def __init__(self, hz):
++        self.hz, self.lock, self.keys, self.next_key = hz, threading.Lock(), {}, 0
++        if not hz.aot.try_map(MOVIE_BASE, KEYS_SIZE + MAX_DECODERS * MD_NIN * MD_INCAP): raise RuntimeError('no room for the movie memory')
++
++    def call(self, symbol, **regs): return self.hz.call_guest(symbol, {k: v & M64 for k, v in regs.items()})
++
++    def key(self, text):
++        """The guest address of a NUL-terminated copy of a key string (the SDK's functions take C strings)"""
++        with self.lock:
++            a = self.keys.get(text)
++            if a is None:
++                raw = text.encode() + b'\0'; a = MOVIE_BASE + 0x2000 + self.next_key; self.next_key += (len(raw) + 15) & ~15
++                if self.next_key > 0x8000: raise RuntimeError('too many movie keys')
++                self.hz.wr(a, raw); self.keys[text] = a
++            return a
++
++    def scratch(self):
++        """A word of guest memory of this thread's own (the SDK writes its out parameters there)"""
++        return MOVIE_BASE + 0xA000 + 16 * (threading.get_ident() % 1024)
++
++    def set_data(self, buf, ptr, cap): self.call('_ZN5movie6Buffer18SetDataAndCapacityEPvm', x0=buf, x1=ptr, x2=cap)
++    def set_range(self, buf, off, size): self.call('_ZN5movie6Buffer8SetRangeEii', x0=buf, x1=off, x2=size)
++    def data(self, buf): return self.call('_ZNK5movie6Buffer4DataEv', x0=buf)
++    def cap(self, buf): return self.call('_ZNK5movie6Buffer8CapacityEv', x0=buf)
++    def size(self, buf): return self.call('_ZNK5movie6Buffer4SizeEv', x0=buf)
++    def set_i32(self, md, key, v): self.call('_ZN5movie9MediaData8SetInt32EPKci', x0=md, x1=self.key(key), x2=v & M32)
++    def set_rect(self, md, key, l, t, r, b): self.call('_ZN5movie9MediaData7SetRectEPKciiii', x0=md, x1=self.key(key), x2=l & M32, x3=t & M32, x4=r & M32, x5=b & M32)
++
++    def find_i32(self, md, key):
++        out = self.scratch(); self.hz.wr32(out, 0)
++        ok = self.call('_ZNK5movie9MediaData9FindInt32EPKcPi', x0=md, x1=self.key(key), x2=out) & 1
++        v = self.hz.rd32(out)
++        return (v - (1 << 32) if v & (1 << 31) else v) if ok else None
++
++    def find_buf(self, md, key):
++        out = self.scratch(); self.hz.wr64(out, 0)
++        ok = self.call('_ZNK5movie9MediaData10FindBufferEPKcPPNS_6BufferE', x0=md, x1=self.key(key), x2=out) & 1
++        return self.hz.rd64(out) if ok else 0
++
++    def signal(self, event): self.call('_ZN2nn2os11SignalEventEPNS0_9EventTypeE', x0=event)
++
++
++def guest_of(hz):
++    if not hasattr(hz, 'movie_guest'): hz.movie_guest = Guest(hz)
++    return hz.movie_guest
++
++
++class Slot:
++    def __init__(self): self.used = self.pic = self.cli = False; self.pts = 0; self.flags = 0; self.data = b''
++
++
++class Dec:
++    """One movie::Decoder: its inputs, output slots and events, and the codec behind them"""
++    def __init__(self, hz, kind, fmt, mode, out_align):
++        self.hz, self.kind, self.fmt, self.mode, self.out_align = hz, kind, fmt, mode, out_align
++        self.audio = kind in (T_VORBIS, T_AAC)
++        self.lock, self.dlock = threading.RLock(), threading.RLock()
++        self.evc, self.ev = 0, [None] * 4
++        self.w = self.h = 0; self.fmt_sent = self.started = self.in_eos = False
++        self.infree, self.inown, self.pend = list(range(MD_NIN)), set(), []
++        self.nout = SLOTS_AUDIO if self.audio else SLOTS_VIDEO
++        self.out = [Slot() for _ in range(self.nout)]; self.outq = []
++        self.codec = None; self.vhdr = [b'', b'']; self.ch = self.rate = 0
++        self.slot = None; self.n_in = self.n_out = 0; self.errors = 0
++        self.in_base = IN_BASE + hz.movie_ndec * MD_NIN * MD_INCAP; hz.movie_ndec += 1
++
++    def event(self, i):
++        """The guest address of the client's event i: the entry of its DecoderEvents struct, read when it is signalled (the client may fill the struct after registering it), else the one it held at registration; 0 when none"""
++        p = 0
++        if self.evc:
++            try: p = self.hz.rd64(self.evc + 8 * i)
++            except AssertionError: p = 0
++        if p % 8 or p < 0x1_0000_0000 or not self.hz.aot.lib.aot_hash64(p, 8, 0): p = self.ev[i] or 0
++        return p
++
++    def fire(self, indices):
++        g = guest_of(self.hz)
++        for i in indices:
++            p = self.event(i)
++            if p: g.signal(p)
++            elif self.errors < 8: self.errors += 1; self.hz.log(f'[movie] [RED] decoder event {i} is not an event any more: not delivered')
++
++    def dims(self): return (self.w or 1920, self.h or 1080)
++
++    def close_codec(self):
++        if self.codec: self.codec.close(); self.codec = None
++
++    # ---- decoding one packet into a slot ----
++    def decode(self, packet):
++        """The slot data for a packet: NV12 bytes (video, None for no picture), PCM bytes (audio, b'' for none)"""
++        if self.kind in (T_VP8, T_VP9):
++            if self.codec is None:
++                w, h = self.dims(); self.codec = movie_codec.Video(self.kind == T_VP9, w, h, threads=max(2, (os.cpu_count() or 4) // 4))
++                self.hz.log(f'[movie] libvpx {self.codec.version}: {"VP9" if self.kind == T_VP9 else "VP8"} decoder, {w}x{h}')
++            nv, size = self.codec.decode(packet)
++            if nv is not None and size != self.dims() and not self.errors: self.errors += 1; self.hz.log(f'[movie] [RED] picture {size[0]}x{size[1]} does not match the output {self.dims()[0]}x{self.dims()[1]}: padded with black or cropped')
++            return nv
++        if self.kind == T_VORBIS:
++            if self.codec is None:
++                self.codec = movie_codec.Vorbis(self.vhdr[0], self.vhdr[1]); self.ch, self.rate = self.codec.channels, self.codec.rate
++                self.hz.log(f'[movie] Vorbis: {self.ch} channels {self.rate} Hz')
++            return self.codec.decode(packet, PCM_CAP)
++        raise movie_codec.CodecError('decoder type not decoded here')
++
++    def pump(self):
++        """While packets wait and an output slot is free: decode the head packet, give its input back, announce the output (and the input, unless the stream ended)"""
++        with self.dlock:
++            while True:
++                with self.lock:
++                    free = next((k for k, s in enumerate(self.out) if not s.used), None) if self.pend else None
++                    if free is None: return
++                    pk = self.pend.pop(0); self.out[free].used = True
++                eos = bool(pk['flags'] & 4)
++                data, got = b'', False
++                if pk['size'] > 0 and not (eos and (pk['pts'] < 0 or pk['size'] >= MD_INCAP)):
++                    try:
++                        raw = self.hz.rd(self.in_base + pk['in'] * MD_INCAP + pk['off'], pk['size'])
++                        r = self.decode(raw)
++                        if r: data, got = r, True
++                    except movie_codec.CodecError as e:
++                        if self.errors < 8: self.errors += 1; self.hz.log(f'[movie] [RED] decode error ({pk["size"]} bytes): {e}')
++                with self.lock:
++                    self.infree.append(pk['in'])
++                    ready = got or eos   # an end-of-stream packet without data still yields an output, to carry the flag back
++                    if ready:
++                        s = self.out[free]; s.pic, s.pts, s.flags, s.data = got, pk['pts'], pk['flags'], data; self.outq.append(free)
++                    else: self.out[free].used = False
++                    ineos = self.in_eos
++                self.fire(([] if ineos else [0]) + ([1] if ready else []))
++
++    def reset(self, close):
++        with self.dlock, self.lock:
++            if close: self.close_codec()
++            self.infree, self.inown = list(range(MD_NIN)), set()
++            self.outq, self.pend, self.in_eos = [], [], False
++            for s in self.out:
++                s.used = s.cli = False
++                if close: s.pic = False
++
++
++def dec_of(hz, self_ptr):
++    token = hz.rd64(self_ptr + 8)
++    return hz.__dict__.setdefault('movie_decs', {}).get(token)
++
++
++def vp9_size(p):
++    """(width, height) of a VP9 key frame from its uncompressed header (VP9 spec 6.2), or None"""
++    bit = [0]
++    def rb(k):
++        v = 0
++        for _ in range(k):
++            if bit[0] >> 3 >= len(p): raise IndexError
++            v = v << 1 | (p[bit[0] >> 3] >> (7 - (bit[0] & 7)) & 1); bit[0] += 1
++        return v
++    try:
++        if rb(2) != 2: return None
++        lo, hi = rb(1), rb(1); prof = hi << 1 | lo
++        if prof == 3: rb(1)
++        if rb(1): return None   # show_existing_frame
++        if rb(1) != 0: return None   # not a key frame
++        rb(2)
++        if rb(24) != 0x498342: return None
++        if prof >= 2: rb(1)
++        if rb(3) != 7:
++            rb(1)
++            if prof in (1, 3): rb(3)
++        elif prof in (1, 3): rb(1)
++        return rb(16) + 1, rb(16) + 1
++    except IndexError: return None
++
++
++def vp8_size(p):
++    if len(p) < 10 or p[0] & 1 or bytes(p[3:6]) != b'\x9d\x01\x2a': return None
++    x, y = (p[6] | p[7] << 8) & 0x3FFF, (p[8] | p[9] << 8) & 0x3FFF
++    return (x, y) if x and y else None
++
++
++def make_decoder(hz, self_ptr, kind, fmt, mode, out_align=0):
++    """The constructor: the object gets the Decoder vtable and a token naming the host side; a combination that is not decoded here keeps a null token and every method answers 0x1000"""
++    hz.__dict__.setdefault('movie_decs', {}); hz.__dict__.setdefault('movie_ndec', 0)
++    vt = hz.ms.symbol('_ZTVN5movie7DecoderE') + 0x10
++    hz.wr64(self_ptr, vt); hz.wr64(self_ptr + 8, 0)
++    audio = kind == T_VORBIS and fmt == F_PCM16
++    video = kind in (T_VP8, T_VP9) and fmt == F_NV12 and mode != MODE_TEXTURE
++    if not (audio or video) or hz.movie_ndec >= MAX_DECODERS:
++        hz.log(f'[movie] [RED] decoder type {kind} output {fmt} mode {mode} is not decoded on the Linux host (VP8 / VP9 as NV12 and Vorbis as PCM 16-bit are): every method returns failure')
++        hz.__dict__.setdefault('movie_unsupported', []).append((kind, fmt, mode)); return
++    guest_of(hz)
++    d = Dec(hz, kind, fmt, mode, out_align)
++    token = len(hz.movie_decs) + 1; hz.movie_decs[token] = d; hz.wr64(self_ptr + 8, token)
++    hz.log(f'[movie] decoder {self_ptr:#x}: type {kind} output {fmt} mode {mode}')
++
++
++def free_decoder(hz, self_ptr):
++    token = hz.rd64(self_ptr + 8); d = hz.__dict__.setdefault('movie_decs', {}).pop(token, None)
++    hz.wr64(self_ptr + 8, 0)
++    if d:
++        with d.dlock, d.lock: d.close_codec()
++        hz.log(f'[movie] decoder {self_ptr:#x} destroyed: {d.n_in} packets in, {d.n_out} outputs out')
++
++
++def rv(r, v): r[0] = v & M64
++
++
++def _decoder_handlers():
++    D = '_ZN5movie7Decoder'
++    reason = 'the host decodes (linux/host/movie.c): VP8 / VP9 by libvpx, Vorbis by stb_vorbis'
++    hle(D + 'C1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeEi', reason)(lambda hz, r: make_decoder(hz, r[0], r[1] & M32, r[2] & M32, r[3] & M32))
++    hle(D + 'C1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE', reason)(lambda hz, r: make_decoder(hz, r[0], r[1] & M32, r[2] & M32, r[3] & M32))
++    def ctor3(hz, r):   # SDK 3 (Xenoblade 2): no mode or priority; its formats are numbered one lower (ARGB 2, NV12 3), its decoders are CPU ones, and GetOutputBufferSize puts an alignment (0x20) in its second output
++        fmt = r[2] & M32; make_decoder(hz, r[0], r[1] & M32, F_NV12 if fmt == 3 else F_ABGR if fmt == 2 else fmt, MODE_CPU, 0x20)
++        d = dec_of(hz, r[0])
++        if d: d.out_align = 0x20
++    for suffix in ('C1', 'C2'): hle(D + suffix + 'ENS_11DecoderTypeENS_19DecoderOutputFormatE', reason)(ctor3)
++    hle(D + 'D2Ev', reason)(lambda hz, r: free_decoder(hz, r[0]))
++    hle(D + 'D1Ev', reason)(lambda hz, r: free_decoder(hz, r[0]))
++    def delete_decoder(hz, r): free_decoder(hz, r[0]); guest_of(hz).call('_ZdlPv', x0=r[0])   # the deleting destructor: the object itself goes back through the game's operator delete
++    hle(D + 'D0Ev', reason)(delete_decoder)
++
++    def configure(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        g, md = guest_of(hz), r[1]
++        if d.audio:   # codec-specific data as Android's MediaCodec takes it: Vorbis csd-0 = identification header, csd-1 = setup header
++            for k in range(2):
++                b = g.find_buf(md, f'csd-{k}') if md else 0
++                if b:
++                    n, ptr = g.size(b), g.data(b)
++                    if n and ptr: d.vhdr[k] = hz.rd(ptr, n)
++            ch, rate = (g.find_i32(md, 'channel-count'), g.find_i32(md, 'sample-rate')) if md else (None, None)
++            if ch and ch > 0: d.ch = ch
++            if rate and rate > 0: d.rate = rate
++            return rv(r, 0)
++        w, h = (g.find_i32(md, 'width'), g.find_i32(md, 'height')) if md else (None, None)
++        with d.lock:
++            if w and h and w > 0 and h > 0 and not d.fmt_sent: d.w, d.h = w, h
++        rv(r, 0)
++    hle(D + '9ConfigureEPNS_9MediaDataE', reason)(configure)
++
++    def register_events(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        d.evc = r[1]
++        for i in range(4):
++            try: p = hz.rd64(r[1] + 8 * i) if r[1] else 0
++            except AssertionError: p = 0
++            d.ev[i] = p if p % 8 == 0 and p >= 0x1_0000_0000 else None
++        rv(r, 0)
++    hle(D + '20RegisterClientEventsEPNS_13DecoderEventsE', reason)(register_events)
++
++    def start(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, 0x2002)
++        with d.lock: d.started = True
++        d.fire([0]); rv(r, 0)   # the inputs are all free: input available
++    hle(D + '5StartEv', reason)(start)
++
++    def stop(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, 0x2003)
++        with d.lock: d.started = False
++        d.reset(True); rv(r, 0)
++    hle(D + '4StopEv', reason)(stop)
++
++    def reset(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        d.reset(True); d.fmt_sent = False; rv(r, 0)
++    hle(D + '5ResetEv', reason)(reset)
++
++    def flush(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        d.reset(False)
++        if d.kind == T_VORBIS:
++            with d.dlock: d.close_codec()   # a seek starts the overlap afresh: the decoder is made again from the headers at the next packet
++        rv(r, 0)
++    hle(D + '5FlushEv', reason)(flush)
++
++    def acquire_input(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        if not r[1] or not r[2]: return rv(r, MD_BAD_ARG)
++        with d.lock:
++            res, idx, left = MD_NO_INPUT, -1, 0
++            if d.infree and d.started and not d.in_eos:   # no input after an end-of-stream packet until a Flush or a Stop, as with MediaCodec
++                idx = d.infree.pop(0); left = len(d.infree); d.inown.add(idx); res = 0
++        hz.wr32(r[1], idx & M32); hz.wr32(r[2], left & M32); rv(r, res)
++    hle(D + '23AcquireInputBufferIndexEPiS1_', reason)(acquire_input)
++
++    def get_input(hz, r):
++        d = dec_of(hz, r[0]); i = r[1] & M32
++        if d is None: return rv(r, MD_FAIL)
++        if not r[2] or i >= MD_NIN: return rv(r, MD_BAD_ARG)
++        g = guest_of(hz); g.set_data(r[2], d.in_base + i * MD_INCAP, MD_INCAP); g.set_range(r[2], 0, MD_INCAP); rv(r, 0)
++    hle(D + '14GetInputBufferEiPNS_6BufferE', reason)(get_input)
++
++    def send_input(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        s32 = lambda x: (x & M32) - (1 << 32) if x & (1 << 31) else x & M32
++        i, off, size, pts, flags = r[1] & M32, s32(r[2]), s32(r[3]), r[4] - (1 << 64) if r[4] & (1 << 63) else r[4], r[5] & M32
++        if i >= MD_NIN or off < 0 or size < 0 or off + size > MD_INCAP: return rv(r, MD_BAD_ARG)
++        fmt_now = False
++        with d.lock:
++            if i in d.infree: d.infree.remove(i)   # an index acquired before a Flush and sent after it: claimed from the free list
++            d.inown.discard(i)
++            if flags & 4: d.in_eos = True
++            if any(p['in'] == i for p in d.pend): return rv(r, MD_BAD_ARG)   # sent twice
++            if len(d.pend) == MD_NIN: return rv(r, MD_BAD_ARG)
++            if d.kind in (T_VP8, T_VP9) and not d.w and size > 0:
++                head = hz.rd(d.in_base + i * MD_INCAP + off, min(size, 64)); sz = (vp9_size if d.kind == T_VP9 else vp8_size)(head)
++                if sz: d.w, d.h = sz; hz.log(f'[movie] {"VP9" if d.kind == T_VP9 else "VP8"} key frame: {sz[0]}x{sz[1]}')
++            if not d.fmt_sent:
++                d.fmt_sent = fmt_now = True
++                if not d.w and not d.audio: d.w, d.h = 1920, 1080   # the size is fixed from here on: the slots are made by it
++            d.pend.append(dict(**{'in': i}, off=off, size=size, pts=pts, flags=flags)); d.n_in += 1
++        if fmt_now: d.fire([2])
++        d.pump(); rv(r, 0)
++    hle(D + '24SendInputBufferForDecodeEiiilj', reason)(send_input)
++
++    def acquire_output(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        if not (r[1] and r[2] and r[3] and r[4]): return rv(r, MD_BAD_ARG)
++        with d.lock:
++            res, idx, pts, flags, left = MD_NO_OUTPUT, -1, 0, 0, 0
++            if d.outq and d.started:
++                idx = d.outq.pop(0); s = d.out[idx]; pts, flags, left = s.pts, s.flags, len(d.outq); s.cli = True; res = 0; d.n_out += 1
++        hz.wr32(r[1], idx & M32); hz.wr64(r[2], pts & M64); hz.wr32(r[3], flags); hz.wr32(r[4], left & M32); rv(r, res)
++    hle(D + '24AcquireOutputBufferIndexEPiPlPjS1_', reason)(acquire_output)
++
++    def put_format(hz, d, md):
++        g = guest_of(hz)
++        if d.audio: g.set_i32(md, 'channel-count', d.ch or 2); g.set_i32(md, 'sample-rate', d.rate or 48000); return
++        w, h = d.dims()
++        g.set_i32(md, 'width', w); g.set_i32(md, 'height', h); g.set_rect(md, 'crop', 0, 0, w - 1, h - 1)
++        g.set_i32(md, 'stride', w); g.set_i32(md, 'slice-height', h)
++        for k, v in (('nv12-y-stride', w), ('nv12-y-offset', 0), ('nv12-uv-offset', w * h), ('nv12-uv-stride', w), ('nv12-width', w), ('nv12-height', h)): g.set_i32(md, k, v)
++
++    def output_format(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        if not r[1]: return rv(r, MD_BAD_ARG)
++        put_format(hz, d, r[1]); rv(r, 0)
++    hle(D + '15GetOutputFormatEPNS_9MediaDataE', reason)(output_format)
++
++    def output_buffer_format(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        if not r[2]: return rv(r, MD_BAD_ARG)
++        put_format(hz, d, r[2]); rv(r, 0)
++    hle(D + '21GetOutputBufferFormatEiPNS_9MediaDataE', reason)(output_buffer_format)
++
++    def output_size(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        if not r[1] or not r[2]: return rv(r, MD_BAD_ARG)
++        if d.audio: size = PCM_CAP
++        else: w, h = d.dims(); size = w * h * 3 // 2
++        hz.wr32(r[1], size); hz.wr32(r[2], d.out_align or d.mode); rv(r, 0)   # the second output: the mode (SDK 4 and later), an alignment (SDK 3)
++    hle(D + '19GetOutputBufferSizeEPiS1_', reason)(output_size)
++
++    def write_output(hz, d, i, buf):
++        g = guest_of(hz); g.set_range(buf, 0, 0)
++        s = d.out[i]
++        if d.audio:   # PCM 16-bit interleaved; an output without samples (the end of the stream) is empty
++            data = s.data if s.pic else b''; ptr, cap = g.data(buf), g.cap(buf)
++            if not ptr or cap < len(data): hz.log(f'[movie] [RED] client audio buffer is {cap} bytes, this packet needs {len(data)}'); return MD_BAD_ARG
++            if data: hz.wr(ptr, data)
++            g.set_range(buf, 0, len(data)); return 0
++        w, h = d.dims(); need = w * h * 3 // 2; ptr, cap = g.data(buf), g.cap(buf)
++        if not ptr or cap < need: hz.log(f'[movie] [RED] client output buffer is {cap} bytes, a frame needs {need}'); return MD_BAD_ARG
++        hz.wr(ptr, s.data if s.pic and len(s.data) == need else bytes([16]) * (w * h) + bytes([128]) * (need - w * h))   # no picture (an end-of-stream output): a black frame
++        g.set_range(buf, 0, need); return 0
++
++    def get_output(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        i = r[1] & M32
++        if not r[2] or i >= d.nout: return rv(r, MD_BAD_ARG)
++        rv(r, write_output(hz, d, i, r[2]))
++    hle(D + '15GetOutputBufferEiPNS_6BufferE', reason)(get_output)
++
++    def get_output_format(hz, r):
++        d = dec_of(hz, r[0])
++        if d is None: return rv(r, MD_FAIL)
++        i = r[1] & M32
++        if not r[2] or i >= d.nout: return rv(r, MD_BAD_ARG)
++        if r[3]: put_format(hz, d, r[3])
++        rv(r, write_output(hz, d, i, r[2]))
++    hle(D + '15GetOutputBufferEiPNS_6BufferEPNS_9MediaDataE', reason)(get_output_format)
++
++    def release_output(hz, r):
++        d = dec_of(hz, r[0]); i = r[1] & M32
++        if d is None: return rv(r, MD_FAIL)
++        if i >= d.nout: return rv(r, MD_BAD_ARG)
++        with d.lock:
++            held = d.out[i].cli
++            if held: s = d.out[i]; s.used = s.pic = s.cli = False
++            queued = bool(d.pend)
++        if held and queued: d.pump()   # a free slot lets the next packet be decoded
++        rv(r, 0)
++    hle(D + '24ReleaseOutputBufferIndexEi', reason)(release_output)
++    hle(D + '12GetLastErrorEv', 'movie decoder: last error (none)')(lambda hz, r: rv(r, 0))
++
++
++if movie_codec.library_path(): _decoder_handlers()
++else: _install()   # the decoders are not built: the openings are refused
+diff --git a/dm/tools/horizon_overrides.py b/dm/tools/horizon_overrides.py
+index 749a0a5..0a577b0 100644
+--- a/dm/tools/horizon_overrides.py
++++ b/dm/tools/horizon_overrides.py
+@@ -58,10 +58,10 @@ def install(horizon):
+     import horizon_movie   # the movie library: openings are refused, named and counted
+     import horizon_trivial
+     for sym, value, why, src in horizon_trivial.TRIVIAL:   # generated from the Mach host: entries that do nothing or return a constant; a hand-written port of the same symbol wins
+-        if sym in TABLE: continue
++        if sym in TABLE or horizon_movie.sdk_owns(sym): continue
+         TABLE[sym] = ((lambda hz, r: None) if value is None else (lambda hz, r, v=value: r.__setitem__(0, v)), why); ORIGIN[sym] = 'trivial'
+     for sym, why, src in horizon_trivial.STUBBED:   # not ported yet: answers 0, and the first call of each is logged
+-        if sym in TABLE: continue
++        if sym in TABLE or horizon_movie.sdk_owns(sym): continue
+         TABLE[sym] = (_stub(sym), f'not ported from {src}: answers 0 ({why})'); ORIGIN[sym] = 'stubbed'
+     exported = set().union(*(m.exports for m in horizon.ms.modules))
+     for sym in TABLE: ORIGIN.setdefault(sym, 'handwritten')
+diff --git a/dm/tools/movie_codec.py b/dm/tools/movie_codec.py
+new file mode 100644
+index 0000000..02e4fb1
+--- /dev/null
++++ b/dm/tools/movie_codec.py
+@@ -0,0 +1,74 @@
++"""The decoders of libnx2linux_movie.so (linux/host/movie.c): VP8 / VP9 to NV12 and Vorbis to PCM 16-bit, for horizon_movie.py. NX2LINUX_MOVIE_LIB names the library
++(default ~/.cache/nx2linux/build-host/libnx2linux_movie.so)."""
++import ctypes as C, os
++from pathlib import Path
++
++
++def library_path():
++    p = os.environ.get('NX2LINUX_MOVIE_LIB') or str(Path.home() / '.cache/nx2linux/build-host/libnx2linux_movie.so')
++    return p if os.path.exists(p) else None
++
++
++class CodecError(Exception):
++    pass
++
++
++_lib = None
++
++
++def lib():
++    global _lib
++    if _lib is None:
++        path = library_path()
++        if not path: raise CodecError('libnx2linux_movie.so is not built (cmake --build ~/.cache/nx2linux/build-host)')
++        L = _lib = C.CDLL(path)
++        L.nx2mv_error.restype = C.c_char_p; L.nx2mv_vpx_version.restype = C.c_char_p
++        L.nx2mv_vpx_open.argtypes = [C.c_int, C.c_int, C.c_int, C.c_int]; L.nx2mv_vpx_open.restype = C.c_void_p
++        L.nx2mv_vpx_close.argtypes = [C.c_void_p]
++        L.nx2mv_vpx_decode.argtypes = [C.c_void_p, C.c_char_p, C.c_int, C.c_void_p, C.c_int, C.c_int, C.POINTER(C.c_int), C.POINTER(C.c_int)]; L.nx2mv_vpx_decode.restype = C.c_int
++        L.nx2mv_vorbis_open.argtypes = [C.c_char_p, C.c_int, C.c_char_p, C.c_int, C.POINTER(C.c_int), C.POINTER(C.c_int)]; L.nx2mv_vorbis_open.restype = C.c_void_p
++        L.nx2mv_vorbis_packet.argtypes = [C.c_void_p, C.c_char_p, C.c_int, C.c_void_p, C.c_int]; L.nx2mv_vorbis_packet.restype = C.c_int
++        L.nx2mv_vorbis_close.argtypes = [C.c_void_p]
++    return _lib
++
++
++def error(): return lib().nx2mv_error().decode()
++
++
++class Video:
++    """A VP8 or VP9 decoder; frames come out as NV12 of the size given (stride = width), padded with black or cropped when the stream's size differs"""
++    def __init__(self, vp9, width, height, threads=2):
++        self.w, self.h = width, height
++        self.handle = lib().nx2mv_vpx_open(int(bool(vp9)), threads, width, height)
++        if not self.handle: raise CodecError(error())
++        self.version = lib().nx2mv_vpx_version().decode()
++
++    def decode(self, packet):
++        """(NV12 bytes or None when the packet makes no picture, the picture's own size); CodecError on a decode error"""
++        out = C.create_string_buffer(self.w * self.h * 3 // 2); dw, dh = C.c_int(), C.c_int()
++        r = lib().nx2mv_vpx_decode(self.handle, packet, len(packet), out, self.w, self.h, C.byref(dw), C.byref(dh))
++        if r < 0: raise CodecError(error())
++        return (out.raw if r == 1 else None), (dw.value, dh.value)
++
++    def close(self):
++        if self.handle: lib().nx2mv_vpx_close(self.handle); self.handle = None
++
++
++class Vorbis:
++    """A Vorbis decoder from the identification and setup headers (the codec-specific data of a WebM track)"""
++    def __init__(self, ident, setup):
++        ch, rate = C.c_int(), C.c_int()
++        self.handle = lib().nx2mv_vorbis_open(ident, len(ident), setup, len(setup), C.byref(ch), C.byref(rate))
++        if not self.handle: raise CodecError(error())
++        self.channels, self.rate = ch.value, rate.value
++
++    def decode(self, packet, cap=8192 * 8 * 2):
++        """The PCM 16-bit interleaved samples of a packet (empty for the first one, which only primes the overlap)"""
++        out = C.create_string_buffer(cap)
++        r = lib().nx2mv_vorbis_packet(self.handle, packet, len(packet), out, cap)
++        if r == -2: raise CodecError(f'a Vorbis packet gives more than {cap} bytes')
++        if r < 0: raise CodecError(error())
++        return out.raw[:r]
++
++    def close(self):
++        if self.handle: lib().nx2mv_vorbis_close(self.handle); self.handle = None
+diff --git a/dm/tools/movie_probe.py b/dm/tools/movie_probe.py
+new file mode 100644
+index 0000000..1fcdb4e
+--- /dev/null
++++ b/dm/tools/movie_probe.py
+@@ -0,0 +1,141 @@
++"""Plays a movie of the game's RomFS through the SDK's own movie player pieces, inside the running process, and checks what comes out (NX2Linux S7bis, milestone E). The game's movie::Extractor (lifted SDK code) demuxes a WebM file
++on the RomFS, and the Decoder of horizon_movie.py decodes its packets; the pictures and the samples are compared with ffmpeg's decoding of the same file (extracted from the RomFS image into a temporary folder, never kept).
++This is how a decoder is verified without playing the game up to a movie: NX2LINUX_MOVIE_PROBE=<path in the RomFS>[:packets] runs it once, 20 seconds in, on a guest thread of the game (where the SDK may be called).
++The probe prints addresses, counts and checksums only."""
++import hashlib, shutil, struct, subprocess, tempfile, time
++from pathlib import Path
++
++import horizon_movie as hm
++import horizon_overrides as ho
++
++M32, M64 = 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF
++D = '_ZN5movie7Decoder'
++E = '_ZN5movie9Extractor'
++
++
++def rom_file(hz, path):
++    rom = next((m for m in hz.fs.mounts.values() if hasattr(m, 'index')), None)
++    if rom is None: raise RuntimeError('the RomFS is not mounted')
++    st = rom.stat(path)
++    if st is None: raise RuntimeError(f'{path} is not in the RomFS')
++    return rom.read(path, 0, st[2])
++
++
++class Probe:
++    def __init__(self, hz, path, packets=120, say=None):
++        self.hz, self.path, self.packets = hz, path, packets
++        self.g = hm.guest_of(hz); self.say = say or (lambda m: hz.log('[probe] ' + m))
++
++    def new(self, size):
++        p = self.g.call('_Znwm', x0=size); self.hz.wr(p, bytes(size)); return p
++
++    def call(self, sym, **regs): return self.g.call(sym, **regs) & M64
++
++    def h(self, suffix, *args):
++        """A method of the host's Decoder, as the game's player would call it"""
++        r = [0] * 39; r[:len(args)] = args
++        ho.TABLE[D + suffix][0](self.hz, r); return r[0] & M32
++
++    def run(self):
++        hz, g, say = self.hz, self.g, self.say
++        data = rom_file(hz, self.path); work = Path(tempfile.mkdtemp(prefix='movie_probe_'))
++        try:
++            (work / 'm.webm').write_bytes(data); say(f'{self.path}: {len(data)} bytes')
++            ex, container, tracks = 0, None, 0
++            word = self.new(64)
++            for c in range(0, 9):
++                ex = self.new(0x2000); self.call(E + 'C1ENS_13ContainerTypeE', x0=ex, x1=c)
++                ret = self.call(E + '13SetDataSourceEPKc', x0=ex, x1=g.key(f'rom:/{self.path}')) & M32
++                tret = self.call(E + '13GetTrackCountEPi', x0=ex, x1=word) & M32; tracks = hz.rd32(word)
++                t0 = time.monotonic()
++                while ret == 0 and tret == 0 and not tracks and time.monotonic() - t0 < 6.0:   # the opening goes on in the extractor's own thread
++                    time.sleep(0.05); tret = self.call(E + '13GetTrackCountEPi', x0=ex, x1=word) & M32; tracks = hz.rd32(word)
++                say(f'container type {c}: SetDataSource -> {ret:#x}, GetTrackCount -> {tret:#x} ({tracks} tracks after {time.monotonic() - t0:.2f} s)')
++                if ret == 0 and tret == 0 and tracks: container = c; break
++            if container is None: return {'ok': False, 'why': 'no container type opened the file'}
++            kinds = {}
++            for t in range(tracks):
++                md = self.new(0x400); self.call('_ZN5movie9MediaDataC1Ev', x0=md)
++                ret = self.call(E + '21GetTrackConfigurationEiPNS_9MediaDataE', x0=ex, x1=t, x2=md) & M32
++                w, hh, ch, rate = g.find_i32(md, 'width'), g.find_i32(md, 'height'), g.find_i32(md, 'channel-count'), g.find_i32(md, 'sample-rate')
++                kinds[t] = dict(kind='video' if w else 'audio', md=md, w=w, h=hh, ch=ch, rate=rate)
++                say(f'track {t}: GetTrackConfiguration -> {ret:#x}: ' + (f'video {w}x{hh}' if w else f'audio {ch} channels {rate} Hz'))
++                say(f'  SelectTrack -> {self.call(E + "11SelectTrackEi", x0=ex, x1=t) & M32:#x}')
++            decs = {}
++            for t, k in kinds.items():
++                obj = self.new(0x200); evs = self.new(0x40); signalled = []
++                for i in range(4):
++                    e = self.new(0x100); self.call('_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE', x0=e, x1=0, x2=0); hz.wr64(evs + 8 * i, e)
++                self.h('C1ENS_11DecoderTypeENS_19DecoderOutputFormatE', obj, 3 if k['kind'] == 'video' else 5, 3 if k['kind'] == 'video' else 1)
++                say(f'track {t}: Configure -> {self.h("9ConfigureEPNS_9MediaDataE", obj, k["md"]):#x}, RegisterClientEvents -> {self.h("20RegisterClientEventsEPNS_13DecoderEventsE", obj, evs):#x}, Start -> {self.h("5StartEv", obj):#x}')
++                decs[t] = dict(obj=obj, ibuf=self.new(0x100), obuf=self.new(0x100), frames=[], pcm=bytearray())
++                for b in (decs[t]['ibuf'], decs[t]['obuf']): self.call('_ZN5movie6BufferC1Ev', x0=b)
++            # an output buffer of the player's own, as big as the decoder says
++            for t, dd in decs.items():
++                self.h('19GetOutputBufferSizeEPiS1_', dd['obj'], word, word + 4); cap = hz.rd32(word); dd['mem'] = self.call('_Znwm', x0=cap)
++                self.call('_ZN5movie6Buffer18SetDataAndCapacityEPvm', x0=dd['obuf'], x1=dd['mem'], x2=cap); say(f'track {t}: an output buffer of {cap} bytes')
++            rbuf = self.new(0x100); self.call('_ZN5movie6BufferC1Em', x0=rbuf, x1=2 << 20)
++            counts = {t: 0 for t in kinds}
++            for n in range(self.packets):
++                ret = self.call(E + '29GetTrackIndexForAvailableDataEPm', x0=ex, x1=word) & M32
++                if ret: say(f'GetTrackIndexForAvailableData -> {ret:#x} after {n} packets'); break
++                t = hz.rd64(word) & M32
++                ret = self.call(E + '4ReadEPNS_6BufferE', x0=ex, x1=rbuf) & M32
++                size = g.size(rbuf); pk = hz.rd(g.data(rbuf), size) if size else b''
++                tret = self.call(E + '13GetSampleTimeEPl', x0=ex, x1=word); pts = struct.unpack('<q', hz.rd(word, 8))[0]
++                if n < 3: say(f'packet {n}: track {t}, Read -> {ret:#x}, {size} bytes, time {pts}')
++                self.call(E + '7AdvanceEv', x0=ex)
++                dd = decs.get(t)
++                if dd is None or not pk: continue
++                if self.h('23AcquireInputBufferIndexEPiS1_', dd['obj'], word, word + 4): say(f'track {t}: no input free at packet {n}'); break
++                i = hz.rd32(word); self.h('14GetInputBufferEiPNS_6BufferE', dd['obj'], i, dd['ibuf']); hz.wr(g.data(dd['ibuf']), pk)
++                self.h('24SendInputBufferForDecodeEiiilj', dd['obj'], i, 0, len(pk), pts, 0)
++                counts[t] += 1
++                while not self.h('24AcquireOutputBufferIndexEPiPlPjS1_', dd['obj'], word, word + 8, word + 16, word + 24):
++                    oi = hz.rd32(word); self.h('15GetOutputBufferEiPNS_6BufferE', dd['obj'], oi, dd['obuf']); b = g.size(dd['obuf'])
++                    out = hz.rd(g.data(dd['obuf']), b)
++                    (dd['frames'].append(out) if kinds[t]['kind'] == 'video' else dd['pcm'].extend(out)); self.h('24ReleaseOutputBufferIndexEi', dd['obj'], oi)
++            return dict(ok=True, container=container, kinds=kinds, decs=decs, counts=counts, work=work, data=data)
++        except Exception:
++            shutil.rmtree(work, ignore_errors=True); raise
++
++
++def check(res, say):
++    """The pictures and the samples against ffmpeg's decoding of the same file"""
++    work, ok = res['work'], bool(res['decs'])
++    try:
++        for t, dd in res['decs'].items():
++            k = res['kinds'][t]
++            if k['kind'] == 'video':
++                n = len(dd['frames']); w, h = k['w'], k['h']
++                subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(work / 'm.webm'), '-map', '0:v:0', '-frames:v', str(n), '-f', 'rawvideo', '-pix_fmt', 'nv12', str(work / 'v.yuv')], check=True, capture_output=True)
++                want = (work / 'v.yuv').read_bytes(); size = w * h * 3 // 2
++                equal = sum(1 for i, f in enumerate(dd['frames']) if want[i * size:(i + 1) * size] == f)
++                say(f'track {t}: {n} pictures {w}x{h} decoded, {equal} identical to ffmpeg\'s; first picture sha {hashlib.sha256(dd["frames"][0]).hexdigest()[:12] if n else "-"}'); ok = ok and n > 0 and equal == n
++            else:
++                subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(work / 'm.webm'), '-map', '0:a:0', '-f', 's16le', '-ac', str(k['ch']), '-ar', str(k['rate']), str(work / 'a.raw')], check=True, capture_output=True)
++                want = (work / 'a.raw').read_bytes(); got = bytes(dd['pcm']); m = min(len(got), len(want)) // 2
++                if m > 100000:
++                    a, b = struct.unpack(f'<{m}h', got[:2 * m]), struct.unpack(f'<{m}h', want[:2 * m])
++                    starts = range(8192, m - 40000 - 8192, 40000)   # the louder windows of the reference: a silent start compares nothing
++                    at = max(starts, key=lambda o: sum(abs(x) for x in b[o:o + 40000:16]))
++                    err = min(sum(abs(x - y) for x, y in zip(a[at + s:at + s + 40000], b[at:at + 40000])) / 40000 for s in range(-4096, 4097, 2)); rms = (sum(x * x for x in b[at:at + 40000]) / 40000) ** 0.5
++                    say(f'track {t}: {len(got) // (2 * k["ch"])} samples decoded ({len(got) / (2 * k["ch"] * k["rate"]):.1f} s), mean error against ffmpeg {err:.1f} in the loudest window (rms of the signal {rms:.0f}{", a silent track" if rms < 1 else ""}; our own peak {max(map(abs, a))})'); ok = ok and err < max(250, rms * 0.05) and (rms > 100 or max(map(abs, a)) <= 2)   # a silent reference (XC2's movie tracks are: -91 dB in ffmpeg too) must come out silent
++                else: say(f'track {t}: {len(got)} bytes of PCM decoded: too few to compare'); ok = False
++    finally: shutil.rmtree(work, ignore_errors=True)
++    return ok
++
++
++def probe_once(hz):
++    """Called on a guest thread of the game: runs the probe named by NX2LINUX_MOVIE_PROBE once, 20 s after the start"""
++    import os, time
++    spec = os.environ.get('NX2LINUX_MOVIE_PROBE')
++    if not spec or getattr(hz, 'movie_probed', False) or time.monotonic() - hz.start < 20: return
++    hz.movie_probed = True
++    path, _, n = spec.partition(':')
++    try:
++        res = Probe(hz, path, int(n or 120)).run()
++        if res.get('ok'): hz.log(f'[probe] {"PASSED" if check(res, lambda m: hz.log("[probe] " + m)) else "FAILED"}: packets per track {res["counts"]}')
++        else: hz.log(f'[probe] FAILED: {res["why"]}')
++    except Exception as e:
++        import traceback; hz.log('[probe] FAILED: ' + traceback.format_exc().replace('\n', ' | '))
+diff --git a/dm/tools/tests/test_horizon_movie.py b/dm/tools/tests/test_horizon_movie.py
+index 2975eef..9797e50 100644
+--- a/dm/tools/tests/test_horizon_movie.py
++++ b/dm/tools/tests/test_horizon_movie.py
+@@ -1,10 +1,11 @@
+ """horizon_movie.py: opening a movie fails explicitly and is counted, with the SDK's own code (the host has no decoder behind movie::Decoder)"""
+-import sys, unittest
++import importlib, sys, unittest
+ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+-import horizon_movie as hm
++import movie_codec
+ import horizon_overrides as ho
++import horizon_movie as hm
+ 
+ 
+ class FakeHz:
+@@ -19,6 +20,20 @@ def call(hz, sym, *args):
+ 
+ 
+ class Movie(unittest.TestCase):
++    """The refusal is what the host does without its decoders: the module is loaded again as if libnx2linux_movie.so were not built"""
++    @classmethod
++    def setUpClass(cls):
++        cls.real, cls.before = movie_codec.library_path, set(ho.TABLE)
++        for sym in [k for k in ho.TABLE if 'movie' in k]: del ho.TABLE[sym]
++        movie_codec.library_path = lambda: None
++        importlib.reload(hm)
++
++    @classmethod
++    def tearDownClass(cls):
++        movie_codec.library_path = cls.real
++        for sym in [k for k in ho.TABLE if 'movie' in k]: del ho.TABLE[sym]
++        importlib.reload(hm)
++
+     def test_every_way_of_opening_a_movie_is_refused_with_the_sdks_own_code_and_counted(self):
+         hz = FakeHz(); hz.mem[0x100:0x120] = b'stream/movie/mv10010100.webm\0'
+         self.assertEqual(call(hz, '_ZN5movie9Extractor13SetDataSourceEPKc', 0x10, 0x100), hm.NO_IMPLEMENTATION)
+diff --git a/dm/tools/tests/test_movie_codec.py b/dm/tools/tests/test_movie_codec.py
+new file mode 100644
+index 0000000..ccdb965
+--- /dev/null
++++ b/dm/tools/tests/test_movie_codec.py
+@@ -0,0 +1,85 @@
++"""movie_codec.py: VP9 / VP8 pictures and Vorbis audio decoded by libnx2linux_movie.so are the same as ffmpeg's own decoding of the same streams (made here from synthetic test patterns: no game data). Needs ffmpeg with libvpx and
++a built libnx2linux_movie.so; skipped without them."""
++import shutil, struct, subprocess, sys, tempfile, unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++import movie_codec as mc
++
++FFMPEG = shutil.which('ffmpeg')
++
++
++def ivf_packets(path):
++    data = Path(path).read_bytes()
++    pos, out = struct.unpack_from('<H', data, 6)[0], []
++    while pos + 12 <= len(data):
++        n = struct.unpack_from('<I', data, pos)[0]; out.append(data[pos + 12:pos + 12 + n]); pos += 12 + n
++    return out
++
++
++def ogg_packets(path):
++    """The packets of the first logical stream of an Ogg file (lacing values; packets that continue over pages are joined)"""
++    data = Path(path).read_bytes(); pos, packets, cur = 0, [], b''
++    while pos + 27 <= len(data) and data[pos:pos + 4] == b'OggS':
++        nseg = data[pos + 26]; lacing = data[pos + 27:pos + 27 + nseg]; body = pos + 27 + nseg
++        for n in lacing:
++            cur += data[body:body + n]; body += n
++            if n < 255: packets.append(cur); cur = b''
++        pos = body
++    return packets
++
++
++def run(*args): subprocess.run(['ffmpeg', '-v', 'error', '-y', *args], check=True, capture_output=True)
++
++
++@unittest.skipUnless(FFMPEG and mc.library_path(), 'ffmpeg or libnx2linux_movie.so is missing')
++class Codec(unittest.TestCase):
++    def setUp(self): self.tmp = tempfile.TemporaryDirectory(); self.d = Path(self.tmp.name)
++    def tearDown(self): self.tmp.cleanup()
++
++    def video(self, codec, w=64, h=48, frames=12):
++        ivf, yuv = self.d / 'v.ivf', self.d / 'v.yuv'
++        run('-f', 'lavfi', '-i', f'testsrc2=size={w}x{h}:rate=25', '-frames:v', str(frames), '-c:v', codec, '-b:v', '200k', '-g', '5', str(ivf))
++        run('-i', str(ivf), '-f', 'rawvideo', '-pix_fmt', 'nv12', str(yuv))
++        return ivf_packets(ivf), yuv.read_bytes()
++
++    def test_vp9_pictures_are_what_ffmpeg_decodes(self):
++        packets, want = self.video('libvpx-vp9'); dec = mc.Video(True, 64, 48); size = 64 * 48 * 3 // 2
++        got = [dec.decode(p)[0] for p in packets]
++        self.assertTrue(all(g is not None for g in got)); self.assertEqual(len(got), 12)
++        self.assertEqual(b''.join(got), want)   # the same libvpx: the same bytes
++        dec.close()
++
++    def test_vp8_pictures_are_what_ffmpeg_decodes(self):
++        packets, want = self.video('libvpx')
++        dec = mc.Video(False, 64, 48)
++        self.assertEqual(b''.join(dec.decode(p)[0] for p in packets), want); dec.close()
++
++    def test_a_picture_of_another_size_is_padded_with_black_or_cropped(self):
++        packets, _ = self.video('libvpx-vp9')
++        big = mc.Video(True, 80, 64); nv, size = big.decode(packets[0])
++        self.assertEqual(size, (64, 48)); self.assertEqual(len(nv), 80 * 64 * 3 // 2)
++        self.assertEqual(nv[80 * 63 + 79], 16); self.assertEqual(nv[80 * 64 + 79], 128)   # the margin: luma 16, chroma 128
++        small = mc.Video(True, 32, 24); nv, _ = small.decode(packets[0]); self.assertEqual(len(nv), 32 * 24 * 3 // 2)
++
++    def test_garbage_is_an_error_not_a_picture(self):
++        dec = mc.Video(True, 64, 48)
++        with self.assertRaises(mc.CodecError): dec.decode(b'\x00' * 40)
++
++    def test_vorbis_is_what_ffmpeg_decodes_to_within_rounding(self):
++        ogg, pcm = self.d / 'a.ogg', self.d / 'a.raw'
++        run('-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=1', '-c:a', 'vorbis', '-strict', '-2', '-ac', '2', str(ogg))
++        run('-i', str(ogg), '-f', 's16le', '-ac', '2', str(pcm))
++        packets = ogg_packets(ogg); dec = mc.Vorbis(packets[0], packets[2])   # the identification and setup headers (the second is the comment)
++        self.assertEqual((dec.channels, dec.rate), (2, 48000))
++        got = b''.join(dec.decode(p) for p in packets[3:]); want = pcm.read_bytes()
++        n = min(len(got), len(want)) // 2
++        a, b = struct.unpack(f'<{n}h', got[:2 * n]), struct.unpack(f'<{n}h', want[:2 * n])
++        self.assertGreater(n, 80000)
++        # the two decoders start the overlap at different points: compare after the first block, as the best alignment of a few offsets
++        best = min((sum(abs(x - y) for x, y in zip(a[4000 + s:44000 + s], b[4000:44000])) / 40000 for s in range(-2048, 2049, 2)), default=1e9)
++        self.assertLess(best, 250)   # a 440 Hz tone at about half scale: a few hundred counts of mean error would mean a mismatch of phase or level, an exact decode is under 5
++        dec.close()
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_movie_decoder.py b/dm/tools/tests/test_movie_decoder.py
+new file mode 100644
+index 0000000..a3b1fe6
+--- /dev/null
++++ b/dm/tools/tests/test_movie_decoder.py
+@@ -0,0 +1,214 @@
++"""horizon_movie.py: the movie::Decoder protocol as a movie player drives it (inputs, output slots, events), against a fake guest SDK (Buffer, MediaData and SignalEvent as plain Python) and real VP9 and Vorbis streams made with ffmpeg
++from synthetic test patterns (no game data). The pictures and samples that come out are compared with ffmpeg's own decoding. Skipped without ffmpeg and a built libnx2linux_movie.so."""
++import shutil, struct, subprocess, sys, tempfile, unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++import movie_codec as mc
++import horizon_movie as hm
++import horizon_overrides as ho
++from test_movie_codec import ivf_packets, ogg_packets, run
++
++S = '_ZN5movie7Decoder'
++SYM = dict(ctor3=S + 'C1ENS_11DecoderTypeENS_19DecoderOutputFormatE', dtor0=S + 'D0Ev', dtor2=S + 'D2Ev', configure=S + '9ConfigureEPNS_9MediaDataE', events=S + '20RegisterClientEventsEPNS_13DecoderEventsE',
++           start=S + '5StartEv', stop=S + '4StopEv', flush=S + '5FlushEv', reset=S + '5ResetEv', acq_in=S + '23AcquireInputBufferIndexEPiS1_', get_in=S + '14GetInputBufferEiPNS_6BufferE',
++           send=S + '24SendInputBufferForDecodeEiiilj', acq_out=S + '24AcquireOutputBufferIndexEPiPlPjS1_', out_fmt=S + '15GetOutputFormatEPNS_9MediaDataE',
++           out_size=S + '19GetOutputBufferSizeEPiS1_', get_out=S + '15GetOutputBufferEiPNS_6BufferE', rel_out=S + '24ReleaseOutputBufferIndexEi')
++VTABLE, EVENTS, MD, BUF, OBJ = 0x5000_0000, 0x1_0000_1000, 0x1_0000_2000, 0x1_0000_3000, 0x1_0000_4000   # fake guest addresses
++CLIENT_BUF = 0x1_1000_0000
++
++
++class FakeAot:
++    def __init__(self, hz): self.hz = hz; self.lib = self; self.mapped = []
++    def try_map(self, base, size): self.mapped.append((base, size)); return True
++    def aot_hash64(self, a, n, blocks): return 1   # every address is readable
++
++
++class FakeMs:
++    def symbol(self, name): return {'_ZTVN5movie7DecoderE': VTABLE}[name]
++
++
++class FakeHz:
++    """A guest memory in dictionaries and the SDK functions the decoder calls, as Python"""
++    def __init__(self):
++        self.mem, self.logs, self.signalled, self.bufs, self.md, self.freed = {}, [], [], {}, {}, []
++        self.aot, self.ms = FakeAot(self), FakeMs()
++    def rd(self, a, n):
++        out = bytearray()
++        for k in range(n): out.append(self.mem.get(a + k, 0))
++        return bytes(out)
++    def wr(self, a, d):
++        for k, b in enumerate(d): self.mem[a + k] = b
++    def rd64(self, a): return struct.unpack('<Q', self.rd(a, 8))[0]
++    def rd32(self, a): return struct.unpack('<I', self.rd(a, 4))[0]
++    def wr64(self, a, v): self.wr(a, struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF))
++    def wr32(self, a, v): self.wr(a, struct.pack('<I', v & 0xFFFFFFFF))
++    def log(self, m): self.logs.append(m)
++    def cstr(self, a): return self.rd(a, 64).split(b'\0')[0].decode()
++
++    def call_guest(self, sym, regs=None):
++        r = regs or {}; x = lambda i: r.get(f'x{i}', 0)
++        if sym == '_ZN5movie6Buffer18SetDataAndCapacityEPvm': self.bufs[x(0)] = dict(ptr=x(1), cap=x(2), off=0, size=0)
++        elif sym == '_ZN5movie6Buffer8SetRangeEii': self.bufs[x(0)].update(off=x(1), size=x(2))
++        elif sym == '_ZNK5movie6Buffer4DataEv': return self.bufs[x(0)]['ptr'] + self.bufs[x(0)]['off']
++        elif sym == '_ZNK5movie6Buffer8CapacityEv': return self.bufs[x(0)]['cap']
++        elif sym == '_ZNK5movie6Buffer4SizeEv': return self.bufs[x(0)]['size']
++        elif sym == '_ZN5movie9MediaData8SetInt32EPKci': self.md.setdefault(x(0), {})[self.cstr(x(1))] = x(2) & 0xFFFFFFFF
++        elif sym == '_ZN5movie9MediaData7SetRectEPKciiii': self.md.setdefault(x(0), {})[self.cstr(x(1))] = (x(2), x(3), x(4), x(5))
++        elif sym == '_ZNK5movie9MediaData9FindInt32EPKcPi':
++            v = self.md.get(x(0), {}).get(self.cstr(x(1)))
++            if v is None: return 0
++            self.wr32(x(2), v); return 1
++        elif sym == '_ZNK5movie9MediaData10FindBufferEPKcPPNS_6BufferE':
++            b = self.md.get(x(0), {}).get(self.cstr(x(1)))
++            if b is None: return 0
++            self.wr64(x(2), b); return 1
++        elif sym == '_ZN2nn2os11SignalEventEPNS0_9EventTypeE': self.signalled.append(x(0))
++        elif sym == '_ZdlPv': self.freed.append(x(0))
++        else: raise AssertionError(f'the decoder called {sym}')
++        return 0
++
++
++def call(hz, name, *args):
++    r = [0] * 39; r[:len(args)] = args
++    ho.TABLE[SYM[name]][0](hz, r)
++    return r[0] & 0xFFFFFFFF
++
++
++class Player:
++    """What a movie player does with a decoder: constructs it, configures it, registers four events, starts it, feeds packets and takes the outputs"""
++    def __init__(self, hz, kind, fmt, md=None):
++        self.hz = hz
++        hz.wr(EVENTS, b''.join(struct.pack('<Q', 0x1_0000_5000 + 0x100 * i) for i in range(4)))
++        call(hz, 'ctor3', OBJ, kind, fmt)
++        if md: self.configure(md)
++        call(hz, 'events', OBJ, EVENTS); call(hz, 'start', OBJ)
++
++    def configure(self, md):
++        self.hz.md[MD] = md; return call(self.hz, 'configure', OBJ, MD)
++
++    def send(self, packet, pts=0, flags=0):
++        hz = self.hz
++        self.assertion = call(hz, 'acq_in', OBJ, 0x1000, 0x1004)
++        if self.assertion: return self.assertion
++        i = hz.rd32(0x1000); call(hz, 'get_in', OBJ, i, BUF)
++        hz.wr(hz.bufs[BUF]['ptr'], packet)
++        return call(hz, 'send', OBJ, i, 0, len(packet), pts, flags)
++
++    def take(self):
++        """(pts, flags, the output bytes) of the next ready output, or None"""
++        hz = self.hz
++        if call(hz, 'acq_out', OBJ, 0x1010, 0x1018, 0x1020, 0x1024): return None
++        i, pts, flags = hz.rd32(0x1010), struct.unpack('<q', hz.rd(0x1018, 8))[0], hz.rd32(0x1020)
++        call(hz, 'get_out', OBJ, i, CLIENT_BUF + 0x100000 * 0)
++        return i, pts, flags
++
++
++@unittest.skipUnless(shutil.which('ffmpeg') and mc.library_path(), 'ffmpeg or libnx2linux_movie.so is missing')
++class Decoder(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory(); self.d = Path(self.tmp.name)
++        self.hz = FakeHz()
++        self.hz.bufs[CLIENT_BUF] = dict(ptr=0x2_0000_0000, cap=4 << 20, off=0, size=0)   # the player's own output buffer
++
++    def tearDown(self): self.tmp.cleanup()
++
++    def vp9(self, w=64, h=48, frames=10):
++        ivf, yuv = self.d / 'v.ivf', self.d / 'v.yuv'
++        run('-f', 'lavfi', '-i', f'testsrc2=size={w}x{h}:rate=25', '-frames:v', str(frames), '-c:v', 'libvpx-vp9', '-b:v', '200k', '-g', '4', str(ivf))
++        run('-i', str(ivf), '-f', 'rawvideo', '-pix_fmt', 'nv12', str(yuv))
++        return ivf_packets(ivf), yuv.read_bytes()
++
++    def output(self, p, i):
++        hz = self.hz; call(hz, 'get_out', OBJ, i, CLIENT_BUF); b = hz.bufs[CLIENT_BUF]
++        return hz.rd(b['ptr'] + b['off'], b['size'])
++
++    def drain(self, p):
++        out = []
++        while True:
++            t = p.take()
++            if t is None: return out
++            i, pts, flags = t; out.append((pts, flags, self.output(p, i))); call(self.hz, 'rel_out', OBJ, i)
++
++    def test_a_vp9_movie_plays_through_the_protocol_and_the_pictures_are_ffmpegs(self):
++        packets, want = self.vp9(); hz = self.hz; size = 64 * 48 * 3 // 2
++        p = Player(hz, 3, 3)   # SDK 3: type 3 is VP9, format 3 is NV12
++        self.assertIn(0x1_0000_5000, hz.signalled)   # "input available" came with Start
++        got = []
++        for k, pk in enumerate(packets):
++            self.assertEqual(p.send(pk, pts=k * 40000), 0)
++            got += self.drain(p)
++        self.assertEqual([g[0] for g in got], [k * 40000 for k in range(len(packets))])   # every picture, with its time, in order
++        self.assertEqual(b''.join(g[2] for g in got), want)
++        self.assertIn(0x1_0000_5100, hz.signalled); self.assertIn(0x1_0000_5200, hz.signalled)   # output ready; format changed (the size became known)
++
++    def test_the_format_is_what_the_key_frame_says_and_the_buffer_size_is_one_frame(self):
++        packets, _ = self.vp9(); hz = self.hz
++        p = Player(hz, 3, 3); p.send(packets[0])
++        call(hz, 'out_fmt', OBJ, 0x1_0000_6000)
++        f = hz.md[0x1_0000_6000]
++        self.assertEqual((f['width'], f['height'], f['crop'], f['nv12-y-stride'], f['nv12-uv-offset'], f['slice-height']), (64, 48, (0, 0, 63, 47), 64, 64 * 48, 48))
++        call(hz, 'out_size', OBJ, 0x1030, 0x1034)
++        self.assertEqual((hz.rd32(0x1030), hz.rd32(0x1034)), (64 * 48 * 3 // 2, 0x20))   # one NV12 frame; SDK 3's second output is its alignment
++
++    def test_outputs_the_client_holds_stop_the_decoder_until_it_gives_one_back(self):
++        packets, _ = self.vp9(frames=10); hz = self.hz
++        p = Player(hz, 3, 3); held = []
++        for k in range(30):
++            r = p.send(packets[k % len(packets)], pts=k)
++            if r: break
++            t = p.take()
++            if t: held.append(t[0])
++        self.assertEqual(len(held), hm.SLOTS_VIDEO)   # 16 slots, all held
++        self.assertEqual(call(hz, 'acq_in', OBJ, 0x1000, 0x1004), hm.MD_NO_INPUT)   # the packets pile up in the inputs: none is free
++        call(hz, 'rel_out', OBJ, held[0])
++        self.assertIsNotNone(p.take())   # a slot came back: a queued packet was decoded
++
++    def test_an_end_of_stream_packet_without_data_yields_an_output_that_carries_the_flag_and_closes_the_input(self):
++        packets, _ = self.vp9(frames=2); hz = self.hz
++        p = Player(hz, 3, 3); p.send(packets[0], pts=0)
++        self.assertEqual(p.send(b'', pts=80000, flags=4), 0)
++        outs = self.drain(p)
++        self.assertEqual([(o[0], o[1]) for o in outs], [(0, 0), (80000, 4)])
++        self.assertEqual(len(outs[1][2]), 64 * 48 * 3 // 2)   # a black frame: the end carries no picture
++        self.assertEqual(call(hz, 'acq_in', OBJ, 0x1000, 0x1004), hm.MD_NO_INPUT)   # no input until a Flush or a Stop
++        call(hz, 'flush', OBJ); call(hz, 'stop', OBJ)
++
++    def test_flush_and_stop_give_every_input_back_and_stop_closes_the_codec(self):
++        packets, _ = self.vp9(); hz = self.hz
++        p = Player(hz, 3, 3)
++        self.assertEqual(call(hz, 'acq_in', OBJ, 0x1000, 0x1004), 0); self.assertEqual(hz.rd32(0x1004), 3)   # one taken, three left
++        call(hz, 'flush', OBJ)
++        self.assertEqual(call(hz, 'acq_in', OBJ, 0x1000, 0x1004), 0); self.assertEqual(hz.rd32(0x1004), 3)   # all four were back: one taken again
++        call(hz, 'stop', OBJ); self.assertEqual(call(hz, 'acq_in', OBJ, 0x1000, 0x1004), hm.MD_NO_INPUT)   # nothing is handed out after a Stop
++
++    def test_a_vorbis_track_decodes_to_pcm_like_ffmpeg(self):
++        ogg, raw = self.d / 'a.ogg', self.d / 'a.raw'; hz = self.hz
++        run('-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=1', '-c:a', 'vorbis', '-strict', '-2', '-ac', '2', str(ogg)); run('-i', str(ogg), '-f', 's16le', '-ac', '2', str(raw))
++        packets = ogg_packets(ogg)
++        hz.wr(0x1_0001_0000, packets[0]); hz.wr(0x1_0001_1000, packets[2])
++        hz.bufs[0x1_0000_7000] = dict(ptr=0x1_0001_0000, cap=len(packets[0]), off=0, size=len(packets[0])); hz.bufs[0x1_0000_7100] = dict(ptr=0x1_0001_1000, cap=len(packets[2]), off=0, size=len(packets[2]))
++        p = Player(hz, 5, 1, md={'csd-0': 0x1_0000_7000, 'csd-1': 0x1_0000_7100, 'channel-count': 2, 'sample-rate': 48000})
++        pcm, pts = b'', 0
++        for pk in packets[3:]:
++            self.assertEqual(p.send(pk, pts=pts), 0); pts += 1
++            for _, _, data in self.drain(p): pcm += data
++        want = raw.read_bytes(); n = min(len(pcm), len(want)) // 2
++        self.assertGreater(n, 80000)
++        a, b = struct.unpack(f'<{n}h', pcm[:2 * n]), struct.unpack(f'<{n}h', want[:2 * n])
++        best = min(sum(abs(x - y) for x, y in zip(a[4000 + s:44000 + s], b[4000:44000])) / 40000 for s in range(-2048, 2049, 2))
++        self.assertLess(best, 250)
++        call(hz, 'out_fmt', OBJ, 0x1_0000_6000); self.assertEqual((hz.md[0x1_0000_6000]['channel-count'], hz.md[0x1_0000_6000]['sample-rate']), (2, 48000))
++
++    def test_a_decoder_of_a_kind_that_is_not_decoded_answers_with_the_sdks_failure_code_and_says_so(self):
++        hz = self.hz; call(hz, 'ctor3', OBJ, 1, 3)   # H.264
++        self.assertEqual(call(hz, 'start', OBJ), 0x2002); self.assertEqual(call(hz, 'configure', OBJ, MD), 0x1000)
++        self.assertTrue(any('not decoded on the Linux host' in m for m in hz.logs)); self.assertEqual(hz.movie_unsupported, [(1, 4, 1)])
++
++    def test_the_deleting_destructor_frees_the_host_side_and_the_object(self):
++        hz = self.hz; p = Player(hz, 3, 3); token = hz.rd64(OBJ + 8)
++        call(hz, 'dtor0', OBJ)
++        self.assertNotIn(token, hz.movie_decs); self.assertEqual(hz.freed, [OBJ]); self.assertTrue(any('destroyed' in m for m in hz.logs))
++
++
++if __name__ == '__main__': unittest.main()

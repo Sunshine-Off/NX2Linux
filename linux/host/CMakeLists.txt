@@ -121,3 +121,15 @@ endif()
 add_library(nx2linux_audio SHARED audio.c)
 target_compile_options(nx2linux_audio PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(nx2linux_audio PRIVATE PkgConfig::SDL3 m pthread)
+
+# the movie decoders (movie.c): VP8 / VP9 through libvpx loaded at run time, Vorbis through stb_vorbis; their headers and source come with the engine tree
+set(NX2_ENGINE_THIRD_PARTY "${CMAKE_CURRENT_SOURCE_DIR}/../../engine/dm/third_party")
+if(EXISTS "${NX2_ENGINE_THIRD_PARTY}/stb_vorbis/stb_vorbis.c")
+  add_library(nx2linux_movie SHARED movie.c)
+  target_include_directories(nx2linux_movie PRIVATE "${NX2_ENGINE_THIRD_PARTY}/stb_vorbis" "${NX2_ENGINE_THIRD_PARTY}/libvpx")
+  target_compile_options(nx2linux_movie PRIVATE -Wall -Wno-unused-function -Wno-unused-variable)
+  target_link_libraries(nx2linux_movie PRIVATE ${CMAKE_DL_LIBS} m)
+else()
+  message(STATUS "movie decoders: engine/dm/third_party is not there (python3 tools/engine.py sync): libnx2linux_movie.so is not built")
+endif()
+

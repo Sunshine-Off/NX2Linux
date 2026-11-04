@@ -120,4 +120,7 @@ Not assumed, only unknown: how the Switch's retail modules lay out their code (t
 | H65 | A 5.1 device sink reads buses 0..5 as front left, front right, centre, low frequency, rear left, rear right, and the stereo mix is L = FL + 0.7071 C + 0.7071 RL (the low frequency is dropped). | The usual downmix; Xenoblade 2's sink is stereo, so it is not exercised. | A 5.1 game. |
 | H66 | `ResultDirectoryNotEmpty` is 0x1002 (module 2, description 8). | From memory of the Horizon result list. | A game that deletes a non-empty directory and reads the code. |
 | H67 | An opening the movie library refuses with 0x1000 makes the game's player skip the movie. | The Mac host used the same code before it had a decoder. | A game that opens a movie. |
+| H68 | The SDK's movie::Extractor can run as lifted code on the RomFS (container type 1 is WebM), and the game's movie player drives the Decoder the way the Mach host's protocol describes. | The probe played three real movies through the SDK's extractor and the host's decoder, picture for picture identical to ffmpeg. The game's own player has not played one. | A game that reaches a movie. |
+| H69 | Signalling "input available" inside Start (not 2 ms later) is safe for Xenoblade 2's player. | Nothing contradicts it; the Mach host had to defer it for Metroid Dread. | Xenoblade 2 at a movie. |
+| H70 | A decoder holds 16 output slots (video) and 64 (audio), 4 inputs of 4 MB. | The numbers the Mach host settled on after many games. | The first game whose player stalls. |
 

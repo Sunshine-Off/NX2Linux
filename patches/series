@@ -83,3 +83,4 @@
 0102-linux-host-the-game-s-constants-and-workarounds.patch
 0103-gpu-path-line-loops-quad-strips-and-polygons-a-c.patch
 0104-linux-host-nn-audio-is-mixed-and-played-voices-a.patch
+0105-linux-host-movie-decoder-decodes-vp8-vp9-by-libv.patch
