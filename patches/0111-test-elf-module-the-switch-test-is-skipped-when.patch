@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 23:02:47 +0100
+Subject: [PATCH] test_elf_module: the Switch test is skipped when the
+ toolchain is absent
+
+It ran without REMILL_BUILD and died with a TypeError instead of skipping, like the
+other classes of the file.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: A test that needs Remill must skip without it, so the Linux CI can run the engine tests without a toolchain
+Issue: Sunshine-Off/NX2Linux#5
+
+---
+ dm/tools/tests/test_elf_module.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/dm/tools/tests/test_elf_module.py b/dm/tools/tests/test_elf_module.py
+index cb86da2..a04dbd8 100644
+--- a/dm/tools/tests/test_elf_module.py
++++ b/dm/tools/tests/test_elf_module.py
+@@ -220,6 +220,7 @@ class LoadingWithJit(unittest.TestCase):
+         finally: d.cleanup()
+ 
+ 
++@unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++, unicorn and capstone')
+ class Switch(unittest.TestCase):
+     def test_the_cases_of_a_switch_are_entries_and_a_dispatch_stays_in_the_recompiled_code(self):
+         d, paths = make_dir(mf.module_d())

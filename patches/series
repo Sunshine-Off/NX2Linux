@@ -88,3 +88,5 @@
 0107-tests-three-stale-or-non-portable-tests-fixed-ao.patch
 0108-env-switches-the-table-lists-dm-font-cache-and.patch
 0109-tests-the-apple-only-tests-are-skipped-off-macos.patch
+0110-docs-linux-architecture-md-the-stages-the-host-t.patch
+0111-test-elf-module-the-switch-test-is-skipped-when.patch
