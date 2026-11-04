@@ -1,0 +1,91 @@
+# Linux x86_64 checks (NX2Linux, issue P0-e). Everything here needs no game, no key and no GPU, and no Remill/dynarmic toolchain:
+# installing that toolchain on a runner depends on tools/setup_toolchain.sh working on more than Fedora (issue #41), so the engine tests that need
+# Remill (aot_*, elf_module's compile tests, module_validate) SKIP on this runner and run locally with the `toolchain-clean` environment.
+# The engine is made by `tools/engine.py sync`, like in tests.yml (the repository tracks no engine file).
+name: linux
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  python:
+    name: Patch queue, tools, CLI and engine tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+      - name: Engine (tools/engine.py sync)
+        run: python3 tools/engine.py sync
+      - name: Patch queue and platform classes
+        run: |
+          python3 tools/engine.py check
+          python3 tools/patch_platforms.py check
+      - name: Python environment of the workers (the venv setup_toolchain.sh makes)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install -r tools/linux-requirements.txt
+          echo "NX2_PYTHON=$RUNNER_TEMP/venv/bin/python" >> "$GITHUB_ENV"
+      - name: Tools tests
+        run: python3 -m unittest discover tools/tests
+      - name: CLI tests
+        run: python3 -m unittest discover -s linux/cli/tests
+      - name: Engine tests that need no game and no toolchain
+        working-directory: engine/dm/tools/tests
+        run: |
+          # One process per file, from this folder (the tests import each other by bare name). test_il2cpp_sym imports by package name and runs from engine/.
+          failed=0
+          for f in test_*.py; do
+            [ "$f" = test_il2cpp_sym.py ] && continue
+            if ! "$NX2_PYTHON" -m unittest -v "${f%.py}" > "$RUNNER_TEMP/$f.log" 2>&1; then
+              tail -n 40 "$RUNNER_TEMP/$f.log"; echo "::error::$f failed"; failed=1
+            fi
+          done
+          (cd ../../.. && "$NX2_PYTHON" -m unittest dm.tools.tests.test_il2cpp_sym) || failed=1
+          exit $failed
+
+  host:
+    name: Linux host (CMake, ctest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config build-essential libvulkan-dev glslc libegl-dev libgl-dev mesa-vulkan-drivers libx11-dev libxext-dev
+      # Ubuntu's runner image has no SDL3 package, so it is built from the tag (3.2.8). The video driver is dummy in the smoke test.
+      - name: SDL3
+        run: |
+          git clone --depth 1 --branch release-3.2.8 https://github.com/libsdl-org/SDL "$RUNNER_TEMP/SDL"
+          cmake -S "$RUNNER_TEMP/SDL" -B "$RUNNER_TEMP/SDL/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_TESTS=OFF -DSDL_INSTALL_TESTS=OFF
+          cmake --build "$RUNNER_TEMP/SDL/build"
+          sudo cmake --install "$RUNNER_TEMP/SDL/build"
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/x86_64-linux-gnu" >> "$GITHUB_ENV"
+      - name: Build and test
+        run: |
+          python3 linux/cli/nx2linux.py build -j2
+          python3 linux/cli/nx2linux.py verify
