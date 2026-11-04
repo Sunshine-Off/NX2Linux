@@ -324,12 +324,9 @@ class Relink(Fixture):
 
 
 class Search(unittest.TestCase):
-    def test_engine_is_either_ignored_by_git_or_tracked_and_never_hidden_from_ripgrep(self):
-        # upstream: engine/ is a build product (tools/engine.py sync), so git ignores it. This fork integrated the engine sources into the repository (commit 093e0f0): engine/ is tracked, and /engine/ is not ignored.
-        # Either way a search from the root must find its files, which the root .ignore guarantees.
-        ignored = '/engine/' in (REPO / '.gitignore').read_text().splitlines()
-        tracked = bool(subprocess.run(['git', 'ls-files', '--', 'engine'], cwd=REPO, capture_output=True, text=True).stdout.strip())
-        self.assertTrue(ignored or tracked, 'engine/ is neither ignored as a build product nor tracked: its files would be neither in git nor out of its way')
+    def test_engine_is_ignored_by_git_and_never_hidden_from_ripgrep(self):
+        # engine/ is a build product (tools/engine.py sync, issue #214): git ignores it and it is not tracked. A search from the root must still find its files, which the root .ignore guarantees.
+        self.assertIn('/engine/', (REPO / '.gitignore').read_text().splitlines())
         self.assertIn('!/engine/', (REPO / '.ignore').read_text().splitlines())
 
     @unittest.skipUnless(shutil.which('rg'), 'ripgrep is not installed')
