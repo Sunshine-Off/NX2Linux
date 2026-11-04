@@ -38,6 +38,10 @@ Issue: LNPANDY/NX2Apple#<n>
 A status may carry a note in brackets. `tools/patches.py status` lists every patch with its status, reason and age, so the
 list of what the fork carries and why is one command, and it should keep shrinking.
 
+## Platform of a patch
+
+`platforms.tsv` gives every patch a class: `common` (useful to Apple and Linux), `apple` or `linux`, with a one line note. The class is a review aid for splitting the series and for choosing what to send to seedds/nxnative. `python3 tools/patch_platforms.py check` fails when a patch has no row, a row has no patch or a class is unknown (`tools/tests/test_patch_platforms.py` runs it). `python3 tools/patch_platforms.py summary` counts the classes and lists the common patches not yet forwarded. `python3 tools/patch_platforms.py lists` writes `series.common`, `series.apple` and `series.linux` (the series order, one class each), and `check` fails when they are stale or when a patch changes a file that an earlier patch of another, non common class changed (it could not be applied alone). Existing overlaps are listed in `platform-overlaps.tsv`. `series` stays the one ordered list that `sync` applies. Add a row, run `lists`, and review any new overlap when `export` adds a patch. The class comes from the paths a patch touches, and a note says when it is ambiguous.
+
 ## Here first, upstream in parallel
 
 A fix to the engine (`dm/`, `scripts/`, `ref/`), to a game profile (`dm/games/<id>/`) or to upstream's docs may land here first, as a
