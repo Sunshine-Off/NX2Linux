@@ -2,6 +2,8 @@
 
 The launcher (see the [README](README.md)) runs the same scripts a terminal does. This page is the by-hand route, for advanced users, for development, or when the launcher is not an option: the tools, your `prod.keys`, and the IPA built from a terminal. Contributing rules are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
+> **Linux:** the Linux x86_64 build is described in [the Linux section](#linux-x86_64) at the end of this page. Everything else here is the Apple route.
+
 ## Get the tools
 
 This is the command-line route the launcher drives for you. The build is upstream's. Follow upstream's [README](https://github.com/seedds/nxnative) to install Xcode, Homebrew tools and the Python packages, then pack an IPA.
@@ -73,3 +75,18 @@ GAME=<title id> W=<work dir> PATCHED=<patched dir> \
 behaviour, only sensible for small games.
 
 The RomFS no longer has to be packed into a shard archive: the build writes the game's data as a single `romfs.img`. Shard archives made earlier (`romfs.idx` with `romfs.00`, `romfs.01`, …) are no longer read; the launcher reports such a folder as having no game data, and the data is sent again once as a `romfs.img`.
+
+## Linux x86_64
+
+NX2Linux is in progress. The steps below build and test what exists. They do not yet give a one click way to play.
+
+```sh
+python3 tools/engine.py sync                    # the engine into engine/ (never tracked by git)
+tools/setup_toolchain.sh                        # Remill (patched), dynarmic and the Python venv, outside the repository
+source ~/.cache/nx2linux/toolchain/env.sh       # REMILL_BUILD, DYNARMIC_DIR, NX2_PYTHON
+python3 linux/cli/nx2linux.py doctor            # what is missing
+python3 linux/cli/nx2linux.py build -j2         # the SDL3 and Vulkan host
+python3 linux/cli/nx2linux.py verify            # its tests
+```
+
+`setup_toolchain.sh` needs git, cmake, ninja, clang, LLVM 22 and Boost headers. It assumes Fedora today. A game is extracted with `nx2linux.py extract` (needs .NET and your own `prod.keys`), then recompiled and run with the tools in `engine/dm/tools/`. See `engine/docs/linux/architecture.md` for the stages. Never put game files or keys in the repository.
