@@ -1,0 +1,17 @@
+patch	earlier patch	file
+0024-games-md-gallery.patch	0015-fork-docs.patch	docs/RELEASE-NOTES-GUIDE.md
+0037-totk-1.4.2-frame-step-sites.patch	0008-bc-cpu-decode.patch	dm/games/0100F2C0115B6000/game.tsv
+0102-linux-host-the-game-s-constants-and-workarounds.patch	0040-nsp-derived-profile-without-frame-step.patch	dm/games/README.md
+0107-tests-three-stale-or-non-portable-tests-fixed-ao.patch	0071-aot-modules-laid-out-contiguously-cross-module-e.patch	dm/tools/tests/test_aot_tailcall.py
+0107-tests-three-stale-or-non-portable-tests-fixed-ao.patch	0074-horizon-on-linux-svcs-ipc-and-sm-nn-init-start-b.patch	dm/tools/tests/test_aot_tailcall.py
+0107-tests-three-stale-or-non-portable-tests-fixed-ao.patch	0077-horizon-on-linux-threads-and-synchronisation.patch	dm/tools/tests/test_horizon_services.py
+0107-tests-three-stale-or-non-portable-tests-fixed-ao.patch	0079-horizon-on-linux-fibers-nn-hid-per-title-profile.patch	dm/tools/tests/test_horizon_services.py
+0107-tests-three-stale-or-non-portable-tests-fixed-ao.patch	0081-horizon-on-linux-silent-nn-audio-nn-time-nested.patch	dm/tools/tests/test_horizon_services.py
+0108-env-switches-the-table-lists-dm-font-cache-and.patch	0001-runtime-profile.patch	docs/env_switches.tsv
+0108-env-switches-the-table-lists-dm-font-cache-and.patch	0004-ios-slim-ipa.patch	docs/env_switches.tsv
+0108-env-switches-the-table-lists-dm-font-cache-and.patch	0009-mac-keymap.patch	docs/env_switches.tsv
+0108-env-switches-the-table-lists-dm-font-cache-and.patch	0031-front-mac-dm-screen.patch	docs/env_switches.tsv
+0108-env-switches-the-table-lists-dm-font-cache-and.patch	0032-front-mac-hide-the-pointer-after-a-few-idle-seco.patch	docs/env_switches.tsv
+0108-env-switches-the-table-lists-dm-font-cache-and.patch	0049-dm-framework-env-switch-row.patch	docs/env_switches.tsv
+0108-env-switches-the-table-lists-dm-font-cache-and.patch	0054-front-mac-start-with-the-pointer-hidden-when-the.patch	docs/env_switches.tsv
+0109-tests-the-apple-only-tests-are-skipped-off-macos.patch	0034-metal-a-newer-compiler-of-the-recorded-generatio.patch	dm/tools/tests/test_own_compilers.py
