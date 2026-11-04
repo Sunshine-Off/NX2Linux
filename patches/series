@@ -81,3 +81,4 @@
 0100-horizon-run-jit-dynarmic-fallback-test-aot-simd.patch
 0101-runtime-nx2-aes-for-the-aes-instructions-remill.patch
 0102-linux-host-the-game-s-constants-and-workarounds.patch
+0103-gpu-path-line-loops-quad-strips-and-polygons-a-c.patch

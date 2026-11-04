@@ -10,9 +10,9 @@ int nx2gpu_flush(void);
 int nx2gpu_ring_read(uint64_t offset, void *out, uint64_t bytes);
 
 enum { OP_SAMP = 14, OP_IMG, OP_TEXPOOL, OP_SAMPPOOL, OP_MISC, OP_VIEWPORT_F };
-enum { MISC_BLEND_COLOR = 1, MISC_DEPTH_RANGE, MISC_ALPHA_REF, MISC_POLY_OFFSET, MISC_PATCH_SIZE };
+enum { MISC_BLEND_COLOR = 1, MISC_DEPTH_RANGE, MISC_ALPHA_REF, MISC_POLY_OFFSET, MISC_PATCH_SIZE, MISC_LINE_WIDTH, MISC_DEPTH_CLAMP, MISC_RESTART, MISC_DISCARD, MISC_POINT_SIZE };
 enum { NST = 6, NUBO = 16, NTEXS = 300, NIMGS = 16, MAX_VERTEX_BYTES = 64 << 20 };
-enum { QUADS_TOPOLOGY = 100, PATCHES = 14 };
+enum { QUADS_TOPOLOGY = 100, LINE_LOOP_TOPOLOGY = 101, QUAD_STRIP_TOPOLOGY = 102, PATCHES = 14 };
 
 typedef struct { uint64_t addr, size; uint8_t bound; } Range;
 
@@ -25,6 +25,7 @@ static struct RState {
     uint32_t color, chmask, poly; uint64_t ds; int ds_bound; uint64_t blend[8]; uint8_t blend_bound[8];
     float vp[4]; int has_vp; int32_t sc[4]; int has_sc;
     float blend_color[4], depth_range[2], alpha_ref, poly_off[3]; uint32_t patch_size, sten[2][3];
+    float line_width, point_size; uint32_t depth_clamp, restart_enable, restart_index, discard;
     uint32_t nrt; uint64_t rt[8]; uint8_t rt_view[8][17];   // per target: has, 16 bytes of the view
     uint64_t depth; uint8_t depth_view[17];
 } RS;
@@ -35,7 +36,7 @@ static void rstate_reset(void) {
     RS.chmask = 0xFFFFFFFFu;
     RS.poly = 1 << 2 | 2 << 3;        // no culling, counter-clockwise front, fill
     RS.ds = 1ull << 1 | 2ull << 2;    // depth test off, write on, function LESS (nvn_state.py defaults)
-    RS.depth_range[1] = 1.0f; RS.patch_size = 3;
+    RS.depth_range[1] = 1.0f; RS.patch_size = 3; RS.line_width = 1.0f; RS.point_size = 1.0f;
     for (int f = 0; f < 2; f++) { RS.sten[f][0] = 0xFF; RS.sten[f][1] = 0xFF; }
 }
 
@@ -73,7 +74,7 @@ void nx2rep_hook(void (*h)(const Nx2Draw *)) { draw_hook = h; }
 void nx2rep_begin(void) { rstate_reset(); }
 
 // ---- counters, and the skip reasons C itself finds (Python names them: nvn_replay.py SKIPS) ----
-enum { SK_NO_PROGRAM, SK_TARGETS, SK_NO_TARGET, SK_STREAM_UNBOUND, SK_VERTEX_FORMAT, SK_UNREADABLE, SK_INDEX, SK_PRIMITIVE, SK_PATCHES, SK_TESS, SK_BUFFERS, SK_NO_ALPHA, SK_NO_TEXTURE_SLOT, SK_PROG_STATUS, SK_IMAGE_STATUS, SK_TEX_STATUS, SK_EMPTY, SK_N };
+enum { SK_NO_PROGRAM, SK_TARGETS, SK_NO_TARGET, SK_STREAM_UNBOUND, SK_VERTEX_FORMAT, SK_UNREADABLE, SK_INDEX, SK_PRIMITIVE, SK_PATCHES, SK_TESS, SK_BUFFERS, SK_NO_ALPHA, SK_NO_TEXTURE_SLOT, SK_PROG_STATUS, SK_IMAGE_STATUS, SK_TEX_STATUS, SK_EMPTY, SK_POINT_SIZE, SK_N };
 static uint64_t st_draws, st_lib_errors, st_write_backs, st_skip[SK_N], st_prim[32], st_prog_cb, st_img_cb, st_tex_cb, st_fallbacks;
 void nx2rep_stats(uint64_t *out) {
     uint64_t v[] = { st_draws, st_lib_errors, st_write_backs, st_prog_cb, st_img_cb, st_tex_cb, st_fallbacks };
@@ -194,6 +195,11 @@ static void apply_record(uint32_t op, const uint64_t *p, uint32_t n) {
         case MISC_ALPHA_REF: RS.alpha_ref = f[0]; break;
         case MISC_POLY_OFFSET: memcpy(RS.poly_off, f, 12); break;
         case MISC_PATCH_SIZE: RS.patch_size = (uint32_t)p[1]; break;
+        case MISC_LINE_WIDTH: RS.line_width = f[0]; break;
+        case MISC_POINT_SIZE: RS.point_size = f[0]; break;
+        case MISC_DEPTH_CLAMP: RS.depth_clamp = (uint32_t)p[1] & 1; break;
+        case MISC_RESTART: RS.restart_enable = (uint32_t)p[1] & 1; RS.restart_index = (uint32_t)p[2]; break;
+        case MISC_DISCARD: RS.discard = (uint32_t)p[1] & 1; break;
         }
         break;
     }
@@ -249,7 +255,8 @@ static int do_draw(const uint64_t *r) {
     if (pi->status == 2) return 2;
     int has_tes = 0, has_tcs = 0;
     for (uint32_t s = 0; s < pi->nst; s++) { if (pi->st[s].kind == 4) has_tes = 1; if (pi->st[s].kind == 3) has_tcs = 1; }
-    if (has_tcs != has_tes) return skip(SK_TESS) + 1;
+    if (has_tcs && !has_tes) return skip(SK_TESS) + 1;
+    if (has_tes && !has_tcs) return 2;   /* no control shader: Python makes the passthrough one from the evaluation shader's interface and the tessellation levels it holds */
     if (prim == PATCHES && !has_tes) return skip(SK_PATCHES) + 1;
     uint32_t vs_id = 0, ps_id = 0; Nx2Draw d; memset(&d, 0, sizeof d);
     for (uint32_t s = 0; s < pi->nst; s++) {
@@ -265,6 +272,8 @@ static int do_draw(const uint64_t *r) {
         } else skip(SK_NO_ALPHA);
     }
     d.vs = vs_id; d.ps = ps_id; d.patch_points = RS.patch_size;
+    d.line_width = RS.line_width; d.depth_clamp = RS.depth_clamp; d.rasterizer_discard = RS.discard;
+    if (prim == 0 && RS.point_size != 1.0f) st_skip[SK_POINT_SIZE]++;   /* a point's size comes from the shader here: the game's SetPointSize is counted, not applied */
     uint64_t rts[8]; uint32_t nrts = 0;
     for (uint32_t i = 0; i < RS.nrt; i++) if (RS.rt[i]) rts[nrts++] = RS.rt[i];
     if (nrts > MAX_TARGETS) return skip(SK_TARGETS) + 1;
@@ -337,11 +346,11 @@ static int do_draw(const uint64_t *r) {
         if (!src || got < nbytes) return skip(SK_INDEX) + 1;
         if (isz == 1) {   // byte indices become 16-bit ones
             if (idx_cap < 2 * nbytes) { idx_cap = 2 * nbytes + 4096; idx_scratch = realloc(idx_scratch, idx_cap); }
-            uint16_t *o = (uint16_t *)idx_scratch; for (uint64_t i = 0; i < nbytes; i++) { o[i] = src[i]; if (src[i] > idx_max) idx_max = src[i]; }
+            uint16_t *o = (uint16_t *)idx_scratch; for (uint64_t i = 0; i < nbytes; i++) { o[i] = src[i]; if (src[i] > idx_max && !(RS.restart_enable && src[i] == (RS.restart_index & 0xFF))) idx_max = src[i]; }
             idx_ptr = idx_scratch; idx_bytes = 2 * nbytes; idx_kind = 1;
         } else {
-            if (isz == 2) { const uint16_t *a = (const uint16_t *)src; for (uint64_t i = 0; i < (uint64_t)icount; i++) if (a[i] > idx_max) idx_max = a[i]; }
-            else { const uint32_t *a = (const uint32_t *)src; for (uint64_t i = 0; i < (uint64_t)icount; i++) if (a[i] > idx_max) idx_max = a[i]; }
+            if (isz == 2) { const uint16_t *a = (const uint16_t *)src; for (uint64_t i = 0; i < (uint64_t)icount; i++) if (a[i] > idx_max && !(RS.restart_enable && a[i] == (RS.restart_index & 0xFFFF))) idx_max = a[i]; }
+            else { const uint32_t *a = (const uint32_t *)src; for (uint64_t i = 0; i < (uint64_t)icount; i++) if (a[i] > idx_max && !(RS.restart_enable && a[i] == RS.restart_index)) idx_max = a[i]; }
             idx_ptr = src; idx_bytes = nbytes; idx_kind = isz == 2 ? 1 : 2;
         }
     }
@@ -367,10 +376,13 @@ static int do_draw(const uint64_t *r) {
         d.streams[d.nstreams].binding = s; d.streams[d.nstreams].stride = stride; d.streams[d.nstreams].divisor = div;
         d.streams[d.nstreams].data = src ? src : one; d.streams[d.nstreams].size = got; d.nstreams++;
     }
-    if (prim == 2 || prim == 8 || prim == 9) return skip(SK_PRIMITIVE) + 1;
-    d.topology = prim == 7 ? QUADS_TOPOLOGY : (uint32_t)prim;
+    /* the primitives Vulkan has no name for: quads, line loops and quad strips are drawn through generated indices (gpu.c), a polygon is a triangle fan */
+    d.topology = prim == 7 ? QUADS_TOPOLOGY : prim == 2 ? LINE_LOOP_TOPOLOGY : prim == 8 ? QUAD_STRIP_TOPOLOGY : prim == 9 ? 6 : (uint32_t)prim;
     d.first = elements ? 0 : (int32_t)first; d.count = icount; d.base_vertex = elements ? (int32_t)base_vertex : 0; d.base_instance = (int32_t)base_instance; d.instances = ninst;
-    if (idx_ptr) { d.index_type = idx_kind; d.index_data = idx_ptr; d.index_size = idx_bytes; }
+    if (idx_ptr) {
+        d.index_type = idx_kind; d.index_data = idx_ptr; d.index_size = idx_bytes;
+        d.restart_enable = RS.restart_enable; d.restart_index = index_type == 0 ? RS.restart_index & 0xFF : index_type == 1 ? RS.restart_index & 0xFFFF : RS.restart_index;
+    }
 
     // resources
     uint8_t scratch[4][4096]; uint32_t nscratch = 0;
@@ -428,6 +440,7 @@ static int do_draw(const uint64_t *r) {
                 if (w >= 8 && stage < NST && slot >= 0 && slot < NTEXS) { handle = RS.tex[stage][slot]; if (slot >= 128) handle |= RS.samp[stage][(w - 90) / 2]; }
             }
             TexEnt *e = texture_binding(RS.texpool, RS.samppool, handle, tx->type);
+            if (e && e->status == 3) return 2;   /* a texture of another type than the shader samples: Python learns the type */
             if (!e || e->status) return skip(SK_TEX_STATUS) + 1;
             if (d.ntex >= 32) return skip(SK_BUFFERS) + 1;
             d.tex[d.ntex] = e->tex; d.tex[d.ntex].binding = tx->binding; d.ntex++;

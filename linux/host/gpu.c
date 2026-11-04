@@ -11,6 +11,7 @@
 
 #include "nx2linux/sdl_host.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,6 +23,9 @@
 #define RING_BYTES (192u << 20)
 #define STAGING_BYTES (96u << 20)
 #define QUADS 100   /* the NVN quad primitive: Vulkan has none, drawn as two triangles through a generated index buffer */
+#define LINE_LOOP 101   /* NVN's line loop: a line strip that returns to its first vertex, through a generated index buffer */
+#define QUAD_STRIP 102   /* NVN's quad strip: vertices (2k, 2k+1, 2k+3, 2k+2) are quad k, drawn as two triangles */
+#define GENERATED(t) ((t) == QUADS || (t) == LINE_LOOP || (t) == QUAD_STRIP)
 
 #include "nx2gpu_types.h"
 
@@ -36,7 +40,7 @@ typedef struct { uint64_t key; VkPipeline pipe; VkPipelineLayout layout; VkDescr
 typedef struct { uint64_t key; VkSampler s; } Samp;
 
 static struct {
-    int open, clip_control, have_swapchain;
+    int open, clip_control, have_swapchain, wide_lines; float line_min, line_max;
     pthread_mutex_t mu;
     VkInstance inst; VkPhysicalDevice phys; VkDevice dev; VkQueue queue; uint32_t family;
     VkPhysicalDeviceMemoryProperties mem;
@@ -111,6 +115,7 @@ int nx2gpu_open(int prefer_software)
     G.phys = devs[best];
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(G.phys, &props);
     snprintf(G.name, sizeof G.name, "%s", props.deviceName);
+    G.line_min = props.limits.lineWidthRange[0]; G.line_max = props.limits.lineWidthRange[1];
     G.ubo_align = props.limits.minUniformBufferOffsetAlignment > 256 ? props.limits.minUniformBufferOffsetAlignment : 256;
     vkGetPhysicalDeviceMemoryProperties(G.phys, &G.mem);
     uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(G.phys, &nq, NULL);
@@ -126,7 +131,7 @@ int nx2gpu_open(int prefer_software)
     VkPhysicalDeviceFeatures avail; vkGetPhysicalDeviceFeatures(G.phys, &avail);
     f2.features.samplerAnisotropy = avail.samplerAnisotropy; f2.features.shaderFloat64 = avail.shaderFloat64; f2.features.shaderInt64 = avail.shaderInt64;
     f2.features.fragmentStoresAndAtomics = avail.fragmentStoresAndAtomics; f2.features.vertexPipelineStoresAndAtomics = avail.vertexPipelineStoresAndAtomics;
-    f2.features.depthClamp = avail.depthClamp; f2.features.independentBlend = avail.independentBlend; f2.features.fillModeNonSolid = avail.fillModeNonSolid; f2.features.geometryShader = avail.geometryShader; f2.features.tessellationShader = avail.tessellationShader;
+    G.wide_lines = avail.wideLines; f2.features.wideLines = avail.wideLines; f2.features.depthClamp = avail.depthClamp; f2.features.independentBlend = avail.independentBlend; f2.features.fillModeNonSolid = avail.fillModeNonSolid; f2.features.geometryShader = avail.geometryShader; f2.features.tessellationShader = avail.tessellationShader;
     f2.features.shaderStorageImageReadWithoutFormat = avail.shaderStorageImageReadWithoutFormat; f2.features.shaderStorageImageWriteWithoutFormat = avail.shaderStorageImageWriteWithoutFormat;
     f2.features.shaderTessellationAndGeometryPointSize = avail.shaderTessellationAndGeometryPointSize; f2.features.largePoints = avail.largePoints; f2.features.multiViewport = avail.multiViewport;
     f2.features.shaderImageGatherExtended = avail.shaderImageGatherExtended; f2.features.shaderStorageImageExtendedFormats = avail.shaderStorageImageExtendedFormats;
@@ -395,6 +400,28 @@ out:
     return r;
 }
 
+/* One region of one level of one layer (or of a 3D image, its slices z..z+d) read back, tightly packed (blocks for compressed formats): the copy of a texture to a buffer */
+int nx2gpu_read_region(uint32_t id, void *out, uint64_t bytes, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w, uint32_t h, uint32_t d)
+{
+    pthread_mutex_lock(&G.mu);
+    int r = -1;
+    if (!G.open || id >= G.nimages || !G.images[id].live || bytes > STAGING_BYTES) goto out;
+    if (begin()) goto out;
+    end_rendering();
+    barrier_all();
+    Image *im = &G.images[id];
+    VkBufferImageCopy c = { .imageSubresource = { .aspectMask = im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = level, .baseArrayLayer = im->is3d ? 0 : layer, .layerCount = 1 },
+                            .imageOffset = { x, y, z }, .imageExtent = { w, h, d ? d : 1 } };
+    vkCmdCopyImageToBuffer(G.cb, im->image, VK_IMAGE_LAYOUT_GENERAL, G.stage, 1, &c);
+    barrier_all();
+    if (flush_locked()) goto out;
+    memcpy(out, G.stage_ptr, bytes);
+    r = 0;
+out:
+    pthread_mutex_unlock(&G.mu);
+    return r;
+}
+
 /* Clears every level and layer of the image (a clear of a view's range: layer, nlayers) */
 int nx2gpu_clear_color(uint32_t id, const float *rgba, uint32_t level, uint32_t nlevels, uint32_t layer, uint32_t nlayers)
 {
@@ -513,6 +540,12 @@ static int fill_writes(Nx2Buf *bufs, uint32_t nb, const Nx2Tex *tex, uint32_t nt
 
 static int has_stencil(VkFormat f) { return f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT; }
 
+/* primitive restart is a property of the pipeline for the strip and fan topologies (the list topologies, and the ones drawn through generated indices, do not restart) */
+static uint32_t restarts(const Nx2Draw *d, uint32_t topology)
+{
+    return d->restart_enable && (topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY) && d->index_type && !GENERATED(d->topology);
+}
+
 static Pipe *pipeline_for(const Nx2Draw *d, VkFormat color_fmt[MAX_TARGETS], VkFormat depth_fmt, uint32_t topology, VkPipelineLayout *layout_out)
 {
     uint64_t key = layout_key(d->bufs, d->nbufs, d->tex, d->ntex, d->imgs, d->nimgs);
@@ -523,6 +556,7 @@ static Pipe *pipeline_for(const Nx2Draw *d, VkFormat color_fmt[MAX_TARGETS], VkF
     key = fnv(key, d->blend, sizeof(Nx2Blend) * d->ntargets);
     key = fnv(key, &d->cull, 8 * 4);
     key = fnv(key, &d->stencil_test, 2 * 4); key = fnv(key, d->stencil_front, 8 * 4);
+    { uint32_t rk[2] = { restarts(d, topology), d->rasterizer_discard }; key = fnv(key, rk, 8); }
     for (uint32_t i = 0; i < G.npipes; i++) if (G.pipes[i].key == key) { *layout_out = G.pipes[i].layout; return &G.pipes[i]; }
 
     VkDescriptorSetLayout sl; VkPipelineLayout pl;
@@ -538,11 +572,11 @@ static Pipe *pipeline_for(const Nx2Draw *d, VkFormat color_fmt[MAX_TARGETS], VkF
     for (uint32_t i = 0; i < d->nattrs; i++) va[i] = (VkVertexInputAttributeDescription){ d->attrs[i].location, d->attrs[i].binding, (VkFormat)d->attrs[i].format, d->attrs[i].offset };
     VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .vertexBindingDescriptionCount = d->nstreams, .pVertexBindingDescriptions = vb,
                                                 .vertexAttributeDescriptionCount = d->nattrs, .pVertexAttributeDescriptions = va };
-    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = (VkPrimitiveTopology)topology };
+    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = (VkPrimitiveTopology)topology, .primitiveRestartEnable = restarts(d, topology) };
     VkPipelineTessellationStateCreateInfo tess = { .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO, .patchControlPoints = d->patch_points ? d->patch_points : 3 };
     VkPipelineViewportDepthClipControlCreateInfoEXT ccs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, .negativeOneToOne = VK_TRUE };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = G.clip_control && d->depth_neg_one ? &ccs : NULL, .viewportCount = 1, .scissorCount = 1 };
-    VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .depthClampEnable = d->depth_clamp, .polygonMode = (VkPolygonMode)d->polygon_mode,
+    VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .depthClampEnable = d->depth_clamp, .rasterizerDiscardEnable = d->rasterizer_discard, .polygonMode = (VkPolygonMode)d->polygon_mode,
                                                   .cullMode = (VkCullModeFlags)d->cull, .frontFace = (VkFrontFace)d->front_face, .depthBiasEnable = d->depth_bias_on, .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = d->depth_test && depth_fmt, .depthWriteEnable = d->depth_write && depth_fmt, .depthCompareOp = (VkCompareOp)d->depth_func, .maxDepthBounds = 1.0f,
@@ -554,8 +588,8 @@ static Pipe *pipeline_for(const Nx2Draw *d, VkFormat color_fmt[MAX_TARGETS], VkF
         ba[i] = (VkPipelineColorBlendAttachmentState){ .blendEnable = d->blend[i].enable, .srcColorBlendFactor = d->blend[i].src_rgb, .dstColorBlendFactor = d->blend[i].dst_rgb, .colorBlendOp = d->blend[i].op_rgb,
                                                         .srcAlphaBlendFactor = d->blend[i].src_a, .dstAlphaBlendFactor = d->blend[i].dst_a, .alphaBlendOp = d->blend[i].op_a, .colorWriteMask = d->blend[i].mask };
     VkPipelineColorBlendStateCreateInfo cbs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = d->ntargets, .pAttachments = ba };
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE };
-    VkPipelineDynamicStateCreateInfo dy = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 7, .pDynamicStates = dyn };
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_LINE_WIDTH };
+    VkPipelineDynamicStateCreateInfo dy = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 8, .pDynamicStates = dyn };
     VkPipelineRenderingCreateInfo ri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = d->ntargets, .pColorAttachmentFormats = color_fmt,
                                          .depthAttachmentFormat = depth_fmt, .stencilAttachmentFormat = has_stencil(depth_fmt) ? depth_fmt : VK_FORMAT_UNDEFINED };
     VkGraphicsPipelineCreateInfo gi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = nst, .pStages = st, .pTessellationState = d->tcs || d->tes ? &tess : NULL, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
@@ -583,7 +617,8 @@ static uint32_t topology_of(uint32_t prim)
     case 0: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     case 1: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     case 3: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
-    case 4: case QUADS: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case 4: case QUADS: case QUAD_STRIP: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case LINE_LOOP: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
     case 5: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
     case 6: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     case 10: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
@@ -629,23 +664,44 @@ int nx2gpu_draw(const Nx2Draw *d)
     }
     uint64_t ib_off = 0; uint32_t index_count = 0; VkIndexType itype = VK_INDEX_TYPE_UINT32;
     uint32_t count = (uint32_t)d->count;
-    if (d->index_type || d->topology == QUADS) {
+    if (d->index_type || GENERATED(d->topology)) {
         uint32_t isz = d->index_type == 1 ? 2 : 4;
         uint32_t src_n = d->index_type ? (uint32_t)(d->index_size / isz) : count;
         if (d->index_type && src_n > count) src_n = count;
-        uint32_t out_n = d->topology == QUADS ? src_n / 4 * 6 : src_n;
-        uint8_t *p; uint64_t need = (uint64_t)out_n * (d->topology == QUADS ? 4 : isz);
+        /* the vertex i of the draw: the index buffer's entry, or first + i without one */
+        #define VTX(i) (!d->index_type ? (uint32_t)d->first + (i) : isz == 2 ? ((const uint16_t *)d->index_data)[i] : ((const uint32_t *)d->index_data)[i])
+        uint32_t out_n = d->topology == QUADS ? src_n / 4 * 6 : d->topology == QUAD_STRIP ? (src_n >= 4 ? (src_n - 2) / 2 * 6 : 0) : d->topology == LINE_LOOP ? (src_n >= 2 ? src_n + 1 : 0) : src_n;
+        if (GENERATED(d->topology) && !out_n) { r = 0; goto out; }   /* too few vertices for one primitive: nothing is drawn */
+        uint8_t *p; uint64_t need = (uint64_t)out_n * (GENERATED(d->topology) ? 4 : isz);
         ib_off = ring_alloc(need ? need : 4, 4, &p);
         if (ib_off == UINT64_MAX) { if (flush_locked() || begin()) goto out; ib_off = ring_alloc(need ? need : 4, 4, &p); if (ib_off == UINT64_MAX) { G.skipped++; r = 1; goto out; } }
-        if (d->topology == QUADS) {
+        if (GENERATED(d->topology)) {
             uint32_t *o = (uint32_t *)p;
-            for (uint32_t q = 0; q < src_n / 4; q++) {
-                uint32_t v[4];
-                for (int k = 0; k < 4; k++) v[k] = !d->index_type ? (uint32_t)d->first + q * 4 + (uint32_t)k : isz == 2 ? ((const uint16_t *)d->index_data)[q * 4 + k] : ((const uint32_t *)d->index_data)[q * 4 + k];
-                o[q * 6 + 0] = v[0]; o[q * 6 + 1] = v[1]; o[q * 6 + 2] = v[2]; o[q * 6 + 3] = v[0]; o[q * 6 + 4] = v[2]; o[q * 6 + 5] = v[3];
+            if (d->topology == QUADS) {
+                for (uint32_t q = 0; q < src_n / 4; q++) {
+                    uint32_t v0 = VTX(q * 4), v1 = VTX(q * 4 + 1), v2 = VTX(q * 4 + 2), v3 = VTX(q * 4 + 3);
+                    o[q * 6 + 0] = v0; o[q * 6 + 1] = v1; o[q * 6 + 2] = v2; o[q * 6 + 3] = v0; o[q * 6 + 4] = v2; o[q * 6 + 5] = v3;
+                }
+            } else if (d->topology == QUAD_STRIP) {
+                for (uint32_t q = 0; q < (src_n - 2) / 2; q++) {
+                    uint32_t a = VTX(2 * q), b = VTX(2 * q + 1), c = VTX(2 * q + 3), e = VTX(2 * q + 2);   /* the quad is a, b, c, e in this order */
+                    o[q * 6 + 0] = a; o[q * 6 + 1] = b; o[q * 6 + 2] = c; o[q * 6 + 3] = a; o[q * 6 + 4] = c; o[q * 6 + 5] = e;
+                }
+            } else {
+                for (uint32_t i = 0; i < src_n; i++) o[i] = VTX(i);
+                o[src_n] = VTX(0);
             }
             itype = VK_INDEX_TYPE_UINT32; index_count = out_n;
-        } else { memcpy(p, d->index_data, (size_t)src_n * isz); itype = isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32; index_count = src_n; }
+        } else {
+            memcpy(p, d->index_data, (size_t)src_n * isz); itype = isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32; index_count = src_n;
+            if (restarts(d, topo) && d->restart_index != (isz == 2 ? 0xFFFFu : 0xFFFFFFFFu)) {   /* Vulkan restarts on the all-ones index: the game's own restart index becomes that one */
+                for (uint32_t i = 0; i < src_n; i++) {
+                    if (isz == 2) { if (((uint16_t *)p)[i] == (uint16_t)d->restart_index) ((uint16_t *)p)[i] = 0xFFFF; }
+                    else if (((uint32_t *)p)[i] == d->restart_index) ((uint32_t *)p)[i] = 0xFFFFFFFFu;
+                }
+            }
+        }
+        #undef VTX
     }
     VkDescriptorBufferInfo bi[32]; VkDescriptorImageInfo ii[40]; VkWriteDescriptorSet wr[72]; uint32_t nw = 0;
     { int fr = fill_writes((Nx2Buf *)d->bufs, d->nbufs, d->tex, d->ntex, d->imgs, d->nimgs, bi, ii, wr, &nw); if (fr) { if (fr > 0) { G.skipped++; r = 1; } goto out; } }
@@ -687,6 +743,7 @@ int nx2gpu_draw(const Nx2Draw *d)
     VkRect2D sc = { { d->scissor[0], d->scissor[1] }, { (uint32_t)d->scissor[2], (uint32_t)d->scissor[3] } };
     vkCmdSetViewport(G.cb, 0, 1, &vp); vkCmdSetScissor(G.cb, 0, 1, &sc);
     vkCmdSetBlendConstants(G.cb, d->blend_color);
+    vkCmdSetLineWidth(G.cb, d->line_width > 0.0f && G.wide_lines ? fminf(fmaxf(d->line_width, G.line_min), G.line_max) : 1.0f);
     vkCmdSetDepthBias(G.cb, d->depth_bias[0], d->depth_bias[1], d->depth_bias[2]);
     vkCmdSetStencilCompareMask(G.cb, VK_STENCIL_FACE_FRONT_BIT, d->stencil_masks[0]); vkCmdSetStencilWriteMask(G.cb, VK_STENCIL_FACE_FRONT_BIT, d->stencil_masks[1]); vkCmdSetStencilReference(G.cb, VK_STENCIL_FACE_FRONT_BIT, d->stencil_masks[2]);
     vkCmdSetStencilCompareMask(G.cb, VK_STENCIL_FACE_BACK_BIT, d->stencil_masks[3]); vkCmdSetStencilWriteMask(G.cb, VK_STENCIL_FACE_BACK_BIT, d->stencil_masks[4]); vkCmdSetStencilReference(G.cb, VK_STENCIL_FACE_BACK_BIT, d->stencil_masks[5]);

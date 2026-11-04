@@ -97,3 +97,32 @@ Mesures sur Xenoblade 2 (103 665 fonctions : main 49 909, subsdk0 13 379, sdk 27
 
 Le jeu lancé avec l'ordre du profil (`main subsdk0 sdk`, sans `--order`, cache complet du nouveau Remill) : 507 trames présentées en 60 s, 637 fonctions non traduites au sens « remplacées », aucun arrêt. Reste : la liste des 243 fonctions « pas portées » n'est pas encore rapprochée de ce que le jeu appelle réellement (jalons D et E).
 
+## 8. Jalon D : le chemin graphique, ce qui est refait et ce qui est compté (2026-11-04)
+
+Mesure de départ (Xenoblade 2, 240 s : titre, ouverture, début de partie ; 1,66 million de dessins) : 0 dessin sauté, mais des compteurs mélangés (informations, textures de remplacement, état ignoré) et cinq états du jeu enregistrés puis jamais lus (`SetLineWidth`, `SetPointSize`, `SetDepthClamp`, `SetPrimitiveRestart`, `SetRasterizerDiscard`).
+
+Ce qui est fait (patch moteur 0103 et `linux/host/`) :
+- **Primitives** : ligne bouclée, bande de quadrilatères (index générés par `gpu.c`), polygone (éventail de triangles). Avant : dessin sauté, compté « primitive 2/8/9 ».
+- **Tessellation sans étage de contrôle** : `passthrough_tcs` fabrique en SPIR-V l'étage que le matériel a quand un programme n'en a pas (sommets recopiés, niveaux de `SetOuter/InnerTessellationLevels`, taille de patch du jeu). Le dessin passe par Python (la voie C lui rend la main).
+- **Copie texture vers tampon** (`nx2gpu_read_region`, avec les pas `copy_row_stride` / `copy_image_stride`) ; copie entre textures de formats différents mais de même taille de texel (copie brute).
+- **État du jeu** appliqué : redémarrage de primitive (avec l'indice propre au jeu, remplacé par le tout-un de Vulkan), rejet du rasteriseur, écrêtage de profondeur, largeur de ligne. La taille de point reste non appliquée, comptée.
+- **Textures finalisées** : `nvnTextureFinalize` ne fait plus disparaître la description d'une texture qu'un pool nomme encore (le matériel garde le descripteur) ; 150 « texture inconnue » sur le parcours deviennent 0.
+- **Rapport** : `coverage_text()` (affiché à la fin de `horizon_run.py`) range chaque compteur : dessins sautés, textures de remplacement, état non appliqué, notes ; et liste les cas concrets (60 au plus).
+- **Comparaison à une référence** : `framediff.py` (deux PNG ou deux dossiers : différence moyenne/maximale, part des pixels différents, PSNR, image de différences). Aucune référence n'est dans le dépôt. `NX2LINUX_NVN_REPLAY=check` compare les voies C et Python dessin par dessin.
+- Les tests : 14 nouveaux dans `test_horizon_gpu.py` (primitives, redémarrage, rejet, écrêtage, largeur, tessellation avec niveaux lus par le shader, copie texture vers tampon, textures fantômes, rapport), `test_framediff.py`.
+
+Mesure d'arrivée (même parcours, 280 s, 1,87 million de dessins, la voie C) : **0 dessin sauté, 0 état non appliqué, 151 dessins avec une texture de remplacement**, tous listés :
+- 75 « un shader échantillonne en 2D (par son instruction) une texture 3D » (le shader `da21866f…`, emplacement 1) : la bibliothèque n'a pas de vue 2D d'une image 3D échantillonnable ; le traducteur garde le type que l'instruction nomme, donc l'apprentissage du type (`learn_type`) n'y change rien et le dit (`unlearnable`) ;
+- 75 le même cas, vu du côté de la vue ;
+- 1 identifiant de texture 0 (jamais enregistré dans le pool).
+Notes : 131 textures de même mémoire mais de format ou de taille différents (des images distinctes, qui ne se voient pas : le plus souvent un flux de résolution de textures qui remplace l'autre au même endroit ; un cas de format 0x25 1280x720 contre 0x32 1024x1024 à la même adresse, à surveiller), 3 485 échantillonnages de stencil, 328 images partagées, 67 premiers usages vides.
+Image vérifiée à la main : une scène du jeu (ciel, personnages, textures, sous-titres) s'affiche correctement.
+
+Reste, par gravité :
+1. La vue 2D d'une texture 3D (VK_EXT_image_2d_view_of_3d) n'est pas faite : 75 dessins pendant un chargement.
+2. La taille de point (`SetPointSize`) n'est pas appliquée (comptée, 0 sur ce parcours).
+3. Le redémarrage de primitive n'agit pas sur les listes (points, lignes, triangles) ni sur les primitives à index générés.
+4. Une texture au-dessus de 96 Ko est jugée réécrite par un échantillon de sa mémoire jusqu'à ce qu'on l'ait vue réécrite (puis elle est hachée en entier) : une première réécriture partielle peut passer inaperçue.
+5. Le mode `check` signale 0,9 % de dessins différents (même état, contenu d'un tampon différent) ; le même écart existait avant (premier écart à 13 s) : la mémoire du jeu change entre les deux passes. Non attribué plus précisément.
+6. Un parcours plus long (combat, ville, carte) n'est pas fait : les chiffres ci-dessus valent pour le parcours testé.
+
