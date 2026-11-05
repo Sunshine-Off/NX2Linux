@@ -99,3 +99,4 @@ file	class	note
 0118-linux-host-a-damaged-elf-module-manifest-or-nso.patch	linux	Loader error handling and tests only
 0119-linux-host-aot-sanitize-builds-the-aot-runtime-w.patch	linux	Test build switch, off by default
 0120-linux-host-horizon-run-report-json-and-aot-repor.patch	linux	Runner option and report tool
+0121-linux-host-horizon-records-the-calls-that-make-m.patch	linux	Horizon bookkeeping, report fields and tests
