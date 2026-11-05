@@ -87,5 +87,5 @@ jobs:
           echo "LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/x86_64-linux-gnu" >> "$GITHUB_ENV"
       - name: Build and test
         run: |
-          python3 linux/cli/nx2linux.py build -j2
+          python3 linux/cli/nx2linux.py build-host -j2
           python3 linux/cli/nx2linux.py verify

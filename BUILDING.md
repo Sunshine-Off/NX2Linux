@@ -85,7 +85,7 @@ python3 tools/engine.py sync                    # the engine into engine/ (never
 tools/setup_toolchain.sh                        # Remill (patched), dynarmic and the Python venv, outside the repository
 source ~/.cache/nx2linux/toolchain/env.sh       # REMILL_BUILD, DYNARMIC_DIR, NX2_PYTHON
 python3 linux/cli/nx2linux.py doctor            # what is missing
-python3 linux/cli/nx2linux.py build -j2         # the SDL3 and Vulkan host
+python3 linux/cli/nx2linux.py build-host -j2         # the SDL3 and Vulkan host
 python3 linux/cli/nx2linux.py verify            # its tests
 ```
 

@@ -91,7 +91,7 @@ class LinuxFrontendTests(unittest.TestCase):
         self.wait_for(lambda: not self.backend.busy)
         line = next(line for line in ''.join(self.output).splitlines() if line.startswith('[['))
         args, cwd, driver = json.loads(line)
-        self.assertEqual(args[:5], ['build', '--build-dir', str(self.root / 'build with spaces'), '--config', 'Release'])
+        self.assertEqual(args[:5], ['build-host', '--build-dir', str(self.root / 'build with spaces'), '--config', 'Release'])
         self.assertEqual(cwd, str(self.root))
         self.assertEqual(driver, 'wayland')
 
