@@ -102,6 +102,7 @@
 0121-linux-host-horizon-records-the-calls-that-make-m.patch
 0122-linux-host-validate-game-py-runs-every-module-va.patch
 0123-linux-host-the-runtime-s-128-bit-compare-and-swa.patch
+0127-linux-host-test-recompile-insn-uses-cls-as-its-u.patch
 0124-linux-host-aot-cost-py-measures-what-a-recompile.patch
 0125-linux-host-aot-lift-lifts-the-functions-a-build.patch
 0126-linux-host-aot-cost-cache-stats-names-the-caches.patch
