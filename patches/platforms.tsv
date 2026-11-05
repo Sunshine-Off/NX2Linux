@@ -96,3 +96,4 @@ file	class	note
 0115-linux-host-the-apple-rewriter-and-its-patches-ar.patch	linux	Linux decision record and test
 0116-linux-host-horizon-run-build-only-recompiles-int.patch	linux	Linux runner option
 0117-linux-host-an-empty-module-folder-is-a-red-line.patch	linux	Linux runner and loader messages
+0118-linux-host-horizon-run-report-json-and-aot-repor.patch	linux	Runner option and report tool
