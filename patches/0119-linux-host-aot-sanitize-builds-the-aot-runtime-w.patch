@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 19:26:34 +0100
+Subject: [PATCH] Linux host: AOT_SANITIZE builds the AOT runtime with ASan and
+ UBSan, with a cache key of its own (#12)
+
+aot_lift.sanitizer_flags() reads AOT_SANITIZE (a comma-separated sanitizer list, anything
+else is a LinkError) and adds -fsanitize, -shared-libsan and -g to the compile and link of
+the runtime, the JIT, the address table and the stubs. The lifted functions stay
+uninstrumented. Unset, there is no flag and toolchain_key() gives the same value as before,
+so no cache is invalidated (tested against the old formula).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: AOT_SANITIZE gives tests a sanitizer build of the AOT runtime, off by default, with its own cache key
+Issue: Sunshine-Off/NX2Linux#12
+
+---
+ dm/tools/aot_lift.py                 | 18 ++++++++++---
+ dm/tools/tests/test_aot_lift_unit.py | 40 ++++++++++++++++++++++++++--
+ 2 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index c1a19882..0798731f 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -138,13 +138,25 @@ def inline_accessors(ll):
+ _toolkey = None
+ 
+ 
++def sanitizer_flags():
++    """Test builds only: AOT_SANITIZE=address,undefined compiles and links the runtime (aot_runtime.cpp, aot_jit.cpp, the address table and the stubs) with those sanitizers. The lifted functions stay uninstrumented
++    (they reach guest memory through the runtime, which is where the checks matter, and instrumenting a hundred thousand of them would only slow the test). The library is loaded by Python (ctypes), so the sanitizer
++    runtime has to be preloaded: `python3 linux/cli/nx2linux.py sanitize` sets that up. Empty by default, and then nothing changes: no flag, and the same cache key as before"""
++    s = os.environ.get('AOT_SANITIZE', '').strip()
++    if not s: return []
++    if not re.fullmatch(r'[a-z]+(,[a-z]+)*', s): raise LinkError(f'AOT_SANITIZE={s!r}: a comma-separated list of sanitizer names is needed, for example address,undefined')
++    return [f'-fsanitize={s}', '-shared-libsan', '-fno-omit-frame-pointer', '-g']   # -shared-libsan: the library needs the runtime as a shared object, so the link still reports an undefined runtime function (--no-undefined)
++
++
+ def toolchain_key():
+     """What a cached object depends on besides the function's bytes: the lifter, the C++ compiler, the flags and the limits. A new Remill build or clang makes every entry stale"""
+     global _toolkey
+     if _toolkey is None:
+         st = os.stat(lifter())
+         cv = subprocess.run(['clang++', '--version'], capture_output=True, text=True, errors='replace').stdout
+-        _toolkey = hashlib.sha256(f'{lifter()}|{st.st_size}|{st.st_mtime_ns}|{cv}|O2 fPIC|{MAX_LIFT_BYTES}|{include_dir()}'.encode()).hexdigest()
++        key = f'{lifter()}|{st.st_size}|{st.st_mtime_ns}|{cv}|O2 fPIC|{MAX_LIFT_BYTES}|{include_dir()}'
++        if sanitizer_flags(): key += '|' + ' '.join(sanitizer_flags())   # a sanitizer build never shares an entry with the normal one
++        _toolkey = hashlib.sha256(key.encode()).hexdigest()
+     return _toolkey
+ 
+ 
+@@ -257,7 +269,7 @@ class Aot:
+             else: objs = dict(lls)
+         so = os.path.join(d, f'aot{n}.so')   # one path per library: dlopen of a path already loaded returns the old one
+         inc = include_dir()
+-        base = ['-O2', '-fPIC', f'-I{inc}/include', f'-I{inc}', '-DADDRESS_SIZE_BITS=64']
++        base = ['-O2', '-fPIC', f'-I{inc}/include', f'-I{inc}', '-DADDRESS_SIZE_BITS=64', *sanitizer_flags()]
+         dyn = dynarmic_dir() if jit else None
+         for a in replaced: self.unlifted[a] = 'replaced by a host function'
+         for _ in range(len(functions) + 1):   # each round that fails to link turns at least one more function into a stub
+@@ -274,7 +286,7 @@ class Aot:
+                 fixed = [fixed_obj(src, std, base, dyn) for src, std in (('aot_runtime.cpp', 'c++17'), ('aot_jit.cpp', 'c++20'))]   # dynarmic's headers need C++20; the lifted code and the runtime do not
+                 libs = [f'{dyn}/build/src/dynarmic/libdynarmic.a', f'{dyn}/build/externals/mcl/src/libmcl.a', f'{dyn}/build/externals/fmt/libfmt.a',
+                         f'{dyn}/build/externals/zydis/libZydis.a', f'{dyn}/build/externals/zydis/zycore/libZycore.a']
+-                cmd = ['clang++', '-shared', *fixed, table_obj(table, base, d, n), table_obj(stubs, base, d, f'{n}s'), *objs.values(), '-o', so, '-Wl,--start-group', *libs, '-Wl,--end-group', '-lpthread', '-Wl,--no-undefined']
++                cmd = ['clang++', '-shared', *sanitizer_flags(), *fixed, table_obj(table, base, d, n), table_obj(stubs, base, d, f'{n}s'), *objs.values(), '-o', so, '-Wl,--start-group', *libs, '-Wl,--end-group', '-lpthread', '-Wl,--no-undefined']
+             else:
+                 cmd = ['clang++', '-shared', '-std=c++17', *base, str(HERE / 'aot_runtime.cpp'), table, stubs, *objs.values(), '-o', so, '-Wl,--no-undefined']
+             rsp = os.path.join(d, f'link{n}.rsp')   # a whole library has tens of thousands of objects: more than the kernel's argument limit, so clang reads them from a response file
+diff --git a/dm/tools/tests/test_aot_lift_unit.py b/dm/tools/tests/test_aot_lift_unit.py
+index de7ba52b..1b1af876 100644
+--- a/dm/tools/tests/test_aot_lift_unit.py
++++ b/dm/tools/tests/test_aot_lift_unit.py
+@@ -1,6 +1,7 @@
+-"""aot_lift.py without Remill: the way it reads a linker's complaint about missing symbols (the English and the French wording; the French one has a space inside « »)."""
+-import sys, unittest
++"""aot_lift.py without Remill: the way it reads a linker's complaint about missing symbols (the English and the French wording; the French one has a space inside « »), and the sanitizer switch."""
++import hashlib, os, shutil, subprocess, sys, tempfile, unittest
+ from pathlib import Path
++from unittest import mock
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ import aot_lift
+ 
+@@ -22,5 +23,40 @@ class Limits(unittest.TestCase):
+         with self.assertRaisesRegex(aot_lift.LiftError, r'function 0x1000: 70000 bytes are more than the 60000'): aot_lift.lift_function(bytes(70000), 0x1000, '/nonexistent/x.ll')
+ 
+ 
++class Sanitizer(unittest.TestCase):
++    """AOT_SANITIZE builds the runtime with sanitizers for `nx2linux.py sanitize` (issue #12). Unset, nothing changes: no flag, and the cache key is the one it always was, so no cache is invalidated"""
++    def flags(self, value):
++        env = {k: v for k, v in os.environ.items() if k != 'AOT_SANITIZE'}
++        if value is not None: env['AOT_SANITIZE'] = value
++        with mock.patch.dict(os.environ, env, clear=True): return aot_lift.sanitizer_flags()
++
++    def test_no_flag_by_default(self):
++        self.assertEqual(self.flags(None), []); self.assertEqual(self.flags(''), []); self.assertEqual(self.flags('  '), [])
++
++    def test_the_flags_follow_the_variable(self):
++        got = self.flags('address,undefined')
++        self.assertIn('-fsanitize=address,undefined', got); self.assertIn('-shared-libsan', got)   # the library links the runtime as a shared object, so --no-undefined still sees a missing runtime function
++        self.assertEqual(self.flags('undefined')[0], '-fsanitize=undefined')
++
++    def test_a_value_that_is_not_a_sanitizer_list_is_an_explicit_error(self):
++        for bad in ('address;rm -rf x', 'Address', 'address,', ',undefined', 'address undefined', '-fsanitize=address'):
++            with self.subTest(bad), self.assertRaisesRegex(aot_lift.LinkError, 'comma-separated list of sanitizer names'): self.flags(bad)
++
++    @unittest.skipUnless(shutil.which('clang++'), 'the cache key reads clang++ --version')
++    def test_the_cache_key_is_unchanged_without_it_and_differs_with_it(self):
++        with tempfile.TemporaryDirectory() as d:
++            lift = Path(d) / 'bin/lift/remill-lift-22'; lift.parent.mkdir(parents=True); lift.write_bytes(b'x' * 5)
++            def key(value):
++                env = {k: v for k, v in os.environ.items() if k not in ('AOT_SANITIZE', 'REMILL_SRC')}
++                env['REMILL_BUILD'] = d
++                if value: env['AOT_SANITIZE'] = value
++                with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(aot_lift, '_toolkey', None): return aot_lift.toolchain_key()
++            st = os.stat(lift); cv = subprocess.run(['clang++', '--version'], capture_output=True, text=True, errors='replace').stdout
++            before_the_switch = hashlib.sha256(f'{lift}|{st.st_size}|{st.st_mtime_ns}|{cv}|O2 fPIC|{aot_lift.MAX_LIFT_BYTES}|{os.path.join(d, "..")}'.encode()).hexdigest()
++            self.assertEqual(key(None), before_the_switch)
++            self.assertNotEqual(key('address,undefined'), before_the_switch)
++            self.assertNotEqual(key('address,undefined'), key('undefined'))
++
++
+ if __name__ == '__main__':
+     unittest.main()

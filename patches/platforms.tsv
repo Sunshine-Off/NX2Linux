@@ -97,3 +97,4 @@ file	class	note
 0116-linux-host-horizon-run-build-only-recompiles-int.patch	linux	Linux runner option
 0117-linux-host-an-empty-module-folder-is-a-red-line.patch	linux	Linux runner and loader messages
 0118-linux-host-a-damaged-elf-module-manifest-or-nso.patch	linux	Loader error handling and tests only
+0119-linux-host-aot-sanitize-builds-the-aot-runtime-w.patch	linux	Test build switch, off by default
