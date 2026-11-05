@@ -101,3 +101,5 @@ file	class	note
 0120-linux-host-horizon-run-report-json-and-aot-repor.patch	linux	Runner option and report tool
 0121-linux-host-horizon-records-the-calls-that-make-m.patch	linux	Horizon bookkeeping, report fields and tests
 0122-linux-host-validate-game-py-runs-every-module-va.patch	linux	Validation driver, tools only
+0123-linux-host-the-runtime-s-128-bit-compare-and-swa.patch	linux	Runtime CAS and tests for the Remill 0010 instructions
+0127-linux-host-test-recompile-insn-uses-cls-as-its-u.patch	linux	Test only: ccmn became liftable with Remill patch 0010

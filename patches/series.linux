@@ -62,3 +62,5 @@
 0120-linux-host-horizon-run-report-json-and-aot-repor.patch
 0121-linux-host-horizon-records-the-calls-that-make-m.patch
 0122-linux-host-validate-game-py-runs-every-module-va.patch
+0123-linux-host-the-runtime-s-128-bit-compare-and-swa.patch
+0127-linux-host-test-recompile-insn-uses-cls-as-its-u.patch

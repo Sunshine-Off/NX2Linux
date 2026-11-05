@@ -1,0 +1,747 @@
+From 2431807e6c2044f7f6134aadf3680078dedb3a56 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 19:50:58 +0100
+Subject: [PATCH] AArch64: pair exclusives, saturating narrows, FRECPE and
+ FRECPX, half precision conversions, register-form CCMN
+
+The instructions that real code still sent to the JIT (issue #16 of NX2Linux), each written from the
+Arm Architecture Reference Manual and checked against Unicorn's AArch64 core (values, NZCV, memory and
+the FPSR flags) by test_aot_simd.py and test_aot_atomics.py.
+
+  * LDXP, LDAXP, STXP, STLXP (two W or two X registers). The monitor gets a third pseudo register,
+    MONITOR_VALUE_HI (Arch::InitializeEmptyLiftedFunction), for the high word of a 128-bit pair. The
+    pair is read as two words, not atomically: a torn read only makes the store-exclusive fail and the
+    program retries. The store is one compare-and-swap of the pair's width against what the load read:
+    64 bits for two W registers, 128 for two X registers (__remill_compare_exchange_memory_128, which the
+    runtime does with cmpxchg16b).
+  * SQXTN, UQXTN, SQXTUN, vector (with the "2" forms) and scalar, with the QC saturation flag.
+  * FRECPE (single and double, vector and scalar) and FRECPX (scalar): the manual's FPRecipEstimate and
+    RecipEstimate on the bits, with FPCR's rounding mode for the overflow case, and the invalid, divide by
+    zero, overflow and inexact flags. FPCR.FZ is not modelled, as for FRSQRTE.
+  * FCVT between half and single or double, FCVTN and FCVTL with 4H and 8H: FPConvert on the bits, with
+    FPCR's rounding mode, IOC for a signalling NaN, OFC and IXC for an overflow, UFC and IXC for a tiny
+    inexact result, IXC for any inexact one. FPCR.FZ16 and AHP are not modelled.
+  * CCMN, register form (W and X): the semantics existed for the immediate form.
+
+Not done, on purpose: the LSE atomics (CAS, SWP, LDADD and the others, ARMv8.1), which the Switch's
+Cortex-A57 does not have and which only sit in outline-atomics code behind a test that fails there, and
+the half-precision arithmetic (ARMv8.2), which that CPU does not have either. They stay in the JIT.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ lib/Arch/AArch64/Arch.cpp               |  95 +++++++++++-
+ lib/Arch/AArch64/Decode.cpp             |  88 -----------
+ lib/Arch/AArch64/Semantics/COND.cpp     |   3 +
+ lib/Arch/AArch64/Semantics/DATAXFER.cpp |  93 +++++++++++
+ lib/Arch/AArch64/Semantics/SIMD.cpp     | 195 ++++++++++++++++++++++++
+ lib/Arch/Arch.cpp                       |   4 +
+ 6 files changed, 383 insertions(+), 95 deletions(-)
+
+diff --git a/lib/Arch/AArch64/Arch.cpp b/lib/Arch/AArch64/Arch.cpp
+index 7ba0b77..c95823d 100644
+--- a/lib/Arch/AArch64/Arch.cpp
++++ b/lib/Arch/AArch64/Arch.cpp
+@@ -2836,9 +2836,6 @@ bool TryDecodeFCVT_DS_FLOATDP1(const InstData &data, Instruction &inst) {
+ }
+ 
+ // FCVT  <Hd>, <Dn>
+-bool TryDecodeFCVT_HD_FLOATDP1(const InstData &data, Instruction &inst) {
+-  return false;
+-}
+ 
+ // FCVT  <Sd>, <Dn>
+ bool TryDecodeFCVT_SD_FLOATDP1(const InstData &data, Instruction &inst) {
+@@ -5413,16 +5410,14 @@ static bool NxFCvtV(const InstData &data, Instruction &inst, bool shift) {
+   return true;
+ }
+ static bool NxFCvtN(const InstData &data, Instruction &inst) {
+-  if (!data.sz) return false;   // half precision is not translated
+-  inst.function += data.Q ? "_2" : "_1";
++  inst.function += data.sz ? (data.Q ? "_2" : "_1") : (data.Q ? "_H2" : "_H1");   // sz = 0: single to half (4S to 4H), sz = 1: double to single
+   AddRegOperand(inst, kActionWrite, kRegQ, kUseAsValue, data.Rd);
+   AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rd);
+   AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rn);
+   return true;
+ }
+ static bool NxFCvtL(const InstData &data, Instruction &inst) {
+-  if (!data.sz) return false;
+-  inst.function += data.Q ? "_2" : "_1";
++  inst.function += data.sz ? (data.Q ? "_2" : "_1") : (data.Q ? "_H2" : "_H1");
+   AddRegOperand(inst, kActionWrite, kRegQ, kUseAsValue, data.Rd);
+   AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rn);
+   return true;
+@@ -5507,6 +5502,92 @@ bool TryDecodeFRSQRTE_ASISDMISC_R(const InstData &data, Instruction &inst) {
+   AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rn);
+   return true;
+ }
++
++// ---- NX2Linux: pair exclusives, register-form CCMN, saturating narrows, FRECPE and FRECPX ----
++// LDXP / LDAXP / STXP / STLXP: one memory operand of the pair's width (64 bits for two W registers, 128 for two X), the registers, and the three monitor registers
++static void AddMonitorHiOperand(Instruction &inst) {
++  Operand op;
++  op.action = Operand::kActionWrite;
++  op.size = 64;
++  op.type = Operand::kTypeRegister;
++  op.reg.name = "MONITOR_VALUE_HI";
++  op.reg.size = 64;
++  inst.operands.push_back(op);
++}
++static bool NxLdxp(const InstData &data, Instruction &inst, bool x) {
++  inst.is_atomic_read_modify_write = true;
++  AddRegOperand(inst, kActionWrite, x ? kRegX : kRegW, kUseAsValue, data.Rt);
++  AddRegOperand(inst, kActionWrite, x ? kRegX : kRegW, kUseAsValue, data.Rt2);
++  AddBasePlusOffsetMemOp(inst, kActionRead, x ? 128 : 64, data.Rn, 0);
++  AddMonitorOperand(inst);
++  AddMonitorHiOperand(inst);
++  return true;
++}
++static bool NxStxp(const InstData &data, Instruction &inst, bool x) {
++  inst.is_atomic_read_modify_write = true;
++  AddRegOperand(inst, kActionWrite, kRegW, kUseAsValue, data.Rs);
++  AddRegOperand(inst, kActionRead, x ? kRegX : kRegW, kUseAsValue, data.Rt);
++  AddRegOperand(inst, kActionRead, x ? kRegX : kRegW, kUseAsValue, data.Rt2);
++  AddBasePlusOffsetMemOp(inst, kActionWrite, x ? 128 : 64, data.Rn, 0);
++  AddMonitorOperand(inst);
++  AddMonitorHiOperand(inst);
++  return true;
++}
++bool TryDecodeLDXP_LP32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxLdxp(data, inst, false); }
++bool TryDecodeLDXP_LP64_LDSTEXCL(const InstData &data, Instruction &inst) { return NxLdxp(data, inst, true); }
++bool TryDecodeLDAXP_LP32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxLdxp(data, inst, false); }
++bool TryDecodeLDAXP_LP64_LDSTEXCL(const InstData &data, Instruction &inst) { return NxLdxp(data, inst, true); }
++bool TryDecodeSTXP_SP32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxStxp(data, inst, false); }
++bool TryDecodeSTXP_SP64_LDSTEXCL(const InstData &data, Instruction &inst) { return NxStxp(data, inst, true); }
++bool TryDecodeSTLXP_SP32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxStxp(data, inst, false); }
++bool TryDecodeSTLXP_SP64_LDSTEXCL(const InstData &data, Instruction &inst) { return NxStxp(data, inst, true); }
++
++// CCMN <Wn>, <Wm>, #<nzcv>, <cond> and the X form: the semantics (CCMN) already exist for the immediate form
++bool TryDecodeCCMN_32_CONDCMP_REG(const InstData &data, Instruction &inst) {
++  SetConditionalFunctionName(data, inst);
++  AddRegOperand(inst, kActionRead, kRegW, kUseAsValue, data.Rn);
++  AddRegOperand(inst, kActionRead, kRegW, kUseAsValue, data.Rm);
++  AddImmOperand(inst, data.nzcv);
++  return true;
++}
++bool TryDecodeCCMN_64_CONDCMP_REG(const InstData &data, Instruction &inst) {
++  SetConditionalFunctionName(data, inst);
++  AddRegOperand(inst, kActionRead, kRegX, kUseAsValue, data.Rn);
++  AddRegOperand(inst, kActionRead, kRegX, kUseAsValue, data.Rm);
++  AddImmOperand(inst, data.nzcv);
++  return true;
++}
++
++// SQXTN, UQXTN, SQXTUN: the vector forms take the arrangement of the narrow result (and the register they merge into for the "2" forms), the scalar ones the size of the result (B, H, S)
++bool TryDecodeSQXTN_ASIMDMISC_N(const InstData &data, Instruction &inst) { return NxNarrow(data, inst, false); }
++bool TryDecodeUQXTN_ASIMDMISC_N(const InstData &data, Instruction &inst) { return NxNarrow(data, inst, false); }
++bool TryDecodeSQXTUN_ASIMDMISC_N(const InstData &data, Instruction &inst) { return NxNarrow(data, inst, false); }
++static bool NxNarrowScalar(const InstData &data, Instruction &inst) {
++  if (data.size == 3) return false;
++  inst.function += data.size == 0 ? "_B" : data.size == 1 ? "_H" : "_S";
++  AddRegOperand(inst, kActionWrite, kRegQ, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rn);
++  return true;
++}
++bool TryDecodeSQXTN_ASISDMISC_N(const InstData &data, Instruction &inst) { return NxNarrowScalar(data, inst); }
++bool TryDecodeUQXTN_ASISDMISC_N(const InstData &data, Instruction &inst) { return NxNarrowScalar(data, inst); }
++bool TryDecodeSQXTUN_ASISDMISC_N(const InstData &data, Instruction &inst) { return NxNarrowScalar(data, inst); }
++
++// FCVT between half precision and single or double (scalar): whole Q registers, the semantics read and write the lanes they need
++static bool NxFcvtHalf(const InstData &data, Instruction &inst) {
++  AddRegOperand(inst, kActionWrite, kRegQ, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rn);
++  return true;
++}
++bool TryDecodeFCVT_SH_FLOATDP1(const InstData &data, Instruction &inst) { return NxFcvtHalf(data, inst); }
++bool TryDecodeFCVT_DH_FLOATDP1(const InstData &data, Instruction &inst) { return NxFcvtHalf(data, inst); }
++bool TryDecodeFCVT_HS_FLOATDP1(const InstData &data, Instruction &inst) { return NxFcvtHalf(data, inst); }
++bool TryDecodeFCVT_HD_FLOATDP1(const InstData &data, Instruction &inst) { return NxFcvtHalf(data, inst); }
++
++// FRECPE and FRECPX, single and double (vector 2S / 4S / 2D, scalar S / D). The half-precision forms stay undecoded: the Switch's CPU has no FP16 arithmetic
++bool TryDecodeFRECPE_ASIMDMISC_R(const InstData &data, Instruction &inst) { return NxFMisc(data, inst); }
++bool TryDecodeFRECPE_ASISDMISC_R(const InstData &data, Instruction &inst) { return TryDecodeFRSQRTE_ASISDMISC_R(data, inst); }
++bool TryDecodeFRECPX_ASISDMISC_R(const InstData &data, Instruction &inst) { return TryDecodeFRSQRTE_ASISDMISC_R(data, inst); }
+ bool TryDecodeFMUL_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+ bool TryDecodeFDIV_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+ bool TryDecodeFMAX_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+diff --git a/lib/Arch/AArch64/Decode.cpp b/lib/Arch/AArch64/Decode.cpp
+index ef1e23d..de4abfb 100644
+--- a/lib/Arch/AArch64/Decode.cpp
++++ b/lib/Arch/AArch64/Decode.cpp
+@@ -296,10 +296,6 @@ bool TryDecodeFRECPX_ASISDMISCFP16_R(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // FRECPX  <V><d>, <V><n>
+-bool TryDecodeFRECPX_ASISDMISC_R(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // STSMAXH STSMAXH_32S_memop:
+ //   0 1 Rt       0
+ //   1 1 Rt       1
+@@ -661,10 +657,6 @@ bool TryDecodeFABS_ASIMDMISCFP16_R(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FCVT  <Sd>, <Hn>
+-bool TryDecodeFCVT_SH_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // FCVT FCVT_DH_floatdp1:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -699,10 +691,6 @@ bool TryDecodeFCVT_SH_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FCVT  <Dd>, <Hn>
+-bool TryDecodeFCVT_DH_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // FCVT FCVT_HS_floatdp1:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -737,10 +725,6 @@ bool TryDecodeFCVT_DH_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FCVT  <Hd>, <Sn>
+-bool TryDecodeFCVT_HS_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // LDLARH LDLARH_LR32_ldstexcl:
+ //   0 x Rt       0
+ //   1 x Rt       1
+@@ -3030,10 +3014,6 @@ bool TryDecodeFRINTA_ASIMDMISCFP16_R(const InstData &, Instruction &) {
+ //  30 0 sz       0
+ //  31 1
+ // STXP  <Ws>, <Wt1>, <Wt2>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTXP_SP32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // STXP STXP_SP64_ldstexcl:
+ //   0 x Rt       0
+ //   1 x Rt       1
+@@ -3068,10 +3048,6 @@ bool TryDecodeSTXP_SP32_LDSTEXCL(const InstData &, Instruction &) {
+ //  30 1 sz       0
+ //  31 1
+ // STXP  <Ws>, <Xt1>, <Xt2>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTXP_SP64_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // SBFM SBFX_SBFM_32M_bitfield:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -3182,10 +3158,6 @@ bool TryDecodeSBFX_SBFM_64M_BITFIELD(const InstData &, Instruction &) {
+ //  30 0 sz       0
+ //  31 1
+ // LDXP  <Wt1>, <Wt2>, [<Xn|SP>{,#0}]
+-bool TryDecodeLDXP_LP32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // LDXP LDXP_LP64_ldstexcl:
+ //   0 x Rt       0
+ //   1 x Rt       1
+@@ -3220,10 +3192,6 @@ bool TryDecodeLDXP_LP32_LDSTEXCL(const InstData &, Instruction &) {
+ //  30 1 sz       0
+ //  31 1
+ // LDXP  <Xt1>, <Xt2>, [<Xn|SP>{,#0}]
+-bool TryDecodeLDXP_LP64_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // UCVTF UCVTF_asisdmiscfp16_R:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -6005,10 +5973,6 @@ bool TryDecodeTST_ANDS_64S_LOG_IMM(const InstData &, Instruction &) {
+ //  30 0 sz       0
+ //  31 1
+ // STLXP  <Ws>, <Wt1>, <Wt2>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTLXP_SP32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // STLXP STLXP_SP64_ldstexcl:
+ //   0 x Rt       0
+ //   1 x Rt       1
+@@ -6043,10 +6007,6 @@ bool TryDecodeSTLXP_SP32_LDSTEXCL(const InstData &, Instruction &) {
+ //  30 1 sz       0
+ //  31 1
+ // STLXP  <Ws>, <Xt1>, <Xt2>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTLXP_SP64_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // SQRSHL SQRSHL_asisdsame_only:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -8193,10 +8153,6 @@ bool TryDecodeSQDMULL_ASIMDELEM_L(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 0 sf       0
+ // CCMN  <Wn>, <Wm>, #<nzcv>, <cond>
+-bool TryDecodeCCMN_32_CONDCMP_REG(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // CCMN CCMN_64_condcmp_reg:
+ //   0 x nzcv     0
+ //   1 x nzcv     1
+@@ -8231,10 +8187,6 @@ bool TryDecodeCCMN_32_CONDCMP_REG(const InstData &, Instruction &) {
+ //  30 0 op       0
+ //  31 1 sf       0
+ // CCMN  <Xn>, <Xm>, #<nzcv>, <cond>
+-bool TryDecodeCCMN_64_CONDCMP_REG(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // STNP STNP_S_ldstnapair_offs:
+ //   0 x Rt       0
+ //   1 x Rt       1
+@@ -14972,10 +14924,6 @@ bool TryDecodeFNMSUB_H_FLOATDP3(const InstData &, Instruction &) {
+ //  30 0 sz       0
+ //  31 1
+ // LDAXP  <Wt1>, <Wt2>, [<Xn|SP>{,#0}]
+-bool TryDecodeLDAXP_LP32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // LDAXP LDAXP_LP64_ldstexcl:
+ //   0 x Rt       0
+ //   1 x Rt       1
+@@ -15010,10 +14958,6 @@ bool TryDecodeLDAXP_LP32_LDSTEXCL(const InstData &, Instruction &) {
+ //  30 1 sz       0
+ //  31 1
+ // LDAXP  <Xt1>, <Xt2>, [<Xn|SP>{,#0}]
+-bool TryDecodeLDAXP_LP64_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // CASPA CASPA_CP32_ldstexcl:
+ //   0 x Rt       0
+ //   1 x Rt       1
+@@ -15997,10 +15941,6 @@ bool TryDecodeFNMUL_H_FLOATDP2(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SQXTN  <Vb><d>, <Va><n>
+-bool TryDecodeSQXTN_ASISDMISC_N(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // SQXTN SQXTN_asimdmisc_N:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -16035,10 +15975,6 @@ bool TryDecodeSQXTN_ASISDMISC_N(const InstData &, Instruction &) {
+ //  30 x Q        0
+ //  31 0
+ // SQXTN{2}  <Vd>.<Tb>, <Vn>.<Ta>
+-bool TryDecodeSQXTN_ASIMDMISC_N(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // ORR MOV_ORR_asimdsame_only:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -24211,10 +24147,6 @@ bool TryDecodeFMIN_ASIMDSAMEFP16_ONLY(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SQXTUN  <Vb><d>, <Va><n>
+-bool TryDecodeSQXTUN_ASISDMISC_N(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // SQXTUN SQXTUN_asimdmisc_N:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -24249,10 +24181,6 @@ bool TryDecodeSQXTUN_ASISDMISC_N(const InstData &, Instruction &) {
+ //  30 x Q        0
+ //  31 0
+ // SQXTUN{2}  <Vd>.<Tb>, <Vn>.<Ta>
+-bool TryDecodeSQXTUN_ASIMDMISC_N(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // LDEORAB LDEORAB_32_memop:
+ //   0 x Rt       0
+ //   1 x Rt       1
+@@ -27586,10 +27514,6 @@ bool TryDecodeLDSMAXLH_32_MEMOP(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // UQXTN  <Vb><d>, <Va><n>
+-bool TryDecodeUQXTN_ASISDMISC_N(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // UQXTN UQXTN_asimdmisc_N:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -27624,10 +27548,6 @@ bool TryDecodeUQXTN_ASISDMISC_N(const InstData &, Instruction &) {
+ //  30 x Q        0
+ //  31 0
+ // UQXTN{2}  <Vd>.<Tb>, <Vn>.<Ta>
+-bool TryDecodeUQXTN_ASIMDMISC_N(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ 
+ // FCVTZS FCVTZS_asisdmiscfp16_R:
+ //   0 x Rd       0
+@@ -39043,10 +38963,6 @@ bool TryDecodeFRECPE_ASISDMISCFP16_R(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // FRECPE  <V><d>, <V><n>
+-bool TryDecodeFRECPE_ASISDMISC_R(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // FRECPE FRECPE_asimdmiscfp16_R:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -39119,10 +39035,6 @@ bool TryDecodeFRECPE_ASIMDMISCFP16_R(const InstData &, Instruction &) {
+ //  30 x Q        0
+ //  31 0
+ // FRECPE  <Vd>.<T>, <Vn>.<T>
+-bool TryDecodeFRECPE_ASIMDMISC_R(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // LD1R LD1R_asisdlso_R1:
+ //   0 x Rt       0
+ //   1 x Rt       1
+diff --git a/lib/Arch/AArch64/Semantics/COND.cpp b/lib/Arch/AArch64/Semantics/COND.cpp
+index 1b7d6d3..12dacb7 100644
+--- a/lib/Arch/AArch64/Semantics/COND.cpp
++++ b/lib/Arch/AArch64/Semantics/COND.cpp
+@@ -130,6 +130,9 @@ DEF_COND_ISEL(CCMP_64_CONDCMP_REG, CCMP, R64, R64)
+ DEF_COND_ISEL(CCMN_32_CONDCMP_IMM, CCMN, R32, I32)
+ DEF_COND_ISEL(CCMN_64_CONDCMP_IMM, CCMN, R64, I64)
+ 
++DEF_COND_ISEL(CCMN_32_CONDCMP_REG, CCMN, R32, R32)
++DEF_COND_ISEL(CCMN_64_CONDCMP_REG, CCMN, R64, R64)
++
+ namespace {
+ 
+ template <bool (*check_cond)(const State &), int kUnused>
+diff --git a/lib/Arch/AArch64/Semantics/DATAXFER.cpp b/lib/Arch/AArch64/Semantics/DATAXFER.cpp
+index 6cdf5da..a76a389 100644
+--- a/lib/Arch/AArch64/Semantics/DATAXFER.cpp
++++ b/lib/Arch/AArch64/Semantics/DATAXFER.cpp
+@@ -349,6 +349,99 @@ DEF_ISEL(STLXR_SR64_LDSTEXCL) = STXR<R64, M64W, true>;
+ 
+ namespace {
+ 
++// LDXP / LDAXP: the pair is read as two words (not atomically: a torn read only makes the store-exclusive fail, which retries), and the monitor keeps the address and both words. STXP / STLXP store
++// both words with one compare-and-swap of the pair's width against what the load read: 64 bits for two W registers, 128 for two X registers (the runtime does it with cmpxchg16b)
++template <bool kAcquire>
++DEF_SEM(LDXP64, R64W dst1, R64W dst2, MV128 src, R64W monitor, R64W monitor_value, R64W monitor_value_hi) {
++  auto vec = UReadV64(src);
++  auto lo = UExtractV64(vec, 0), hi = UExtractV64(vec, 1);
++  Write(dst1, lo);
++  Write(dst2, hi);
++  Write(monitor, AddressOf(src));
++  Write(monitor_value, lo);
++  Write(monitor_value_hi, hi);
++  if (kAcquire) {
++    memory = __remill_barrier_load_load(memory);
++    memory = __remill_barrier_load_store(memory);
++  }
++  return memory;
++}
++
++template <bool kAcquire>
++DEF_SEM(LDXP32, R32W dst1, R32W dst2, MV64 src, R64W monitor, R64W monitor_value, R64W monitor_value_hi) {
++  auto vec = UReadV32(src);
++  auto lo = UExtractV32(vec, 0), hi = UExtractV32(vec, 1);
++  WriteZExt(dst1, lo);
++  WriteZExt(dst2, hi);
++  Write(monitor, AddressOf(src));
++  Write(monitor_value, (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo));
++  Write(monitor_value_hi, 0_u64);
++  if (kAcquire) {
++    memory = __remill_barrier_load_load(memory);
++    memory = __remill_barrier_load_store(memory);
++  }
++  return memory;
++}
++
++template <bool kRelease>
++DEF_SEM(STXP64, R32W status, R64 src1, R64 src2, MV128W dst, R64W monitor, R64W monitor_value, R64W monitor_value_hi) {
++  const addr_t addr = AddressOf(dst);
++  if (kRelease) {
++    memory = __remill_barrier_load_store(memory);
++    memory = __remill_barrier_store_store(memory);
++  }
++  if (Read(monitor) == addr) {
++    uint128_t expected = (static_cast<uint128_t>(Read(monitor_value_hi)) << 64) | static_cast<uint128_t>(Read(monitor_value));
++    uint128_t desired = (static_cast<uint128_t>(Read(src2)) << 64) | static_cast<uint128_t>(Read(src1));
++    MnW<uint128_t> where = {addr};
++    if (UCmpXchg(where, expected, desired)) {
++      WriteZExt(status, 0_u32);  // Store succeeded.
++    } else {
++      WriteZExt(status, 1_u32);  // The pair changed since the load.
++    }
++  } else {
++    WriteZExt(status, 1_u32);  // No exclusive load of this address.
++  }
++  Write(monitor, 0_u64);
++  return memory;
++}
++
++template <bool kRelease>
++DEF_SEM(STXP32, R32W status, R32 src1, R32 src2, MV64W dst, R64W monitor, R64W monitor_value, R64W monitor_value_hi) {
++  const addr_t addr = AddressOf(dst);
++  if (kRelease) {
++    memory = __remill_barrier_load_store(memory);
++    memory = __remill_barrier_store_store(memory);
++  }
++  if (Read(monitor) == addr) {
++    uint64_t expected = Read(monitor_value);
++    uint64_t desired = (static_cast<uint64_t>(Read(src2)) << 32) | static_cast<uint64_t>(Read(src1));
++    MnW<uint64_t> where = {addr};
++    if (UCmpXchg(where, expected, desired)) {
++      WriteZExt(status, 0_u32);
++    } else {
++      WriteZExt(status, 1_u32);
++    }
++  } else {
++    WriteZExt(status, 1_u32);
++  }
++  Write(monitor, 0_u64);
++  return memory;
++}
++
++}  // namespace
++
++DEF_ISEL(LDXP_LP32_LDSTEXCL) = LDXP32<false>;
++DEF_ISEL(LDXP_LP64_LDSTEXCL) = LDXP64<false>;
++DEF_ISEL(LDAXP_LP32_LDSTEXCL) = LDXP32<true>;
++DEF_ISEL(LDAXP_LP64_LDSTEXCL) = LDXP64<true>;
++DEF_ISEL(STXP_SP32_LDSTEXCL) = STXP32<false>;
++DEF_ISEL(STXP_SP64_LDSTEXCL) = STXP64<false>;
++DEF_ISEL(STLXP_SP32_LDSTEXCL) = STXP32<true>;
++DEF_ISEL(STLXP_SP64_LDSTEXCL) = STXP64<true>;
++
++namespace {
++
+ template <typename D, typename S, typename InterType>
+ DEF_SEM(LoadSExt, D dst, S src) {
+   WriteZExt(dst, SExtTo<InterType>(Read(src)));
+diff --git a/lib/Arch/AArch64/Semantics/SIMD.cpp b/lib/Arch/AArch64/Semantics/SIMD.cpp
+index 5b4f362..5cadabf 100644
+--- a/lib/Arch/AArch64/Semantics/SIMD.cpp
++++ b/lib/Arch/AArch64/Semantics/SIMD.cpp
+@@ -3372,3 +3372,198 @@ DEF_ISEL(FRSQRTE_ASIMDMISC_R_4S) = NX_FRSQRTE<4, 1>;
+ DEF_ISEL(FRSQRTE_ASIMDMISC_R_2D) = NX_FRSQRTE<8, 1>;
+ DEF_ISEL(FRSQRTE_ASISDMISC_R_S) = NX_FRSQRTE<4, 2>;
+ DEF_ISEL(FRSQRTE_ASISDMISC_R_D) = NX_FRSQRTE<8, 2>;
++
++// SQXTN, UQXTN, SQXTUN: narrow every lane to half its width with saturation (QC is set when a lane saturates). KIND 0: signed to signed, 1: unsigned to unsigned, 2: signed to unsigned.
++// E is the destination element size in bytes. The vector form writes the lower half (Q = 0, upper half zeroed) or the upper half (Q = 1, "2" forms, lower half kept)
++template <int E, int KIND> ALWAYS_INLINE static uint64_t NxQxtn(State &state, uint64_t wide) {
++  const int bits = E * 8, src = bits * 2;
++  NxI128 x = KIND == 1 ? static_cast<NxI128>(wide) : static_cast<NxI128>(static_cast<int64_t>(wide << (64 - src)) >> (64 - src));
++  return KIND == 0 ? NxSatS(state, x, bits) : NxSatU(state, x, bits);
++}
++template <int E, int Q, int KIND> DEF_SEM(NX_QXTN, V128W dst, V128 accv, V128 src) {
++  NxVec a = NxRead(src), c = NxRead(accv), r = {};
++  if (Q) r.d[0] = c.d[0];
++  constexpr int n = 8 / E;
++  for (int i = 0; i < n; i++) {
++    uint64_t x = E == 1 ? a.h[i] : E == 2 ? a.s[i] : a.d[i];
++    NxSet<E>(r, Q * n + i, NxQxtn<E, KIND>(state, x));
++  }
++  NxWrite(dst, r); return memory;
++}
++template <int E, int KIND> DEF_SEM(NX_QXTN_S, V128W dst, V128 src) {
++  NxVec a = NxRead(src), r = {};
++  uint64_t x = E == 1 ? a.h[0] : E == 2 ? a.s[0] : a.d[0];
++  NxSet<E>(r, 0, NxQxtn<E, KIND>(state, x));
++  NxWrite(dst, r); return memory;
++}
++
++// FRECPE: FPRecipEstimate / RecipEstimate of the manual, on the bits (single: E = 4, double: E = 8), with FPCR's rounding mode for the overflow case. FPCR.FZ is not modelled (as for FRSQRTE).
++// FRECPX: the exponent inverted, the fraction cleared (a zero or a denormal gives the largest exponent)
++ALWAYS_INLINE static unsigned NxRecipEstimate(unsigned a) { return (((1u << 19) / (a * 2 + 1)) + 1) / 2; }   // 256 <= a < 512
++template <int E> ALWAYS_INLINE static uint64_t NxFrecpe(uint64_t bits, State &state) {
++  constexpr int fb = E == 4 ? 23 : 52, eb = E == 4 ? 8 : 11;
++  const uint64_t fmask = (1ull << fb) - 1, emax = (1ull << eb) - 1;
++  uint64_t sign = bits >> (fb + eb), exp = (bits >> fb) & emax, frac = bits & fmask;
++  if (exp == emax && frac) {   // NaN: quieted, and an invalid operation if it was signalling
++    if (!(frac >> (fb - 1))) state.sr.ioc = 1;
++    return bits | (1ull << (fb - 1));
++  }
++  if (exp == emax) return sign << (fb + eb);   // infinity -> zero
++  if (exp == 0 && frac == 0) { state.sr.dzc = 1; return (sign << (fb + eb)) | (emax << fb); }   // zero -> infinity
++  if (exp == 0 && (frac >> (fb - 2)) == 0) {   // |x| < 2^-128 (single) or 2^-1024 (double): the result overflows
++    const unsigned mode = (state.fpcr.flat >> 22) & 3;
++    const bool to_inf = mode == 0 || (mode == 1 && !sign) || (mode == 2 && sign);
++    state.sr.ofc = 1; state.sr.ixc = 1;
++    return (sign << (fb + eb)) | (to_inf ? (emax << fb) : (((emax - 1) << fb) | fmask));
++  }
++  uint64_t fraction = E == 4 ? frac << 29 : frac;   // 52 bits
++  int64_t e = static_cast<int64_t>(exp);
++  const uint64_t m52 = (1ull << 52) - 1;
++  if (e == 0) {
++    if (!((fraction >> 51) & 1)) { e = -1; fraction = (fraction << 2) & m52; }
++    else fraction = (fraction << 1) & m52;
++  }
++  const unsigned scaled = 256u | static_cast<unsigned>((fraction >> 44) & 0xFF);
++  int64_t re = (E == 4 ? 253 : 2045) - e;
++  uint64_t out = static_cast<uint64_t>(NxRecipEstimate(scaled) & 0xFF) << 44;
++  if (re == 0) out = (1ull << 51) | (out >> 1);
++  else if (re == -1) { out = (1ull << 50) | (out >> 2); re = 0; }
++  return (sign << (fb + eb)) | ((static_cast<uint64_t>(re) & emax) << fb) | (out >> (52 - fb));
++}
++template <int E, int Q> DEF_SEM(NX_FRECPE, V128W dst, V128 src) {
++  NxVec a = NxRead(src), r = {};
++  for (int i = 0; i < NxN<E, Q>::n; i++) {
++    if constexpr (E == 4) r.s[i] = static_cast<uint32_t>(NxFrecpe<4>(a.s[i], state)); else r.d[i] = NxFrecpe<8>(a.d[i], state);
++  }
++  NxWrite(dst, r); return memory;
++}
++template <int E> ALWAYS_INLINE static uint64_t NxFrecpx(uint64_t bits, State &state) {
++  constexpr int fb = E == 4 ? 23 : 52, eb = E == 4 ? 8 : 11;
++  const uint64_t fmask = (1ull << fb) - 1, emax = (1ull << eb) - 1;
++  uint64_t sign = bits >> (fb + eb), exp = (bits >> fb) & emax, frac = bits & fmask;
++  if (exp == emax && frac) {
++    if (!(frac >> (fb - 1))) state.sr.ioc = 1;
++    return bits | (1ull << (fb - 1));
++  }
++  return (sign << (fb + eb)) | ((exp == 0 ? emax - 1 : (~exp & emax)) << fb);
++}
++template <int E> DEF_SEM(NX_FRECPX, V128W dst, V128 src) {
++  NxVec a = NxRead(src), r = {};
++  if constexpr (E == 4) r.s[0] = static_cast<uint32_t>(NxFrecpx<4>(a.s[0], state)); else r.d[0] = NxFrecpx<8>(a.d[0], state);
++  NxWrite(dst, r); return memory;
++}
++
++DEF_ISEL(SQXTN_ASIMDMISC_N_8B) = NX_QXTN<1, 0, 0>;
++DEF_ISEL(SQXTN_ASIMDMISC_N_16B) = NX_QXTN<1, 1, 0>;
++DEF_ISEL(SQXTN_ASIMDMISC_N_4H) = NX_QXTN<2, 0, 0>;
++DEF_ISEL(SQXTN_ASIMDMISC_N_8H) = NX_QXTN<2, 1, 0>;
++DEF_ISEL(SQXTN_ASIMDMISC_N_2S) = NX_QXTN<4, 0, 0>;
++DEF_ISEL(SQXTN_ASIMDMISC_N_4S) = NX_QXTN<4, 1, 0>;
++DEF_ISEL(UQXTN_ASIMDMISC_N_8B) = NX_QXTN<1, 0, 1>;
++DEF_ISEL(UQXTN_ASIMDMISC_N_16B) = NX_QXTN<1, 1, 1>;
++DEF_ISEL(UQXTN_ASIMDMISC_N_4H) = NX_QXTN<2, 0, 1>;
++DEF_ISEL(UQXTN_ASIMDMISC_N_8H) = NX_QXTN<2, 1, 1>;
++DEF_ISEL(UQXTN_ASIMDMISC_N_2S) = NX_QXTN<4, 0, 1>;
++DEF_ISEL(UQXTN_ASIMDMISC_N_4S) = NX_QXTN<4, 1, 1>;
++DEF_ISEL(SQXTUN_ASIMDMISC_N_8B) = NX_QXTN<1, 0, 2>;
++DEF_ISEL(SQXTUN_ASIMDMISC_N_16B) = NX_QXTN<1, 1, 2>;
++DEF_ISEL(SQXTUN_ASIMDMISC_N_4H) = NX_QXTN<2, 0, 2>;
++DEF_ISEL(SQXTUN_ASIMDMISC_N_8H) = NX_QXTN<2, 1, 2>;
++DEF_ISEL(SQXTUN_ASIMDMISC_N_2S) = NX_QXTN<4, 0, 2>;
++DEF_ISEL(SQXTUN_ASIMDMISC_N_4S) = NX_QXTN<4, 1, 2>;
++DEF_ISEL(SQXTN_ASISDMISC_N_B) = NX_QXTN_S<1, 0>;
++DEF_ISEL(SQXTN_ASISDMISC_N_H) = NX_QXTN_S<2, 0>;
++DEF_ISEL(SQXTN_ASISDMISC_N_S) = NX_QXTN_S<4, 0>;
++DEF_ISEL(UQXTN_ASISDMISC_N_B) = NX_QXTN_S<1, 1>;
++DEF_ISEL(UQXTN_ASISDMISC_N_H) = NX_QXTN_S<2, 1>;
++DEF_ISEL(UQXTN_ASISDMISC_N_S) = NX_QXTN_S<4, 1>;
++DEF_ISEL(SQXTUN_ASISDMISC_N_B) = NX_QXTN_S<1, 2>;
++DEF_ISEL(SQXTUN_ASISDMISC_N_H) = NX_QXTN_S<2, 2>;
++DEF_ISEL(SQXTUN_ASISDMISC_N_S) = NX_QXTN_S<4, 2>;
++DEF_ISEL(FRECPE_ASIMDMISC_R_2S) = NX_FRECPE<4, 0>;
++DEF_ISEL(FRECPE_ASIMDMISC_R_4S) = NX_FRECPE<4, 1>;
++DEF_ISEL(FRECPE_ASIMDMISC_R_2D) = NX_FRECPE<8, 1>;
++DEF_ISEL(FRECPE_ASISDMISC_R_S) = NX_FRECPE<4, 2>;
++DEF_ISEL(FRECPE_ASISDMISC_R_D) = NX_FRECPE<8, 2>;
++DEF_ISEL(FRECPX_ASISDMISC_R_S) = NX_FRECPX<4>;
++DEF_ISEL(FRECPX_ASISDMISC_R_D) = NX_FRECPX<8>;
++
++// Half precision conversions (FCVT, FCVTN, FCVTL with 4H / 8H): the Switch's Cortex-A57 has them although it has no half-precision arithmetic. Written on the bits from the manual's FPConvert, with FPCR's
++// rounding mode, and the flags the manual sets: IOC for a signalling NaN, OFC and IXC for an overflow, UFC and IXC for a tiny inexact result, IXC for any inexact one. FPCR.FZ16 and AHP are not modelled.
++template <int E> ALWAYS_INLINE static uint64_t NxHalfTo(State &state, uint16_t h) {   // exact: every half is a single and a double
++  constexpr int fb = E == 4 ? 23 : 52, eb = E == 4 ? 8 : 11, bias = E == 4 ? 127 : 1023;
++  const uint64_t emax = (1ull << eb) - 1, sign = static_cast<uint64_t>(h >> 15) << (fb + eb);
++  unsigned exp = (h >> 10) & 31, frac = h & 0x3FF;
++  if (exp == 31) {
++    if (!frac) return sign | (emax << fb);
++    if (!(frac >> 9)) state.sr.ioc = 1;
++    return sign | (emax << fb) | (1ull << (fb - 1)) | (static_cast<uint64_t>(frac) << (fb - 10));
++  }
++  if (exp == 0) {
++    if (!frac) return sign;
++    int e = -14;
++    while (!(frac & 0x400)) { frac <<= 1; e--; }
++    return sign | (static_cast<uint64_t>(e + bias) << fb) | (static_cast<uint64_t>(frac & 0x3FF) << (fb - 10));
++  }
++  return sign | (static_cast<uint64_t>(exp - 15 + bias) << fb) | (static_cast<uint64_t>(frac) << (fb - 10));
++}
++template <int E> ALWAYS_INLINE static uint16_t NxToHalf(State &state, uint64_t bits) {
++  constexpr int fb = E == 4 ? 23 : 52, eb = E == 4 ? 8 : 11, bias = E == 4 ? 127 : 1023;
++  const uint64_t emax = (1ull << eb) - 1, fmask = (1ull << fb) - 1;
++  const uint16_t sign = ((bits >> (fb + eb)) & 1) ? 0x8000 : 0;
++  const uint64_t exp = (bits >> fb) & emax, frac = bits & fmask;
++  if (exp == emax) {
++    if (!frac) return sign | 0x7C00;
++    if (!(frac >> (fb - 1))) state.sr.ioc = 1;   // a signalling NaN; the result is quiet with the top bits of the payload
++    return sign | 0x7E00 | static_cast<uint16_t>((frac >> (fb - 10)) & 0x1FF);
++  }
++  if (exp == 0 && frac == 0) return sign;
++  uint64_t m; int e;   // the significand with its hidden bit, and the unbiased exponent
++  if (exp == 0) { e = 1 - bias; m = frac; while (!((m >> fb) & 1)) { m <<= 1; e--; } }
++  else { e = static_cast<int>(exp) - bias; m = frac | (1ull << fb); }
++  const bool tiny = e < -14;
++  int shift = fb - 10 + (tiny ? -14 - e : 0);
++  if (shift > 100) shift = 100;
++  const unsigned __int128 mm = m, one = 1;
++  unsigned __int128 q = mm >> shift;
++  const unsigned __int128 rem = mm & ((one << shift) - 1), half = one << (shift - 1);
++  const bool inexact = rem != 0, neg = sign != 0;
++  const unsigned mode = (state.fpcr.flat >> 22) & 3;   // 0 to nearest even, 1 towards +inf, 2 towards -inf, 3 towards zero
++  const bool up = mode == 0 ? (rem > half || (rem == half && (q & 1))) : mode == 1 ? (!neg && inexact) : mode == 2 ? (neg && inexact) : false;
++  if (up) q++;
++  if (inexact) state.sr.ixc = 1;
++  if (tiny) {
++    if (inexact) state.sr.ufc = 1;
++    return sign | static_cast<uint16_t>(q);   // q = 1024 is the smallest normal number: its bits are already right
++  }
++  if (q == 2048) { q = 1024; e++; }
++  if (e > 15) {
++    state.sr.ofc = 1; state.sr.ixc = 1;
++    const bool to_inf = mode == 0 || (mode == 1 && !neg) || (mode == 2 && neg);
++    return sign | (to_inf ? 0x7C00 : 0x7BFF);
++  }
++  return sign | static_cast<uint16_t>(((e + 15) << 10) | (static_cast<uint32_t>(q) & 0x3FF));
++}
++DEF_SEM(NX_FCVT_SH, V128W dst, V128 src) { NxVec a = NxRead(src), r = {}; r.s[0] = static_cast<uint32_t>(NxHalfTo<4>(state, a.h[0])); NxWrite(dst, r); return memory; }
++DEF_SEM(NX_FCVT_DH, V128W dst, V128 src) { NxVec a = NxRead(src), r = {}; r.d[0] = NxHalfTo<8>(state, a.h[0]); NxWrite(dst, r); return memory; }
++DEF_SEM(NX_FCVT_HS, V128W dst, V128 src) { NxVec a = NxRead(src), r = {}; r.h[0] = NxToHalf<4>(state, a.s[0]); NxWrite(dst, r); return memory; }
++DEF_SEM(NX_FCVT_HD, V128W dst, V128 src) { NxVec a = NxRead(src), r = {}; r.h[0] = NxToHalf<8>(state, a.d[0]); NxWrite(dst, r); return memory; }
++template <int Q> DEF_SEM(NX_FCVTN_H, V128W dst, V128 accv, V128 src) {   // 4S to 4H: Q = 1 fills the upper half and keeps the lower
++  NxVec a = NxRead(src), c = NxRead(accv), r = {};
++  if (Q) r.d[0] = c.d[0];
++  for (int i = 0; i < 4; i++) r.h[Q * 4 + i] = NxToHalf<4>(state, a.s[i]);
++  NxWrite(dst, r); return memory;
++}
++template <int Q> DEF_SEM(NX_FCVTL_H, V128W dst, V128 src) {   // 4H to 4S: Q = 1 reads the upper half
++  NxVec a = NxRead(src), r = {};
++  for (int i = 0; i < 4; i++) r.s[i] = static_cast<uint32_t>(NxHalfTo<4>(state, a.h[Q * 4 + i]));
++  NxWrite(dst, r); return memory;
++}
++DEF_ISEL(FCVT_SH_FLOATDP1) = NX_FCVT_SH;
++DEF_ISEL(FCVT_DH_FLOATDP1) = NX_FCVT_DH;
++DEF_ISEL(FCVT_HS_FLOATDP1) = NX_FCVT_HS;
++DEF_ISEL(FCVT_HD_FLOATDP1) = NX_FCVT_HD;
++DEF_ISEL(FCVTN_ASIMDMISC_N_H1) = NX_FCVTN_H<0>;
++DEF_ISEL(FCVTN_ASIMDMISC_N_H2) = NX_FCVTN_H<1>;
++DEF_ISEL(FCVTL_ASIMDMISC_L_H1) = NX_FCVTL_H<0>;
++DEF_ISEL(FCVTL_ASIMDMISC_L_H2) = NX_FCVTL_H<1>;
+diff --git a/lib/Arch/Arch.cpp b/lib/Arch/Arch.cpp
+index 245864f..b6d4c26 100644
+--- a/lib/Arch/Arch.cpp
++++ b/lib/Arch/Arch.cpp
+@@ -769,6 +769,10 @@ void Arch::InitializeEmptyLiftedFunction(llvm::Function *func) const {
+   auto monitor_value = ir.CreateAlloca(addr, nullptr, "MONITOR_VALUE");
+   ir.CreateStore(llvm::ConstantInt::get(addr, 0), monitor_value);
+ 
++  // The high 64 bits of the value a pair load (LDXP of two X registers) read
++  auto monitor_value_hi = ir.CreateAlloca(addr, nullptr, "MONITOR_VALUE_HI");
++  ir.CreateStore(llvm::ConstantInt::get(addr, 0), monitor_value_hi);
++
+   // NOTE(pag): `PC` and `NEXT_PC` are handled by
+   //            `FinishLiftedFunctionInitialization`.
+ 
