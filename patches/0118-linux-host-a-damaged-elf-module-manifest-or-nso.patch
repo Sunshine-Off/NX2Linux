@@ -1,0 +1,434 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 18:26:16 +0100
+Subject: [PATCH] Linux host: a damaged ELF module, manifest or NSO is a
+ ModuleError, the same one every time (#13)
+
+elf_module.py let struct.error, ValueError, KeyError, AttributeError, TypeError, MemoryError
+and SystemExit out of the reader for a program header table past the file, a dynamic
+section or a relocation or symbol table past the image, a symbol name outside the image,
+a manifest that is not an object or lacks a field, an elf field that names another folder,
+a damaged NSO and a size field in the gigabytes. Each is now a ModuleError that names the
+file, field or address. The image size is capped by MAX_IMAGE (1 GiB). Nothing that loaded
+before is refused except those cases: a name that is not UTF-8 keeps its bytes as \xNN.
+
+test_elf_module_errors.py: one case per failure, a sweep over every truncation of an ELF
+and a sweep over every damaged byte of the headers and tables (2140 cases), all allowing
+only ModuleError and checking that a second attempt gives the same message.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: A damaged module, manifest or NSO stops the loader with one named ModuleError instead of a traceback or a process exit
+Issue: Sunshine-Off/NX2Linux#13
+
+---
+ dm/tools/elf_module.py                   |  26 +-
+ dm/tools/tests/test_elf_module_errors.py | 308 +++++++++++++++++++++++
+ 2 files changed, 330 insertions(+), 4 deletions(-)
+ create mode 100644 dm/tools/tests/test_elf_module_errors.py
+
+diff --git a/dm/tools/elf_module.py b/dm/tools/elf_module.py
+index cc3b014..b8c6c8c 100644
+--- a/dm/tools/elf_module.py
++++ b/dm/tools/elf_module.py
+@@ -25,6 +25,8 @@ DT = {2: 'PLTRELSZ', 5: 'STRTAB', 6: 'SYMTAB', 7: 'RELA', 8: 'RELASZ', 9: 'RELAE
+ R_ABS64, R_GLOB_DAT, R_JUMP_SLOT, R_RELATIVE = 257, 1025, 1026, 1027
+ RNAME = {R_ABS64: 'ABS64', R_GLOB_DAT: 'GLOB_DAT', R_JUMP_SLOT: 'JUMP_SLOT', R_RELATIVE: 'RELATIVE'}
+ STOP = 0xFFFF0000   # the x30 the harness gives a function it calls: never executed
++MAX_IMAGE = 1 << 30   # the largest module image (code, data and bss) the loader maps: a Switch module is a few hundred megabytes at most, so a bigger size field is damage, and is refused before it is allocated
++PHSIZE = 56   # the size of an ELF64 program header
+ 
+ 
+ class ModuleError(Exception):
+@@ -41,6 +43,8 @@ def parse_elf(data):
+     etype, machine = struct.unpack_from('<HH', data, 16)
+     if etype != 3 or machine != 183: raise ModuleError(f'ELF type {etype} machine {machine}: a shared object (3) for AArch64 (183) is needed')
+     phoff, phentsize, phnum = struct.unpack_from('<QxxxxxxxxxxxxxxHH', data, 32)[0], *struct.unpack_from('<HH', data, 54)
++    if phnum and phentsize < PHSIZE: raise ModuleError(f'program header size {phentsize} is smaller than {PHSIZE}')
++    if phoff + phentsize * phnum > len(data): raise ModuleError(f'the program header table ({phnum} entries of {phentsize} bytes at {phoff:#x}) runs past the end of the file ({len(data):#x} bytes)')
+     loads, dyn, eh = [], None, None
+     for i in range(phnum):
+         t, flags, off, va, _, filesz, memsz, _ = struct.unpack_from('<IIQQQQQQ', data, phoff + i * phentsize)
+@@ -50,6 +54,8 @@ def parse_elf(data):
+         elif t == PT_DYNAMIC: dyn = va
+         elif t == PT_GNU_EH_FRAME: eh = va
+     if not loads: raise ModuleError('no PT_LOAD segment')
++    size = max(s['vaddr'] + s['memsz'] for s in loads)
++    if size > MAX_IMAGE: raise ModuleError(f'the module image would be {size:#x} bytes, more than the {MAX_IMAGE:#x} the loader maps: a segment address or size is damaged')
+     return loads, dyn, eh
+ 
+ 
+@@ -63,6 +69,7 @@ def image_of(data, loads):
+ 
+ def read_dynamic(img, dyn):
+     if dyn is None: raise ModuleError('no PT_DYNAMIC')
++    if dyn + 16 > len(img): raise ModuleError(f'the dynamic section at {dyn:#x} is outside the module image ({len(img):#x} bytes)')
+     out, o = {}, dyn
+     while True:
+         tag, val = struct.unpack_from('<qQ', img, o); o += 16
+@@ -76,11 +83,13 @@ def read_symbols(img, dynamic):
+     if 'SYMTAB' not in dynamic or 'STRTAB' not in dynamic: return []
+     sym, st = dynamic['SYMTAB'], dynamic['STRTAB']
+     if st < sym or (st - sym) % 24: raise ModuleError('the symbol table does not end where the string table begins (host/loader.c relies on that too)')
++    if st > len(img): raise ModuleError(f'the symbol table at {sym:#x} runs past the end of the module image ({len(img):#x} bytes)')
+     out = []
+     for i in range((st - sym) // 24):
+         name, info, _, shndx, value, size = struct.unpack_from('<IBBHQQ', img, sym + 24 * i)
+-        end = img.index(b'\0', st + name)
+-        out.append((bytes(img[st + name:end]).decode(), info >> 4, info & 15, shndx != 0, value, size))
++        end = img.find(b'\0', st + name) if st + name < len(img) else -1
++        if end < 0: raise ModuleError(f'symbol {i}: its name (offset {name:#x} in the string table at {st:#x}) is outside the module image')
++        out.append((bytes(img[st + name:end]).decode(errors='backslashreplace'), info >> 4, info & 15, shndx != 0, value, size))   # a name that is not UTF-8 keeps its bytes as \xNN: it still loads, and the same way every time
+     return out
+ 
+ 
+@@ -89,6 +98,7 @@ def read_relocs(img, dynamic):
+     out = []
+     for key, size_key, table in (('RELA', 'RELASZ', 'rela'), ('JMPREL', 'PLTRELSZ', 'plt')):
+         if key not in dynamic: continue
++        if dynamic[key] + dynamic.get(size_key, 0) > len(img): raise ModuleError(f'the {table} relocation table at {dynamic[key]:#x} ({dynamic.get(size_key, 0):#x} bytes) runs past the end of the module image ({len(img):#x} bytes)')
+         n = dynamic.get(size_key, 0) // 24
+         for i in range(n):
+             off, info, add = struct.unpack_from('<QQq', img, dynamic[key] + 24 * i)
+@@ -182,8 +192,11 @@ def convert_nso(nso_path, out_dir, name):
+     import nso
+     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+     elf, man = out / f'{name}.elf', out / f'{name}.manifest.json'
+-    nso2elf.convert(str(nso_path), str(elf))
+-    m = describe(elf.read_bytes(), name, elf.name, nso.cli_read(str(nso_path)).build_id.hex())
++    try:   # the NSO reader and nso2elf are command line helpers that end the process with a [RED] line on a damaged module: here that is an error the caller can catch
++        nso2elf.convert(str(nso_path), str(elf))
++        build_id = nso.cli_read(str(nso_path)).build_id.hex()
++    except SystemExit as e: raise ModuleError(str(e.code).removeprefix('[RED] ')) from None
++    m = describe(elf.read_bytes(), name, elf.name, build_id)
+     man.write_text(json.dumps(m, indent=1, sort_keys=True) + '\n')
+     return elf, man
+ 
+@@ -193,7 +206,12 @@ def load_manifest(path):
+     path = Path(path)
+     try: m = json.loads(path.read_text())
+     except (OSError, ValueError) as e: raise ModuleError(f'{path}: {e}') from None
++    if not isinstance(m, dict): raise ModuleError(f'{path}: not a JSON object')
+     if m.get('format') != FORMAT: raise ModuleError(f'{path}: format {m.get("format")!r}, not {FORMAT!r}')
++    for k in ('name', 'elf', 'sha256', 'build_id'):
++        if k not in m: raise ModuleError(f'{path}: lacks "{k}"')
++        if not isinstance(m[k], str): raise ModuleError(f'{path}: "{k}" is not a string')
++    if m['elf'] != Path(m['elf']).name: raise ModuleError(f'{path}: "elf" {m["elf"]!r} must be a file name in the manifest\'s own folder')
+     elf = path.parent / m['elf']
+     try: data = elf.read_bytes()
+     except OSError as e: raise ModuleError(f'{path}: {e}') from None
+diff --git a/dm/tools/tests/test_elf_module_errors.py b/dm/tools/tests/test_elf_module_errors.py
+new file mode 100644
+index 0000000..b5a0ea2
+--- /dev/null
++++ b/dm/tools/tests/test_elf_module_errors.py
+@@ -0,0 +1,308 @@
++"""Load failures of an ELF module are explicit and the same every time (NX2Linux Phase 2, #13). A damaged ELF, manifest or NSO is a ModuleError that says which file, field or address is wrong. It is never a
++struct.error, ValueError, KeyError, AttributeError, TypeError, MemoryError or SystemExit from deep inside the reader, and a second attempt gives the same message. test_elf_module.py has the loading
++behaviour and the failures it already covers (wrong format, changed ELF, bad relocation type, unaligned relocation, duplicate module); this file has the rest: sizes, program headers, the dynamic section,
++tables that run past the image, manifests of the wrong shape and NSOs that are cut short, plus two sweeps (every truncation, every damaged header or table byte) that allow only ModuleError.
++Fixtures are made here from module_fixture.py in a temporary folder: no game data. The parse-level tests need nothing else, those that read function boundaries need capstone and are skipped without it."""
++import hashlib, json, struct, sys, tempfile, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import elf_module as em
++import module_fixture as mf
++
++try: import capstone  # noqa: F401
++except ImportError: capstone = None
++NEEDS_CAPSTONE = unittest.skipUnless(capstone, 'needs capstone 5 (the function boundaries are read with it)')
++
++PH = 0x40          # the program headers start right after the ELF header, 56 bytes each: text, rodata, data and bss, dynamic, eh_frame_hdr
++PHSIZE = 56
++HDR = 0x1000       # the file offset of image byte 0 (nso2elf.HDR)
++
++
++def walk(data):
++    """Everything the loader reads from an ELF before it looks at a manifest"""
++    loads, dyn, _ = em.parse_elf(data)
++    img = em.image_of(data, loads)
++    dynamic = em.read_dynamic(img, dyn)
++    em.read_symbols(img, dynamic); em.read_relocs(img, dynamic)
++    return img, dynamic
++
++
++def outcome(fn, *args):
++    """(exception class name, message) of fn(*args), or None: what a caller can see and compare between two attempts"""
++    try: fn(*args)
++    except Exception as e: return type(e).__name__, str(e)
++    return None
++
++
++def put(data, off, fmt, *v):
++    b = bytearray(data); struct.pack_into(fmt, b, off, *v); return bytes(b)
++
++
++class Module:
++    """A synthetic module a (an ELF and its manifest) in a temporary folder"""
++    def __init__(self):
++        self.dir = tempfile.TemporaryDirectory()
++        nso, self.info = mf.build(mf.module_a())
++        nso_path = Path(self.dir.name) / 'a.nso'; nso_path.write_bytes(nso); self.nso = nso
++        em.convert_nso(nso_path, self.dir.name, 'a')
++        self.elf = (Path(self.dir.name) / 'a.elf').read_bytes()
++        self.manifest_path = Path(self.dir.name) / 'a.manifest.json'
++        self.manifest = json.loads(self.manifest_path.read_text())
++        self.img, self.dynamic = walk(self.elf)
++        self.dyn_vaddr = em.parse_elf(self.elf)[1]
++
++    def seal(self, data, name='sealed'):
++        """The manifest path of a perfectly consistent manifest for ELF bytes `data`, as convert_nso would have made it (so what is wrong is in the ELF only)"""
++        d = Path(self.dir.name)
++        (d / f'{name}.elf').write_bytes(data)
++        (d / f'{name}.manifest.json').write_text(json.dumps(em.describe(data, name, f'{name}.elf', self.manifest['build_id'])))
++        return d / f'{name}.manifest.json'
++
++    def write_manifest(self, content, name='m'):
++        p = Path(self.dir.name) / f'{name}.manifest.json'
++        p.write_text(content if isinstance(content, str) else json.dumps(content)); return p
++
++    def dyn_entry(self, tag_name, value, data=None):
++        """The ELF (or `data`, an ELF already damaged) with one entry of its dynamic section set to value"""
++        data = self.elf if data is None else data
++        o = HDR + self.dyn_vaddr
++        while True:
++            tag, _ = struct.unpack_from('<qQ', data, o)
++            if tag == 0: raise AssertionError(f'no {tag_name} entry in the fixture')
++            if em.DT.get(tag) == tag_name: return put(data, o + 8, '<Q', value)
++            o += 16
++
++    def cleanup(self): self.dir.cleanup()
++
++
++class Base(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls): cls.mod = Module()
++
++    @classmethod
++    def tearDownClass(cls): cls.mod.cleanup()
++
++    def cases(self, table, run):
++        """table: [(label, damaged input, regex of the ModuleError)]. Each case raises ModuleError with that message, and a second attempt gives the identical outcome"""
++        for label, data, why in table:
++            with self.subTest(label):
++                first = outcome(run, data)
++                self.assertIsNotNone(first, 'no error at all')
++                self.assertEqual(first[0], 'ModuleError', f'{first[0]}: {first[1]}')
++                self.assertRegex(first[1], why)
++                self.assertEqual(outcome(run, data), first, 'the second attempt differs')
++
++
++class ProgramHeaders(Base):
++    def test_a_damaged_header_or_program_header_table_is_an_explicit_error(self):
++        e, n = self.mod.elf, len(self.mod.elf)
++        self.cases([
++            ('program headers start past the file', put(e, 32, '<Q', n + 10), 'program header table'),
++            ('more program headers than the file holds', put(e, 56, '<H', 0xFFF), 'program header table'),
++            ('program header size below 56', put(e, 54, '<H', 8), 'program header size'),
++            ('no program header', put(e, 56, '<H', 0), 'no PT_LOAD'),
++            ('another machine', put(e, 18, '<H', 62), 'machine 62'),
++            ('an executable, not a shared object', put(e, 16, '<H', 2), 'ELF type 2'),
++            ('big endian', put(e, 5, '<B', 2), 'little-endian ELF64'),
++            ('ELF32', put(e, 4, '<B', 1), 'little-endian ELF64'),
++            ('a load segment past the end of the file', put(e, PH + 32, '<Q', n * 2), r'PT_LOAD 0 runs past the file'),
++            ('a load segment starting past the end of the file', put(e, PH + 8, '<Q', n + 1), r'PT_LOAD 0 runs past the file'),
++            ('a load segment with more file bytes than memory', put(e, PH + 40, '<Q', 1), r'PT_LOAD 0 runs past the file or its memory size'),
++        ], walk)
++
++    def test_a_missing_segment_is_an_explicit_error(self):
++        e = self.mod.elf
++        no_load = e
++        for i in range(3): no_load = put(no_load, PH + i * PHSIZE, '<I', 0)   # the three PT_LOAD become PT_NULL
++        self.cases([
++            ('no load segment', no_load, 'no PT_LOAD'),
++            ('no dynamic segment', put(e, PH + 3 * PHSIZE, '<I', 0), 'no PT_DYNAMIC'),
++        ], walk)
++
++    def test_a_module_with_no_executable_segment_is_an_explicit_error(self):
++        self.cases([('text segment without the execute flag', put(self.mod.elf, PH + 4, '<I', 4), 'no executable PT_LOAD')],
++                   lambda data: em.describe(data, 'a', 'a.elf', ''))
++
++    def test_an_image_size_beyond_the_limit_is_refused_by_name_not_by_running_out_of_memory(self):
++        """A damaged size field must not make the loader allocate gigabytes: the limit is em.MAX_IMAGE"""
++        e = self.mod.elf
++        self.cases([
++            ('memory size of the text segment', put(e, PH + 40, '<Q', 1 << 40), 'image'),
++            ('memory size of the data segment', put(e, PH + 2 * PHSIZE + 40, '<Q', 1 << 40), 'image'),
++            ('virtual address of the text segment', put(e, PH + 16, '<Q', 1 << 62), 'image'),
++        ], walk)
++        self.assertEqual(em.MAX_IMAGE, 1 << 30)
++        just_under = put(e, PH + 2 * PHSIZE + 40, '<Q', em.MAX_IMAGE - 0x2000 - 0x1000)
++        self.assertEqual(outcome(em.parse_elf, just_under), None)   # the check is about the allocation, parse alone allows it
++
++
++class DynamicSection(Base):
++    def test_a_dynamic_section_outside_the_image_is_an_explicit_error(self):
++        e, size = self.mod.elf, len(self.mod.img)
++        self.cases([
++            ('dynamic section past the image', put(e, PH + 3 * PHSIZE + 16, '<Q', size + 0x100), 'dynamic section'),
++            ('dynamic section starting in the last 8 bytes', put(e, PH + 3 * PHSIZE + 16, '<Q', size - 8), 'dynamic section'),
++        ], walk)
++
++    def test_tables_that_run_past_the_image_are_explicit_errors(self):
++        m, size = self.mod, len(self.mod.img)
++        self.cases([
++            ('relocation table too long', m.dyn_entry('RELASZ', size * 2), 'relocation table'),
++            ('relocation table past the image', m.dyn_entry('RELA', size * 2), 'relocation table'),
++            ('PLT relocation table too long', m.dyn_entry('PLTRELSZ', size * 2), 'relocation table'),
++            ('symbol table and string table past the image', m.dyn_entry('STRTAB', size * 2 + 24 * 8, m.dyn_entry('SYMTAB', size * 2)), 'symbol table at .* runs past the end'),
++        ], walk)
++
++    def test_a_symbol_table_that_does_not_end_at_the_string_table_is_an_explicit_error(self):
++        m, d = self.mod, self.mod.dynamic
++        self.cases([
++            ('string table in the middle of a symbol', m.dyn_entry('STRTAB', d['SYMTAB'] + 25), 'does not end where the string table begins'),
++            ('string table before the symbol table', m.dyn_entry('STRTAB', d['SYMTAB'] - 24), 'does not end where the string table begins'),
++        ], walk)
++
++    def test_a_symbol_name_outside_the_image_is_an_explicit_error(self):
++        sym = self.mod.dynamic['SYMTAB']
++        self.cases([('name offset of the first symbol', put(self.mod.elf, HDR + sym + 24, '<I', 0x7FFFFFF0), 'symbol 1')], walk)
++
++
++class ManifestShape(Base):
++    def load(self, content): return em.load_manifest(self.mod.write_manifest(content))
++
++    def test_a_manifest_of_the_wrong_shape_is_an_explicit_error(self):
++        good = self.mod.manifest
++        without = lambda k: {a: b for a, b in good.items() if a != k}
++        for label, content, why in (
++                ('a JSON list', '[]', 'not a JSON object'), ('a number', '3', 'not a JSON object'), ('null', 'null', 'not a JSON object'),
++                ('not JSON at all', '{nope', 'Expecting property name'), ('empty file', '', 'Expecting value'),
++                ('no elf field', without('elf'), '"elf"'), ('no sha256 field', without('sha256'), '"sha256"'),
++                ('no name field', without('name'), '"name"'), ('no build_id field', without('build_id'), '"build_id"'),
++                ('elf is a number', dict(good, elf=5), '"elf"'), ('sha256 is a number', dict(good, sha256=5), '"sha256"'),
++                ('name is a number', dict(good, name=5), '"name"'), ('build_id is a list', dict(good, build_id=[1]), '"build_id"'),
++                ('elf names a file outside the folder', dict(good, elf='../a.elf'), 'file name'), ('elf is an absolute path', dict(good, elf='/etc/hostname'), 'file name'),
++                ('elf is the folder itself', dict(good, elf='.'), 'file name'), ('elf is missing', dict(good, elf='missing.elf'), 'No such file')):
++            with self.subTest(label):
++                first = outcome(self.load, content)
++                self.assertIsNotNone(first, 'no error at all')
++                self.assertEqual(first[0], 'ModuleError', f'{first[0]}: {first[1]}')
++                self.assertRegex(first[1], why)
++                self.assertIn('m.manifest.json', first[1]); self.assertEqual(outcome(self.load, content), first)
++
++    def test_a_missing_or_unreadable_manifest_names_the_path(self):
++        d = Path(self.mod.dir.name)
++        for p, why in ((d / 'nope.json', 'No such file'), (d, 'Is a directory')):
++            with self.subTest(str(p.name)):
++                got = outcome(em.load_manifest, p)
++                self.assertEqual(got[0], 'ModuleError'); self.assertIn(why, got[1]); self.assertIn(str(p), got[1])
++
++    def test_a_wrong_hash_in_the_manifest_is_refused_before_anything_is_read(self):
++        m = dict(self.mod.manifest, sha256=hashlib.sha256(b'another file').hexdigest())
++        got = outcome(self.load, m)
++        self.assertEqual(got[0], 'ModuleError'); self.assertIn('SHA-256 differs', got[1])
++        self.assertEqual(outcome(self.load, dict(m, sha256='')), got)            # an empty hash is just a wrong one
++        self.assertEqual(outcome(self.load, dict(m, sha256=m['sha256'].upper())), got)   # the hash is compared as written: no silent tolerance of another spelling
++
++    def test_a_manifest_with_a_field_changed_is_refused_by_field_name(self):
++        good = self.mod.manifest
++        for key, value in (('dynamic', {}), ('segments', []), ('jump_targets', [dict(start=4, origin=0, end=8, br=4)]), ('imports', []), ('relocations', {}), ('eh_frame_hdr', 3)):
++            with self.subTest(key):
++                got = outcome(self.load, dict(good, **{key: value}))
++                self.assertEqual(got[0], 'ModuleError'); self.assertRegex(got[1], f'"{key}" does not match')
++
++    def test_a_manifest_list_that_is_empty_is_an_explicit_error(self):
++        got = outcome(em.ModuleSet, [], {})
++        self.assertEqual(got[0], 'ModuleError'); self.assertIn('no module to load', got[1])
++
++
++class Relocations(Base):
++    """Damage that only shows when the module is mapped: the manifest is consistent with the damaged ELF"""
++    def rela(self, i, off=None, info=None):
++        base = HDR + self.mod.dynamic['RELA'] + 24 * i
++        e = self.mod.elf
++        if off is not None: e = put(e, base, '<Q', off)
++        if info is not None: e = put(e, base + 8, '<Q', info)
++        return e
++
++    def load(self, data): return em.ModuleSet([self.mod.seal(data)], {'hle_add': lambda r: None})
++
++    @NEEDS_CAPSTONE
++    def test_a_relocation_the_module_cannot_hold_is_an_explicit_error(self):
++        size = len(self.mod.img)
++        self.cases([
++            ('relocation outside the module', self.rela(0, off=size + 8), 'outside the module or not 4-byte aligned'),
++            ('relocation in the last 4 bytes', self.rela(0, off=size - 4), 'outside the module or not 4-byte aligned'),
++            ('relocation names a symbol past the table', self.rela(0, info=(9999 << 32) | em.R_GLOB_DAT), 'names symbol 9999, past the table'),
++        ], self.load)
++
++
++class Sweeps(Base):
++    """Damage the module everywhere a reader looks and demand that the only way out is a ModuleError (or a load that works)"""
++    def only_module_errors(self, run, data, label):
++        got = outcome(run, data)
++        if got and got[0] != 'ModuleError': self.fail(f'{label}: {got[0]}: {got[1]}')
++        return got
++
++    def test_a_file_cut_at_any_length_is_never_anything_but_a_module_error(self):
++        e = self.mod.elf
++        for n in range(len(e)):   # every length, parse level
++            self.only_module_errors(walk, e[:n], f'ELF cut at {n} of {len(e)} bytes')
++
++    @NEEDS_CAPSTONE
++    def test_a_file_cut_at_many_lengths_is_never_anything_but_a_module_error_in_the_whole_manifest_step(self):
++        e = self.mod.elf
++        for n in sorted(set(range(0, 0x1100, 13)) | set(range(0x1100, len(e), 211)) | {len(e) - 1}):
++            self.only_module_errors(lambda d: em.describe(d, 'a', 'a.elf', ''), e[:n], f'ELF cut at {n} of {len(e)} bytes')
++
++    def damaged_spots(self):
++        """Offsets of the ELF header, program headers and every table the reader walks"""
++        m = self.mod; d = m.dynamic
++        spots = set(range(0, PH + 5 * PHSIZE))                                                        # ELF header and program headers
++        spots |= set(range(HDR + m.dyn_vaddr, HDR + m.dyn_vaddr + 16 * 14))                         # the dynamic section
++        spots |= set(range(HDR + d['SYMTAB'], HDR + d['STRTAB']))                                    # the symbol table
++        spots |= set(range(HDR + d['RELA'], HDR + d['RELA'] + d['RELASZ']))                         # the relocations
++        spots |= set(range(HDR + d['JMPREL'], HDR + d['JMPREL'] + d['PLTRELSZ']))                   # the PLT relocations
++        spots |= set(range(HDR + d['STRTAB'], HDR + d['STRTAB'] + 8))                               # the start of the string table
++        return sorted(spots)
++
++    @NEEDS_CAPSTONE
++    def test_a_damaged_header_or_table_byte_is_never_anything_but_a_module_error(self):
++        e = self.mod.elf
++        run = lambda d: em.describe(d, 'a', 'a.elf', '')
++        for off in self.damaged_spots():
++            for how, v in (('zeroed', 0), ('set to 0xFF', 0xFF), ('top bit flipped', e[off] ^ 0x80)):
++                data = put(e, off, '<B', v)
++                if data == e: continue
++                label = f'byte {off:#x} {how}'
++                first = self.only_module_errors(run, data, label)
++                self.assertEqual(outcome(run, data), first, f'{label}: the second attempt differs')
++
++
++class Nso(Base):
++    def convert(self, data):
++        p = Path(self.mod.dir.name) / 'bad.nso'; p.write_bytes(data)
++        return em.convert_nso(p, self.mod.dir.name, 'bad')
++
++    def test_a_damaged_nso_is_an_explicit_error_not_a_process_exit(self):
++        nso = self.mod.nso
++        self.cases([
++            ('an empty file', b'', 'not an NSO or NRO'),
++            ('garbage', bytes(range(256)) * 2, 'not an NSO or NRO'),
++            ('a header cut short', nso[:0x60], 'header is cut short'),
++            ('half of the file', nso[:len(nso) // 2], 'past the end of the file'),
++        ], self.convert)
++
++
++class UnwindData(Base):
++    @NEEDS_CAPSTONE
++    def test_unreadable_unwind_data_is_an_explicit_error(self):
++        real = em.nso_code.fde_ranges
++        for exc in (AssertionError, ValueError, IndexError, struct.error):
++            def broken(_, exc=exc): raise exc('damaged')
++            em.nso_code.fde_ranges = broken
++            try: got = outcome(em.describe, self.mod.elf, 'a', 'a.elf', '')
++            finally: em.nso_code.fde_ranges = real
++            self.assertEqual(got[0], 'ModuleError', exc.__name__); self.assertIn('cannot read the function boundaries from the unwind data', got[1])
++
++
++if __name__ == '__main__': unittest.main()
