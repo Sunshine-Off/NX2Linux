@@ -345,6 +345,16 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument('--build', action='store_true', help='build before testing')
     check.add_argument('--require-vulkan', action='store_true', help='fail if the Vulkan test is skipped')
 
+    san = sub.add_parser('sanitize', help='run the AOT runtime and the host libraries under ASan and UBSan, in a build directory of their own (needs clang, Remill for the AOT cases)')
+    san.add_argument('--build-dir', help='the sanitizer build directory (default: ~/.cache/nx2linux/build-host-asan), never the normal one')
+    san.add_argument('-j', '--jobs', type=int, default=0, help='parallel build jobs')
+    san.add_argument('--sanitizers', default='address,undefined', help='the -fsanitize list')
+    san.add_argument('--only', nargs='+', choices=('c', 'aot', 'jit', 'host'), help='run only these groups: c (ctest), aot, jit (needs DYNARMIC_DIR), host (the Python tests of the host libraries)')
+    san.add_argument('--skip-build', action='store_true', help='use the build directory as it is')
+    san.add_argument('--vulkan', choices=('default', 'soft'), default='default', help='soft: run the GPU tests on llvmpipe (Mesa lavapipe) whatever the machine has')
+    san.add_argument('--leaks', action='store_true', help='also detect leaks (noisy: the drivers and Python leak at exit)')
+    san.add_argument('--timeout', type=int, default=1800, help='seconds allowed to each case')
+
     ext = sub.add_parser('extract', help='extract a game package into the XDG cache (needs dotnet and your prod.keys)')
     ext.add_argument('nsp', help='the .nsp of the game')
     ext.add_argument('--keys', required=True, help='prod.keys, or the folder that holds it')
@@ -376,6 +386,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_demo(args)
     if args.command == 'verify':
         return verify(args)
+    if args.command == 'sanitize':
+        import nx2linux_sanitize
+        return nx2linux_sanitize.run(args, ROOT, worker_python())
     if args.command == 'extract':
         return extract(args)
     if args.command == 'survey':

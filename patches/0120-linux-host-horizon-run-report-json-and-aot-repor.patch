@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 20:19:56 +0100
+Subject: [PATCH] Linux host: horizon_run --report-json and aot_report.py, the
+ numbers of a run as a file (#14)
+
+horizon_run.py --report-json FILE writes, when the run ends (and with --build-only, the static part only), the
+survey of the build (survey.classify: lifted, replaced, left to the JIT, by reason and mnemonic) and every counter of
+the runtime (jit_entries, jit_to_aot, fallback_requests, jit_invalidations, unlifted_calls...), with the share of
+native functions and of indirect transfers the AOT table could not take. aot_report.py shows one report and
+compares two. Tested without a game: the arithmetic, the file, the text, the option, and a fixture module whose
+function Remill cannot lift (N calls, N entries into the JIT, and a --build-only run through the real command).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: A run of a recompiled game writes its AOT and JIT figures to a file, so that two runs can be compared
+Issue: Sunshine-Off/NX2Linux#14
+
+---
+ dm/tools/aot_report.py            |  96 +++++++++++++++++++++
+ dm/tools/horizon_run.py           |  24 +++++-
+ dm/tools/tests/test_aot_report.py | 133 ++++++++++++++++++++++++++++++
+ 3 files changed, 250 insertions(+), 3 deletions(-)
+ create mode 100644 dm/tools/aot_report.py
+ create mode 100644 dm/tools/tests/test_aot_report.py
+
+diff --git a/dm/tools/aot_report.py b/dm/tools/aot_report.py
+new file mode 100644
+index 00000000..fa87b7e6
+--- /dev/null
++++ b/dm/tools/aot_report.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++"""The numbers of one run of a recompiled game, as a JSON file (NX2Linux Phase 2, #14 and #17): how much of the code is native (the static count of survey.py) and how much of the running went through the JIT fallback or
++back (the counters of aot_runtime.cpp), so that "the AOT/JIT ratio" and "the transitions" are figures to compare between runs and not impressions. horizon_run.py --report-json writes it when the run ends (and with
++--build-only, with the static part only). Nothing of the game is in it: counts, addresses of functions and mnemonics, the same as survey.py prints.
++  static     functions, lifted, replaced by the host, left to the JIT (with --jit) or not translated, by reason and mnemonic, cache hits and misses
++  runtime    every counter of aot_lift.STATS: indirect_calls, indirect_jumps, fallback_requests, reads, writes, regions, jit_entries (AOT to JIT), jit_to_aot (JIT back to AOT), jit_invalidations (a write into
++             code the JIT had translated), jit_pages, unlifted_calls (a call of a function that was not lifted), svc_calls, import_calls
++  derived    aot_function_share (lifted / (lifted + left to the JIT), the replaced ones leave the count: they are not code of the game), jit_entries_per_second, and the share of the indirect transfers that
++             the AOT table could not take (fallback_requests / (indirect_calls + indirect_jumps))
++Usage: aot_report.py show <report.json>      print it
++       aot_report.py compare <a.json> <b.json>   the counters side by side (two runs: with and without --jit, or before and after a change)"""
++import json, os, sys, tempfile
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++
++VERSION = 1
++RATE = ('jit_entries', 'jit_to_aot', 'jit_invalidations', 'unlifted_calls', 'fallback_requests', 'svc_calls', 'import_calls')
++
++
++def runtime_counters(aot):
++    """{name: value} of every counter the runtime keeps (aot_lift.STATS)"""
++    import aot_lift
++    return {name: int(aot.stat(name)) for name in aot_lift.STATS}
++
++
++def derived(static, runtime, seconds):
++    """The ratios that need both parts. None where a denominator is 0: a ratio of nothing is not 1 and not 0"""
++    lifted, left = static.get('lifted', 0), static.get('jit_fallback', 0) + static.get('not_translated', 0)
++    indirect = runtime.get('indirect_calls', 0) + runtime.get('indirect_jumps', 0)
++    out = {'aot_function_share': lifted / (lifted + left) if lifted + left else None,
++           'fallback_share_of_indirect_transfers': runtime.get('fallback_requests', 0) / indirect if indirect else None}
++    out['per_second'] = {k: runtime.get(k, 0) / seconds for k in RATE} if seconds and seconds > 0 else None
++    return out
++
++
++def build(static, runtime=None, *, seconds=None, frames=None, jit=False, extra=None):
++    """The report: static is survey.classify's dict (plus modules, cache hits and misses), runtime the counters (None for a build with no run)"""
++    rep = {'format': f'nx2linux-aot-report/{VERSION}', 'jit': bool(jit), 'static': static}
++    if runtime is not None:
++        rep['runtime'] = runtime
++        rep['seconds'] = seconds
++        if frames is not None: rep['frames_presented'] = frames
++        rep['derived'] = derived(static, runtime, seconds)
++    if extra: rep['extra'] = extra
++    return rep
++
++
++def write(path, report):
++    """The report to path, whole or not at all (a run killed while writing leaves the previous file)"""
++    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
++    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.', suffix='.part')
++    with os.fdopen(fd, 'w') as f: json.dump(report, f, indent=1, sort_keys=True); f.write('\n')
++    os.replace(tmp, path)
++
++
++def load(path):
++    try: rep = json.loads(Path(path).read_text())
++    except (OSError, ValueError) as e: raise SystemExit(f'[RED] {path}: {e}')
++    if not isinstance(rep, dict) or not str(rep.get('format', '')).startswith('nx2linux-aot-report/'): raise SystemExit(f'[RED] {path}: not an nx2linux AOT report')
++    return rep
++
++
++def text(rep):
++    s = rep['static']; lines = [f"jit {'on' if rep['jit'] else 'off'}: {s.get('functions', '?')} entries, lifted {s.get('lifted', '?')}, replaced {s.get('replaced', '?')}, "
++                                f"left to the JIT {s.get('jit_fallback', 0)}, not translated {s.get('not_translated', 0)}"]
++    for k in ('jit_fallback_by_reason', 'not_translated_by_reason'):
++        if s.get(k): lines.append(f'  {k}: ' + ', '.join(f'{a} {b}' for a, b in s[k].items()))
++    for k, v in (s.get('instruction_details') or {}).items(): lines.append(f'  {k}: ' + ', '.join(f'{m} {n}' for m, n in v.items()))
++    if 'runtime' in rep:
++        lines.append(f"ran {rep.get('seconds') or 0:.0f} s, frames presented {rep.get('frames_presented', '?')}")
++        lines.append('  ' + ', '.join(f'{k} {v}' for k, v in rep['runtime'].items()))
++        d = rep['derived']
++        lines.append('  aot function share ' + ('n/a' if d['aot_function_share'] is None else f"{d['aot_function_share']:.4%}") + ', fallback share of indirect transfers ' +
++                     ('n/a' if d['fallback_share_of_indirect_transfers'] is None else f"{d['fallback_share_of_indirect_transfers']:.4%}"))
++    return '\n'.join(lines)
++
++
++def compare(a, b):
++    lines = [f'{"":<28}{"a":>16}{"b":>16}']
++    def row(name, x, y): lines.append(f'{name:<28}{"-" if x is None else x:>16}{"-" if y is None else y:>16}')
++    for k in ('functions', 'lifted', 'replaced', 'jit_fallback', 'not_translated'): row(k, a['static'].get(k), b['static'].get(k))
++    for k in sorted(set(a.get('runtime', {})) | set(b.get('runtime', {}))): row(k, a.get('runtime', {}).get(k), b.get('runtime', {}).get(k))
++    row('seconds', None if a.get('seconds') is None else round(a['seconds']), None if b.get('seconds') is None else round(b['seconds']))
++    return '\n'.join(lines)
++
++
++def main(argv=None):
++    argv = sys.argv[1:] if argv is None else argv
++    if len(argv) == 2 and argv[0] == 'show': print(text(load(argv[1]))); return 0
++    if len(argv) == 3 and argv[0] == 'compare': print(compare(load(argv[1]), load(argv[2]))); return 0
++    sys.exit(__doc__)
++
++
++if __name__ == '__main__': sys.exit(main())
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index dc2767b9..9aab1cec 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env python3
+ """Run a recompiled game on the Linux host (NX2Linux S7bis): load its modules, replace the SDK functions the host provides, start nn::init::Start's sequence and let the game run for a while.
+-Usage: horizon_run.py [--jit] --modules <dir with <name>.manifest.json> --romfs <RomFS.img> --title <id> [--display|--hidden] [--seconds N] [--order a,b,c] [--cache DIR]
++Usage: horizon_run.py [--jit] [--report-json FILE] --modules <dir with <name>.manifest.json> --romfs <RomFS.img> --title <id> [--display|--hidden] [--seconds N] [--order a,b,c] [--cache DIR]
+ The game's constants and workarounds come from its profile folder (dm/games/<id>/, see horizon_game.py); a title with none runs on generic defaults and the run says so.
+ Needs REMILL_BUILD (the lifter) for functions not in the cache, and DYNARMIC_DIR with --jit (both: tools/setup_toolchain.sh writes an env.sh). The window needs linux/host built (libnx2linux_display.so, see horizon_display.py)."""
+ import argparse, os, sys, time
+@@ -21,6 +21,7 @@ def main():
+     p.add_argument('--seconds', type=float, default=60, help='stop after this long (the game runs on its own threads)')
+     p.add_argument('--jit', action='store_true', help='build the dynarmic fallback (needs DYNARMIC_DIR: tools/setup_toolchain.sh): a function that cannot be lifted runs in the JIT instead of stopping its thread. Turns the inline memory accesses off')
+     p.add_argument('--build-only', action='store_true', help='recompile into the cache (the same functions and cache keys as a run), then stop before the game starts: what `nx2linux build` does')
++    p.add_argument('--report-json', metavar='FILE', help='write the numbers of the run here when it ends (with --build-only: the static part only): how many functions are native, how many went to the JIT, and the runtime counters (aot_report.py)')
+     p.add_argument('--no-profile', action='store_true', help='do not apply the per-title workarounds'); p.add_argument('--verbose', action='store_true')
+     a = p.parse_args()
+     import horizon_game
+@@ -37,12 +38,26 @@ def main():
+     except em.ModuleError as e: sys.exit(f'[RED] {e}')
+     hz = horizon_hle.Horizon(ms, verbose=a.verbose, romfs=a.romfs, title_id=a.title, game=game)
+     ovr = horizon_overrides.install(hz)
+-    if not a.no_profile: ovr.update(horizon_overrides.install_profile(hz, game.workarounds()))
++    origin = {s: horizon_overrides.ORIGIN.get(s, 'handwritten') for s in ovr}   # for the report: who replaced each function
++    if not a.no_profile:
++        work = horizon_overrides.install_profile(hz, game.workarounds())
++        ovr.update(work); origin.update({s: 'game profile' for s in work})
+     t = time.time()
+     hz.aot = ms.build(jit=a.jit, overrides=ovr, cache=a.cache)
+     print(f'built in {time.time() - t:.0f} s ({hz.aot.cache_hits} cached, {hz.aot.cache_misses} built, {len(hz.aot.unlifted)} not translated)', flush=True)
++    built_in = time.time() - t
++    def write_report(runtime=None, seconds=None):
++        if not a.report_json: return
++        import aot_report, survey
++        total = sum(len(m.functions) + len(m.jump_targets) for m in ms.modules)
++        by_addr = {ms.exports[s]: (s, o) for s, o in origin.items() if s in ms.exports}
++        static = survey.classify(hz.aot.unlifted, total, by_addr, a.jit)
++        static.update(game=game.name, known_profile=game.known, modules={m.name: len(m.functions) for m in ms.modules}, build_seconds=built_in, cache_hits=hz.aot.cache_hits, cache_misses=hz.aot.cache_misses)
++        aot_report.write(a.report_json, aot_report.build(static, runtime, seconds=seconds, frames=getattr(hz, 'frames_presented', 0) if runtime is not None else None, jit=a.jit,
++                                                          extra={'title': a.title, 'thread_faults': len(getattr(hz, 'thread_faults', []))} if runtime is not None else None))
++        print(f'[report] {a.report_json}', flush=True)
+     if a.build_only:
+-        hz.aot.close(); print('[build] recompiled: the cache is ready', flush=True); return
++        write_report(); hz.aot.close(); print('[build] recompiled: the cache is ready', flush=True); return
+     hz.attach()
+     if a.display:
+         import horizon_display
+@@ -64,10 +79,13 @@ def main():
+         if hasattr(hz, 'audio'): print(hz.audio.report())
+         print(hz.fs.report()); import horizon_movie; print(horizon_movie.report(hz))
+         print('stubbed overrides called:', sorted(hz.stub_calls)); print('where the guest threads are:\n' + hz.thread_report()); print(hz.ring_report(1)); print('threads that stopped:', hz.thread_faults, flush=True)
++        import aot_report
++        write_report(aot_report.runtime_counters(hz.aot), time.time() - started)
+     def stop():
+         print(f'[run] {a.seconds:.0f} s elapsed: stopping', flush=True); report()
+         if hasattr(hz, 'audio') and hz.audio.mixer: hz.audio.mixer.close()   # a WAV file gets its final header
+         os._exit(0)
++    started = time.time()
+     threading.Timer(a.seconds, stop).start()
+     r = hz.boot()
+     print('result', {k: (hex(v) if isinstance(v, int) else v) for k, v in r.items() if k in ('fault', 'x0', 'step')})
+diff --git a/dm/tools/tests/test_aot_report.py b/dm/tools/tests/test_aot_report.py
+new file mode 100644
+index 00000000..73949137
+--- /dev/null
++++ b/dm/tools/tests/test_aot_report.py
+@@ -0,0 +1,133 @@
++"""aot_report.py and horizon_run.py --report-json (NX2Linux Phase 2, #14): the numbers of a run of a recompiled game as a JSON file. The arithmetic, the file and the text need nothing. The run of a fixture module
++through the JIT (a function Remill cannot lift, called N times: N entries into the JIT) needs REMILL_BUILD, DYNARMIC_DIR, clang++, unicorn and capstone, and is skipped otherwise. No game data."""
++import json, os, subprocess, sys, tempfile, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++TOOLS = HERE.parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(TOOLS))
++import aot_report as ar
++
++try:
++    import capstone  # noqa: F401
++    from test_aot_t3 import READY
++except ImportError: capstone, READY = None, False
++JIT_READY = bool(READY and capstone and os.path.exists(os.path.join(os.environ.get('DYNARMIC_DIR', '/nonexistent'), 'build/src/dynarmic/libdynarmic.a')))
++
++STATIC = {'functions': 110, 'lifted': 95, 'replaced': 10, 'jit_fallback': 5, 'not_translated': 0, 'jit_fallback_by_reason': {'instruction without semantics': 5}, 'instruction_details': {'instruction without semantics': {'cls': 5}}}
++RUNTIME = {'indirect_calls': 600, 'indirect_jumps': 400, 'fallback_requests': 50, 'reads': 1, 'writes': 2, 'regions': 3, 'jit_entries': 40, 'jit_to_aot': 30, 'jit_invalidations': 2, 'jit_pages': 4,
++           'unlifted_calls': 40, 'svc_calls': 7, 'import_calls': 9}
++
++
++class Arithmetic(unittest.TestCase):
++    def test_the_share_leaves_the_replaced_functions_out(self):
++        d = ar.derived(STATIC, RUNTIME, 10)
++        self.assertAlmostEqual(d['aot_function_share'], 95 / 100)   # 10 replaced functions are the host's, not game code left behind
++        self.assertAlmostEqual(d['fallback_share_of_indirect_transfers'], 0.05)
++        self.assertEqual(d['per_second']['jit_entries'], 4.0)
++
++    def test_a_ratio_of_nothing_is_none_not_zero_or_one(self):
++        d = ar.derived({'lifted': 0, 'jit_fallback': 0, 'not_translated': 0}, {'indirect_calls': 0, 'indirect_jumps': 0, 'fallback_requests': 0}, 0)
++        self.assertEqual((d['aot_function_share'], d['fallback_share_of_indirect_transfers'], d['per_second']), (None, None, None))
++
++    def test_a_build_without_a_run_has_the_static_part_only(self):
++        rep = ar.build(STATIC, None, jit=True)
++        self.assertEqual(set(rep), {'format', 'jit', 'static'}); self.assertTrue(rep['jit'])
++
++    def test_a_run_adds_the_counters_the_ratios_and_the_frames(self):
++        rep = ar.build(STATIC, RUNTIME, seconds=10, frames=300, jit=True, extra={'title': 'x'})
++        self.assertEqual((rep['runtime'], rep['frames_presented'], rep['seconds'], rep['extra']), (RUNTIME, 300, 10, {'title': 'x'}))
++        self.assertIn('derived', rep)
++
++    def test_the_counters_are_the_ones_of_the_runtime(self):
++        import aot_lift
++        self.assertEqual(set(RUNTIME), set(aot_lift.STATS))   # a counter added to the runtime has to be in this fixture and in the report
++
++
++class Files(unittest.TestCase):
++    def test_write_then_load_gives_the_same_report_and_leaves_no_partial_file(self):
++        with tempfile.TemporaryDirectory() as d:
++            rep = ar.build(STATIC, RUNTIME, seconds=3.5, frames=10, jit=False)
++            ar.write(Path(d) / 'sub' / 'r.json', rep)
++            self.assertEqual(ar.load(Path(d) / 'sub' / 'r.json'), json.loads(json.dumps(rep)))
++            self.assertEqual([p.name for p in (Path(d) / 'sub').iterdir()], ['r.json'])
++
++    def test_a_file_that_is_not_a_report_is_an_explicit_exit(self):
++        with tempfile.TemporaryDirectory() as d:
++            for name, text, why in (('a.json', '{nope', 'Expecting'), ('b.json', '[]', 'not an nx2linux AOT report'), ('c.json', '{"format": "other"}', 'not an nx2linux AOT report')):
++                (Path(d) / name).write_text(text)
++                with self.subTest(name), self.assertRaises(SystemExit) as cm: ar.load(Path(d) / name)
++                self.assertIn(why, str(cm.exception))
++            with self.assertRaises(SystemExit) as cm: ar.load(Path(d) / 'missing.json')
++            self.assertIn('[RED]', str(cm.exception))
++
++    def test_show_and_compare_print_the_figures_of_both_runs(self):
++        a, b = ar.build(STATIC, RUNTIME, seconds=10, frames=5, jit=True), ar.build(dict(STATIC, jit_fallback=0, not_translated=5), dict(RUNTIME, jit_entries=0), seconds=12, jit=False)
++        t = ar.text(a)
++        for part in ('jit on', 'left to the JIT 5', 'cls 5', 'jit_entries 40', '95.0000%', '5.0000%'): self.assertIn(part, t)
++        c = ar.compare(a, b)
++        self.assertRegex(c, r'jit_entries\s+40\s+0'); self.assertRegex(c, r'jit_fallback\s+5\s+0'); self.assertRegex(c, r'seconds\s+10\s+12')
++
++    def test_the_command_line_shows_and_compares(self):
++        with tempfile.TemporaryDirectory() as d:
++            ar.write(Path(d) / 'a.json', ar.build(STATIC, RUNTIME, seconds=1, jit=True)); ar.write(Path(d) / 'b.json', ar.build(STATIC, None))
++            for args, want in ((['show', str(Path(d) / 'a.json')], 'jit on'), (['compare', str(Path(d) / 'a.json'), str(Path(d) / 'b.json')], 'jit_entries')):
++                r = subprocess.run([sys.executable, '-I', str(TOOLS / 'aot_report.py'), *args], capture_output=True, text=True)
++                self.assertEqual(r.returncode, 0, r.stderr); self.assertIn(want, r.stdout)
++            self.assertNotEqual(subprocess.run([sys.executable, '-I', str(TOOLS / 'aot_report.py')], capture_output=True, text=True).returncode, 0)
++
++
++class RunnerOption(unittest.TestCase):
++    def test_the_option_is_named_and_written_at_the_end_of_a_run_and_of_a_build(self):
++        r = subprocess.run([sys.executable, '-I', str(TOOLS / 'horizon_run.py'), '--help'], capture_output=True, text=True, timeout=120)
++        self.assertIn('--report-json', r.stdout)
++        src = (TOOLS / 'horizon_run.py').read_text()
++        self.assertLess(src.index('if a.build_only:\n        write_report()'), src.index('hz.attach()'))   # a build writes the static part before the game starts
++        self.assertIn('write_report(aot_report.runtime_counters(hz.aot)', src)
++
++
++@unittest.skipUnless(JIT_READY, 'needs REMILL_BUILD, DYNARMIC_DIR, clang++, unicorn and capstone')
++class FixtureRun(unittest.TestCase):
++    """module_c: c_main starts with an instruction Remill cannot lift, so it runs in the JIT, and calls a host function"""
++    @classmethod
++    def setUpClass(cls):
++        import elf_module as em, module_fixture as mf
++        cls.tmp = tempfile.TemporaryDirectory()
++        nso, _ = mf.build(mf.module_c()); (Path(cls.tmp.name) / 'c.nso').write_bytes(nso)
++        em.convert_nso(Path(cls.tmp.name) / 'c.nso', cls.tmp.name, 'c')
++
++    @classmethod
++    def tearDownClass(cls): cls.tmp.cleanup()
++
++    def test_n_calls_of_a_jit_function_are_n_entries_in_the_report(self):
++        import elf_module as em, survey
++        ms = em.ModuleSet([str(Path(self.tmp.name) / 'c.manifest.json')], {'hle_add': lambda r: r.__setitem__(0, (r[0] + r[1]) & ar_mask())})
++        aot = ms.build(jit=True)
++        try:
++            self.assertEqual(aot.stat('jit_entries'), 0)
++            for i in range(7):
++                self.assertNotIn('fault', ms.call('c_main', {'x0': i, 'x1': 2}))
++            runtime = ar.runtime_counters(aot)
++            total = sum(len(m.functions) + len(m.jump_targets) for m in ms.modules)
++            static = survey.classify(aot.unlifted, total, {}, True)
++            rep = ar.build(static, runtime, seconds=1.0, jit=True)
++            self.assertEqual(rep['static']['jit_fallback'], 1); self.assertEqual(rep['static']['not_translated'], 0)
++            self.assertEqual(rep['runtime']['jit_entries'], 7); self.assertGreaterEqual(rep['runtime']['import_calls'], 7)
++            self.assertAlmostEqual(rep['derived']['aot_function_share'], rep['static']['lifted'] / (rep['static']['lifted'] + 1))
++            self.assertEqual(rep['derived']['per_second']['jit_entries'], 7.0)
++        finally: aot.close()
++
++    def test_a_build_with_the_runner_writes_the_static_part(self):
++        out = Path(self.tmp.name) / 'build.json'
++        cache = Path(self.tmp.name) / 'cache'
++        r = subprocess.run([sys.executable, '-I', str(TOOLS / 'horizon_run.py'), '--modules', self.tmp.name, '--order', 'c', '--title', '0000000000000000', '--jit', '--build-only',
++                            '--cache', str(cache), '--report-json', str(out)], capture_output=True, text=True, timeout=600)
++        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
++        rep = ar.load(out)
++        self.assertEqual((rep['jit'], rep['static']['jit_fallback'], rep['static']['functions']), (True, 1, 2)); self.assertNotIn('runtime', rep)
++
++
++def ar_mask(): return (1 << 64) - 1
++
++
++if __name__ == '__main__': unittest.main()

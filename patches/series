@@ -97,6 +97,10 @@
 0116-linux-host-horizon-run-build-only-recompiles-int.patch
 0117-linux-host-an-empty-module-folder-is-a-red-line.patch
 0118-linux-host-a-damaged-elf-module-manifest-or-nso.patch
+0119-linux-host-aot-sanitize-builds-the-aot-runtime-w.patch
+0120-linux-host-horizon-run-report-json-and-aot-repor.patch
+0121-linux-host-horizon-records-the-calls-that-make-m.patch
+0122-linux-host-validate-game-py-runs-every-module-va.patch
 0124-linux-host-aot-cost-py-measures-what-a-recompile.patch
 0125-linux-host-aot-lift-lifts-the-functions-a-build.patch
 0126-linux-host-aot-cost-cache-stats-names-the-caches.patch

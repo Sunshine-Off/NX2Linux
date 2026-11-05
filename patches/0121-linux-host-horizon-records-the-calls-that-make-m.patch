@@ -1,0 +1,337 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 20:31:47 +0100
+Subject: [PATCH] Linux host: Horizon records the calls that make memory
+ executable, the report says where the JIT was entered, and the tests for
+ generated code across threads (#17)
+
+horizon_hle: SetMemoryPermission (with the X bit), SetProcessMemoryPermission, ControlCodeMemory, CreateCodeMemory,
+MapProcessCodeMemory and UnmapProcessCodeMemory are named, counted and recorded (the first 200, addresses and numbers
+only), the first of each kind is logged as [dyncode], and code_summary() feeds the run report. The code-memory calls
+were unhandled before and still answer R_NOT_IMPLEMENTED. aot_report.jit_targets() splits the JIT entries
+(Aot.jit_log) into those inside a module image and those outside every module, which is what generated code looks
+like. horizon_run.py prints the counts at the end of a run and puts both in --report-json.
+
+test_aot_dynamic_code.py: a thread that ran generated code sees a rewrite made by another thread (a store of guest
+code, or the harness), and the dc cvau / ic ivau / isb sequence runs. With the cross-thread invalidation of
+aot_jit.cpp turned off on purpose, the first test fails (stale code), so it does test it.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: A run reports whether the game makes memory executable and where the JIT was entered, and generated code is tested across threads
+Issue: Sunshine-Off/NX2Linux#17
+
+---
+ dm/tools/aot_report.py                  |  23 ++++
+ dm/tools/horizon_hle.py                 |  23 ++++
+ dm/tools/horizon_run.py                 |   8 +-
+ dm/tools/tests/test_aot_dynamic_code.py | 169 ++++++++++++++++++++++++
+ 4 files changed, 222 insertions(+), 1 deletion(-)
+ create mode 100644 dm/tools/tests/test_aot_dynamic_code.py
+
+diff --git a/dm/tools/aot_report.py b/dm/tools/aot_report.py
+index fa87b7e6..8a33add1 100644
+--- a/dm/tools/aot_report.py
++++ b/dm/tools/aot_report.py
+@@ -35,6 +35,22 @@ def derived(static, runtime, seconds):
+     return out
+ 
+ 
++def jit_targets(log, ranges, top=20):
++    """Where the JIT was entered, from Aot.jit_log() ("#seq pc=0x... kind count=N" per target and kind) and the (start, end) of every module image: targets inside a module are functions Remill did not lift (or an
++    address the AOT table did not hold), targets outside every module are code that was generated at run time. Addresses and counts only"""
++    inside, outside = {}, {}
++    for line in log.splitlines():
++        parts = line.split()
++        try:
++            pc = int(parts[1].split('=')[1], 16); kind = parts[2]; count = int(parts[3].split('=')[1])
++        except (IndexError, ValueError): continue
++        where = inside if any(a <= pc < b for a, b in ranges) else outside
++        where[pc, kind] = where.get((pc, kind), 0) + count
++    def rows(d): return [dict(pc=hex(pc), kind=kind, count=n) for (pc, kind), n in sorted(d.items(), key=lambda kv: -kv[1])[:top]]
++    return dict(targets_in_modules=len(inside), entries_in_modules=sum(inside.values()), targets_outside_modules=len(outside), entries_outside_modules=sum(outside.values()),
++                top_in_modules=rows(inside), top_outside_modules=rows(outside))
++
++
+ def build(static, runtime=None, *, seconds=None, frames=None, jit=False, extra=None):
+     """The report: static is survey.classify's dict (plus modules, cache hits and misses), runtime the counters (None for a build with no run)"""
+     rep = {'format': f'nx2linux-aot-report/{VERSION}', 'jit': bool(jit), 'static': static}
+@@ -74,6 +90,13 @@ def text(rep):
+         d = rep['derived']
+         lines.append('  aot function share ' + ('n/a' if d['aot_function_share'] is None else f"{d['aot_function_share']:.4%}") + ', fallback share of indirect transfers ' +
+                      ('n/a' if d['fallback_share_of_indirect_transfers'] is None else f"{d['fallback_share_of_indirect_transfers']:.4%}"))
++    ex = rep.get('extra') or {}
++    if 'dynamic_code' in ex:
++        d = ex['dynamic_code']
++        lines.append(f"  calls that make memory executable: {d['executable_requests']} " + ('(' + ', '.join(f'{k} {v}' for k, v in d['counts'].items()) + ')' if d['counts'] else '(none)'))
++    if 'jit_targets' in ex:
++        j = ex['jit_targets']
++        lines.append(f"  JIT entered at {j['targets_in_modules']} places inside the modules ({j['entries_in_modules']} entries) and {j['targets_outside_modules']} outside them ({j['entries_outside_modules']} entries: generated code)")
+     return '\n'.join(lines)
+ 
+ 
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index 4a0ab9b2..aa170881 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -20,10 +20,17 @@ SVC_NAMES = {
+     0x09: 'StartThread', 0x0a: 'ExitThread', 0x0b: 'SleepThread', 0x0c: 'GetThreadPriority', 0x0d: 'SetThreadPriority', 0x0e: 'GetThreadCoreMask', 0x0f: 'SetThreadCoreMask',
+     0x10: 'GetCurrentProcessorNumber', 0x11: 'SignalEvent', 0x12: 'ClearEvent', 0x13: 'MapSharedMemory', 0x14: 'UnmapSharedMemory', 0x15: 'CreateTransferMemory', 0x16: 'CloseHandle',
+     0x17: 'ResetSignal', 0x18: 'WaitSynchronization', 0x19: 'CancelSynchronization', 0x1a: 'ArbitrateLock', 0x1b: 'ArbitrateUnlock', 0x1c: 'WaitProcessWideKeyAtomic',
++    0x4b: 'CreateCodeMemory', 0x4c: 'ControlCodeMemory', 0x73: 'SetProcessMemoryPermission', 0x77: 'MapProcessCodeMemory', 0x78: 'UnmapProcessCodeMemory',
+     0x1d: 'SignalProcessWideKey', 0x1e: 'GetSystemTick', 0x1f: 'ConnectToNamedPort', 0x21: 'SendSyncRequest', 0x22: 'SendSyncRequestWithUserBuffer', 0x24: 'GetProcessId',
+     0x25: 'GetThreadId', 0x26: 'Break', 0x27: 'OutputDebugString', 0x29: 'GetInfo', 0x34: 'WaitForAddress', 0x45: 'CreateEvent', 0x35: 'SignalToAddress', 0x36: 'SynchronizePreemptionState',
+ }
+ 
++# The calls through which a program makes memory it wrote executable: how generated code (a JIT, a decompressed or patched function) reaches the machine. Counted and recorded by Horizon.svc, so that "does the
++# game generate code" is read from a run (issue #17). name -> the argument that is a permission and the operation that sets it (None: every call counts: it creates or maps code memory)
++CODE_SVCS = {'SetMemoryPermission': 2, 'SetProcessMemoryPermission': 3, 'ControlCodeMemory': 4, 'CreateCodeMemory': None, 'MapProcessCodeMemory': None, 'UnmapProcessCodeMemory': None}
++PERM_X = 4
++
++
+ # MemoryType values QueryMemory reports (the ones a game checks)
+ MT_UNMAPPED, MT_CODE, MT_CODE_DATA, MT_NORMAL, MT_STACK, MT_HEAP = 0, 3, 4, 5, 11, 5
+ PERM_NONE, PERM_R, PERM_RW, PERM_RX = 0, 1, 3, 5
+@@ -122,6 +129,7 @@ class Horizon:
+         self.services = {}      # sm: name -> factory(hz) -> Service
+         self.named_ports = {}   # ConnectToNamedPort names -> factory
+         self.stats, self.unhandled, self.start = {}, {}, time.monotonic()
++        self.code_requests, self.code_counts = [], {}   # calls that make memory executable or create code memory (CODE_SVCS): the first 200, and a count by name
+         self.stop_reason = None
+         self.verbose_nvn = bool(os.environ.get('NX2LINUX_NVN_LOG'))
+         self.display_factory = None   # () -> horizon_display.Display, called when the game first presents a frame
+@@ -236,10 +244,25 @@ class Horizon:
+             if name == stop_after: return dict(r, step=name)
+         return dict(r, step='nnMain')
+ 
++    def note_code_request(self, name, r, orig):
++        """Record a call that may make memory executable. executable: the permission it asks for has the X bit (SetMemoryPermission, SetProcessMemoryPermission, ControlCodeMemory), or it creates or maps code memory.
++        Only addresses, sizes, permissions and the address of the calling instruction are kept"""
++        arg = CODE_SVCS[name]
++        executable = True if arg is None else bool(r[arg] & PERM_X)
++        key = name + (' (X)' if executable and arg is not None else '')
++        self.code_counts[key] = self.code_counts.get(key, 0) + 1
++        if len(self.code_requests) < 200: self.code_requests.append(dict(svc=name, site=orig, args=[r[i] for i in range(5)], executable=executable))
++        if self.code_counts[key] == 1: self.log(f'[dyncode] {name}({", ".join(hex(r[i]) for i in range(5))}) at {orig:#x}' + (': asks for executable memory' if executable else ''))
++
++    def code_summary(self):
++        """{svc name: count} (X marks the calls asking for executable permission), the number of calls that made memory executable, and the first few calls"""
++        return dict(counts=dict(self.code_counts), executable_requests=sum(1 for q in self.code_requests if q['executable']), first=[dict(q, args=[hex(a) for a in q['args']], site=hex(q['site'])) for q in self.code_requests[:10]])
++
+     # ---- the SVC entry ----
+     def svc(self, num, r, orig):
+         name = SVC_NAMES.get(num, f'svc{num:#x}')
+         self.stats[name] = self.stats.get(name, 0) + 1
++        if name in CODE_SVCS: self.note_code_request(name, r, orig)
+         f = getattr(self, f'svc_{name}', None)
+         if f is None:
+             self.unhandled[name] = self.unhandled.get(name, 0) + 1
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 9aab1cec..16f86fd6 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -46,6 +46,11 @@ def main():
+     hz.aot = ms.build(jit=a.jit, overrides=ovr, cache=a.cache)
+     print(f'built in {time.time() - t:.0f} s ({hz.aot.cache_hits} cached, {hz.aot.cache_misses} built, {len(hz.aot.unlifted)} not translated)', flush=True)
+     built_in = time.time() - t
++    def run_extra():
++        import aot_report
++        extra = {'title': a.title, 'thread_faults': len(getattr(hz, 'thread_faults', [])), 'dynamic_code': hz.code_summary()}   # does the game make memory executable, and where the JIT was entered (issue #17)
++        if a.jit: extra['jit_targets'] = aot_report.jit_targets(hz.aot.jit_log(), [(m.base, m.base + m.size) for m in ms.modules])
++        return extra
+     def write_report(runtime=None, seconds=None):
+         if not a.report_json: return
+         import aot_report, survey
+@@ -54,7 +59,7 @@ def main():
+         static = survey.classify(hz.aot.unlifted, total, by_addr, a.jit)
+         static.update(game=game.name, known_profile=game.known, modules={m.name: len(m.functions) for m in ms.modules}, build_seconds=built_in, cache_hits=hz.aot.cache_hits, cache_misses=hz.aot.cache_misses)
+         aot_report.write(a.report_json, aot_report.build(static, runtime, seconds=seconds, frames=getattr(hz, 'frames_presented', 0) if runtime is not None else None, jit=a.jit,
+-                                                          extra={'title': a.title, 'thread_faults': len(getattr(hz, 'thread_faults', []))} if runtime is not None else None))
++                                                          extra=run_extra() if runtime is not None else None))
+         print(f'[report] {a.report_json}', flush=True)
+     if a.build_only:
+         write_report(); hz.aot.close(); print('[build] recompiled: the cache is ready', flush=True); return
+@@ -79,6 +84,7 @@ def main():
+         if hasattr(hz, 'audio'): print(hz.audio.report())
+         print(hz.fs.report()); import horizon_movie; print(horizon_movie.report(hz))
+         print('stubbed overrides called:', sorted(hz.stub_calls)); print('where the guest threads are:\n' + hz.thread_report()); print(hz.ring_report(1)); print('threads that stopped:', hz.thread_faults, flush=True)
++        print('calls that make memory executable (SetMemoryPermission with X, code memory):', hz.code_summary()['counts'] or 'none', flush=True)
+         import aot_report
+         write_report(aot_report.runtime_counters(hz.aot), time.time() - started)
+     def stop():
+diff --git a/dm/tools/tests/test_aot_dynamic_code.py b/dm/tools/tests/test_aot_dynamic_code.py
+new file mode 100644
+index 00000000..47538d71
+--- /dev/null
++++ b/dm/tools/tests/test_aot_dynamic_code.py
+@@ -0,0 +1,169 @@
++"""Generated and self-modifying code (NX2Linux Phase 2, #17): what the JIT fallback and the Horizon layer do when a program writes code and runs it, tested on fixtures (no game data).
++  · across threads: a thread that has run generated code sees the new code after ANOTHER thread rewrote it, by a store of guest code or by the harness (hypotheses.md H15 was fixed in T5 and nothing
++    tested it across threads: `blocages-connus.md` item 5 still lists it as open)
++  · the cache maintenance sequence a JIT emits after writing code (dc cvau, dsb, ic ivau, dsb, isb) runs
++  · horizon_hle records the calls that make memory executable (SetMemoryPermission with X, code memory), and aot_report classifies where the JIT was entered: inside the modules, or outside them (generated code)
++The first group needs REMILL_BUILD, DYNARMIC_DIR, clang++ and unicorn, and is skipped otherwise. The others need nothing."""
++import io, struct, sys, threading, types, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_report as ar
++import horizon_hle as hh
++
++
++class CodeRequests(unittest.TestCase):
++    def make(self):
++        ms = types.SimpleNamespace(aot=types.SimpleNamespace(regions=[(0, 0x4000, b'')], lib=None), modules=[], TLS=0x1000, STOP=0xFFFF0000)
++        return hh.Horizon(ms, out=io.StringIO())
++
++    def call(self, hz, num, *args):
++        r = [0] * 31
++        for i, a in enumerate(args): r[i] = a
++        hz.svc(num, r, 0x4000 + num)
++        return r
++
++    def test_a_permission_with_the_x_bit_is_a_request_for_executable_memory_and_one_without_is_not(self):
++        hz = self.make()
++        self.call(hz, 0x02, 0x10000, 0x1000, 3)   # SetMemoryPermission, read and write
++        self.call(hz, 0x02, 0x20000, 0x1000, 5)   # read and execute
++        s = hz.code_summary()
++        self.assertEqual(s['counts'], {'SetMemoryPermission': 1, 'SetMemoryPermission (X)': 1}); self.assertEqual(s['executable_requests'], 1)
++        self.assertEqual([q['executable'] for q in hz.code_requests], [False, True])
++
++    def test_code_memory_calls_are_named_counted_and_still_refused_as_before(self):
++        hz = self.make()
++        # CreateCodeMemory(addr, size), ControlCodeMemory(handle, op, addr, size, perm), MapProcessCodeMemory(process, dst, src, size), SetProcessMemoryPermission(process, addr, size, perm)
++        for num, name, args in ((0x4b, 'CreateCodeMemory', (0x10000, 0x1000)), (0x4c, 'ControlCodeMemory', (0xD000, 0, 0x30000, 0x1000, 5)), (0x77, 'MapProcessCodeMemory', (0xD001, 0x40000, 0x10000, 0x1000)),
++                                (0x73, 'SetProcessMemoryPermission', (0xD001, 0x40000, 0x1000, 5))):
++            r = self.call(hz, num, *args)
++            self.assertEqual(r[0], hh.R_NOT_IMPLEMENTED, name)   # naming them changed nothing for the game: they were unhandled and still are
++            self.assertEqual(hz.stats[name], 1)
++        self.assertEqual(hz.unhandled, {'CreateCodeMemory': 1, 'ControlCodeMemory': 1, 'MapProcessCodeMemory': 1, 'SetProcessMemoryPermission': 1})
++        self.assertEqual(hz.code_summary()['counts'], {'CreateCodeMemory': 1, 'ControlCodeMemory (X)': 1, 'MapProcessCodeMemory': 1, 'SetProcessMemoryPermission (X)': 1})
++
++    def test_an_svc_that_has_nothing_to_do_with_code_is_not_recorded_and_an_unknown_one_stays_unnamed(self):
++        hz = self.make()
++        self.call(hz, 0x3F, 1, 2, 3)
++        self.assertEqual((hz.code_summary()['counts'], hz.unhandled), ({}, {'svc0x3f': 1}))
++
++    def test_the_record_is_bounded_and_keeps_only_addresses_and_numbers(self):
++        hz = self.make()
++        for i in range(500): self.call(hz, 0x02, 0x10000 + i * 0x1000, 0x1000, 5)
++        self.assertEqual(len(hz.code_requests), 200); self.assertEqual(hz.code_counts['SetMemoryPermission (X)'], 500)
++        first = hz.code_summary()['first']
++        self.assertEqual(len(first), 10); self.assertTrue(all(isinstance(v, str) for v in first[0]['args'])); self.assertEqual(set(first[0]), {'svc', 'site', 'args', 'executable'})
++
++    def test_the_first_call_of_each_kind_is_logged_once(self):
++        hz = self.make()
++        for _ in range(3): self.call(hz, 0x02, 0x10000, 0x1000, 5)
++        self.assertEqual(hz.out.getvalue().count('[dyncode] SetMemoryPermission'), 1); self.assertIn('asks for executable memory', hz.out.getvalue())
++
++
++class JitTargets(unittest.TestCase):
++    LOG = ('#1 pc=0x8001000 jump count=3\n#2 pc=0x8001000 call count=2\n#3 pc=0x9000040 call count=7\n#4 pc=0xa0000000 call count=5\n#5 pc=0xa0000010 jump count=1\n'
++           'not a log line\n#6 pc=zz call count=4\n')
++
++    def test_targets_inside_a_module_and_outside_every_module_are_counted_apart(self):
++        j = ar.jit_targets(self.LOG, [(0x8000000, 0x9000000)])
++        self.assertEqual((j['targets_in_modules'], j['entries_in_modules']), (2, 5))
++        self.assertEqual((j['targets_outside_modules'], j['entries_outside_modules']), (3, 13))
++        self.assertEqual(j['top_outside_modules'][0], dict(pc='0x9000040', kind='call', count=7))   # biggest first
++        self.assertEqual([r['count'] for r in j['top_in_modules']], [3, 2])
++
++    def test_no_module_means_everything_is_outside_and_an_empty_log_means_nothing(self):
++        self.assertEqual(ar.jit_targets(self.LOG, [])['targets_in_modules'], 0)
++        j = ar.jit_targets('', [(0, 1)])
++        self.assertEqual((j['entries_in_modules'], j['entries_outside_modules'], j['top_outside_modules']), (0, 0, []))
++
++    def test_the_list_is_cut_to_the_top(self):
++        log = ''.join(f'#{i} pc={0xb0000000 + 4 * i:#x} call count={i + 1}\n' for i in range(50))
++        self.assertEqual(len(ar.jit_targets(log, [], top=5)['top_outside_modules']), 5)
++
++    def test_the_report_text_says_both(self):
++        s = {'functions': 5, 'lifted': 4, 'replaced': 0, 'jit_fallback': 1, 'not_translated': 0}
++        rep = ar.build(s, {'indirect_calls': 1, 'indirect_jumps': 0, 'fallback_requests': 0}, seconds=1, jit=True,
++                       extra={'dynamic_code': {'counts': {'SetMemoryPermission (X)': 2}, 'executable_requests': 2, 'first': []}, 'jit_targets': ar.jit_targets(self.LOG, [(0x8000000, 0x9000000)])})
++        t = ar.text(rep)
++        self.assertIn('calls that make memory executable: 2 (SetMemoryPermission (X) 2)', t); self.assertIn('2 places inside the modules (5 entries) and 3 outside them (13 entries: generated code)', t)
++        none = ar.text(ar.build(s, {'indirect_calls': 0, 'indirect_jumps': 0, 'fallback_requests': 0}, seconds=1, jit=True, extra={'dynamic_code': {'counts': {}, 'executable_requests': 0, 'first': []}}))
++        self.assertIn('(none)', none)
++
++
++try:
++    import test_aot_jit as tj
++    JIT_READY = tj.READY
++except ImportError: tj, JIT_READY = None, False
++
++
++@unittest.skipUnless(JIT_READY, 'needs REMILL_BUILD, DYNARMIC_DIR, clang++ and unicorn')
++class AcrossThreads(unittest.TestCase):
++    """The fixtures of test_aot_jit: SLOT holds generated code (`nop ; ret`), `indirect` calls the address in x1, PATCHME stores the word x1 at [x0] and calls it"""
++    def setUp(self):
++        self.a = tj.make(('indirect',))
++
++    def tearDown(self): self.a.close()
++
++    def call_slot(self):
++        r = self.a.run(tj.RANGES['indirect'][0], {'x1': tj.SLOT, 'x2': tj.RETONLY, 'x30': tj.ref.STOP}, 0, tj.SP)
++        self.assertNotIn('fault', r); return r['x0']
++
++    def rewrite_by_guest_code(self, word):
++        r = self.a.run(tj.PATCHME, {'x0': tj.SLOT, 'x1': word, 'x30': tj.ref.STOP}, 0, tj.SP)
++        self.assertNotIn('fault', r); return r['x0']
++
++    def test_a_thread_that_ran_the_generated_code_sees_it_after_another_thread_rewrote_it_with_a_store(self):
++        """thread A runs SLOT (so its own JIT holds it), thread B rewrites it by guest code, A runs it again: the round trip is repeated, with both orders of the words"""
++        a_ready, b_done, a_saw = threading.Event(), threading.Event(), []
++        words = [tj.fx.MOVZ(0, v) for v in (7, 9, 7, 300, 1, 2)]
++        errors = []
++        def thread_a():
++            try:
++                for _ in words:
++                    a_ready.set(); b_done.wait(30); b_done.clear()
++                    a_saw.append(self.call_slot())
++            except Exception as e: errors.append(e)
++        def thread_b():
++            try:
++                for w in words:
++                    a_ready.wait(30); a_ready.clear()
++                    self.rewrite_by_guest_code(w)
++                    b_done.set()
++            except Exception as e: errors.append(e)
++        # A runs the first version before any rewrite so that its code cache holds it
++        self.assertEqual(self.call_slot(), 0)
++        ta, tb = threading.Thread(target=thread_a), threading.Thread(target=thread_b)
++        ta.start(); tb.start(); ta.join(60); tb.join(60)
++        self.assertEqual(errors, []); self.assertEqual(a_saw, [7, 9, 7, 300, 1, 2], 'a thread ran stale code after another thread rewrote it')
++        self.assertGreaterEqual(self.a.stat('jit_invalidations'), len(words))
++
++    def test_a_rewrite_by_the_harness_reaches_a_thread_that_already_ran_the_code(self):
++        seen = []
++        self.assertEqual(self.call_slot(), 0)
++        def other():
++            for imm in (11, 12, 13): seen.append(self.call_slot())
++        for imm in (11, 12, 13):
++            self.a.lib.aot_poke(tj.SLOT, struct.pack('<I', tj.fx.MOVZ(0, imm)), 4)
++            t = threading.Thread(target=lambda: seen.append(self.call_slot())); t.start(); t.join(30)
++        self.assertEqual(seen, [11, 12, 13])
++
++    def test_the_cache_maintenance_sequence_a_jit_emits_runs_and_the_code_it_covers_is_the_new_code(self):
++        """dc cvau, dsb ish, ic ivau, dsb ish, isb after the store, as an emitter of generated code writes it: it must run in the JIT and leave the new code in place"""
++        import test_aot_simd as ts, tempfile
++        with tempfile.TemporaryDirectory() as tmp:
++            (w,) = ts.assemble(['str w1, [x0]; dc cvau, x0; dsb ish; ic ivau, x0; dsb ish; isb; stp x29, x30, [sp, #-16]!; blr x0; ldp x29, x30, [sp], #16'], tmp)
++        code = struct.pack('<%dI' % len(w), *w)
++        base = 0x600
++        img = bytearray(tj.IMG); img[base:base + len(code)] = code
++        a = tj.aot_lift.Aot([(tj.RANGES['indirect'][0], tj.IMG[tj.RANGES['indirect'][0]:tj.RANGES['indirect'][1]])], jit=True)
++        try:
++            for b, data in tj.MEM.items(): a.map(b, len(data), data)
++            a.map(0, len(img), bytes(img))
++            for imm in (21, 22, 23):
++                r = a.run(base, {'x0': tj.SLOT, 'x1': tj.fx.MOVZ(0, imm), 'x30': tj.ref.STOP}, 0, tj.SP)
++                self.assertNotIn('fault', r); self.assertEqual(r['x0'], imm)
++        finally: a.close()
++
++
++if __name__ == '__main__': unittest.main()

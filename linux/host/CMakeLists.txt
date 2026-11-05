@@ -3,6 +3,14 @@ cmake_minimum_required(VERSION 3.20)
 project(nx2linux_host LANGUAGES C)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)   # the static libraries end up in libnx2linux_display.so
 
+# Sanitizer build, off by default: the normal build has none of these flags. Use a directory of its own and clang, so one sanitizer runtime serves the whole process
+# (the libraries are loaded into Python by ctypes, with the runtime preloaded). `python3 linux/cli/nx2linux.py sanitize` does all of it, see README.md.
+set(NX2LINUX_SANITIZE "" CACHE STRING "comma-separated -fsanitize list, for example address,undefined (empty: no sanitizer)")
+if(NX2LINUX_SANITIZE)
+    add_compile_options(-fsanitize=${NX2LINUX_SANITIZE} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${NX2LINUX_SANITIZE})
+endif()
+
 include(CTest)
 find_package(PkgConfig REQUIRED)
 find_package(Vulkan REQUIRED)
