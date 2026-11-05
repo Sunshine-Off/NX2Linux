@@ -108,6 +108,10 @@ def doctor_report() -> dict[str, dict[str, str | bool]]:
             else 'install vulkan-tools for GPU diagnostics'
         ),
     }
+    import nx2linux_build   # the checks `build` makes, so that doctor reports the same gaps
+    for c in nx2linux_build.prerequisites():
+        if c.name in ('remill', 'dynarmic'):
+            checks[c.name] = {'ok': c.ok, 'required': False, 'detail': c.detail if c.ok else f'{c.detail} (needed to {"recompile a game" if c.name == "remill" else "recompile with --jit"}: {c.fix})'}
     for kind in ('config', 'cache', 'state', 'data'):
         checks[f'xdg-{kind}'] = {'ok': True, 'detail': str(xdg_dir(kind))}
     return checks
@@ -242,6 +246,28 @@ def extract(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def game_build(args: argparse.Namespace) -> int:
+    """nx2linux build <nsp>: extraction, ELF modules, build manifest, recompilation (linux/cli/nx2linux_build.py)"""
+    import nx2linux_build as nb
+    if not args.nsp:
+        print('build: give the game package, for example: nx2linux build game.nsp --keys prod.keys. The SDL3 and Vulkan host demo is now `nx2linux build-host`', file=sys.stderr)
+        return nb.EXIT['usage']
+    if not args.keys:
+        print('build: --keys is required (your own prod.keys, or the folder that holds it)', file=sys.stderr)
+        return nb.EXIT['usage']
+    opts = nb.Options(nsp=Path(args.nsp), keys=Path(args.keys), out=Path(args.out) if args.out else None, update=Path(args.update) if args.update else None,
+                      jit=args.jit, skip_recompile=args.skip_recompile, stop_after=args.stop_after, force=args.force)
+    def on_event(e):
+        print(json.dumps(e), flush=True) if args.json else nb.print_event(e)
+    try:
+        root = nb.run_build(opts, on_event)
+    except nb.BuildError as error:
+        print(f'build: [{error.step}] {error}', file=sys.stderr)
+        return error.code
+    print(f'build directory: {root}')
+    return 0
+
+
 SURVEY = ROOT / 'engine' / 'dm' / 'tools' / 'survey.py'
 
 
@@ -297,7 +323,18 @@ def parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser('doctor', help='diagnose Linux build and runtime dependencies')
     doctor.add_argument('--json', action='store_true', help='print machine-readable JSON')
 
-    build = sub.add_parser('build', parents=[common], help='configure and build the Linux host')
+    gb = sub.add_parser('build', help='build a game: package to extraction, ELF modules, build manifest and recompilation (needs dotnet, your prod.keys and Remill)')
+    gb.add_argument('nsp', nargs='?', help='the .nsp or .xci of the game')
+    gb.add_argument('--keys', help='prod.keys, or the folder that holds it')
+    gb.add_argument('--update', help='the update package')
+    gb.add_argument('--out', help='build folder (default: the XDG cache), never inside the repository. The game goes to <out>/<title ID>')
+    gb.add_argument('--jit', action='store_true', help='build the dynarmic fallback (needs DYNARMIC_DIR)')
+    gb.add_argument('--skip-recompile', action='store_true', help='stop after the build manifest, the recompilation (about 25 minutes, 12 GB) is not run')
+    gb.add_argument('--stop-after', choices=('check', 'extract', 'modules', 'manifest', 'recompile'), help='stop after this step')
+    gb.add_argument('--force', action='store_true', help='run every step again')
+    gb.add_argument('--json', action='store_true', help='print the progress events as JSON lines')
+
+    build = sub.add_parser('build-host', parents=[common], help='configure and build the Linux host demo')
     build.add_argument('--config', choices=('Debug', 'Release'), default='Debug')
 
     launch = sub.add_parser('run', parents=[common], help='run the visible Vulkan demo')
@@ -332,6 +369,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == 'doctor':
         return print_doctor(doctor_report(), args.json)
     if args.command == 'build':
+        return game_build(args)
+    if args.command == 'build-host':
         return configure_and_build(args)
     if args.command == 'run':
         return run_demo(args)

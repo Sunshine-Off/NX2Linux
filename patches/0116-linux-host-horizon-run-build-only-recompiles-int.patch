@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 16:57:33 +0100
+Subject: [PATCH] Linux host: horizon_run --build-only recompiles into the
+ cache and stops before the game
+
+Upstream-Status: fork-only
+Reason: nx2linux build recompiles with the exact cache keys of a run without starting the game
+Issue: Sunshine-Off/NX2Linux#11
+
+---
+ dm/tools/horizon_run.py                       |  3 +++
+ dm/tools/tests/test_horizon_run_build_only.py | 23 +++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+ create mode 100644 dm/tools/tests/test_horizon_run_build_only.py
+
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 2ac8c23..5d107bf 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -20,6 +20,7 @@ def main():
+     p.add_argument('--display', action='store_true', help='open a window when the game first presents a frame'); p.add_argument('--hidden', action='store_true', help='with --display: keep the window hidden')
+     p.add_argument('--seconds', type=float, default=60, help='stop after this long (the game runs on its own threads)')
+     p.add_argument('--jit', action='store_true', help='build the dynarmic fallback (needs DYNARMIC_DIR: tools/setup_toolchain.sh): a function that cannot be lifted runs in the JIT instead of stopping its thread. Turns the inline memory accesses off')
++    p.add_argument('--build-only', action='store_true', help='recompile into the cache (the same functions and cache keys as a run), then stop before the game starts: what `nx2linux build` does')
+     p.add_argument('--no-profile', action='store_true', help='do not apply the per-title workarounds'); p.add_argument('--verbose', action='store_true')
+     a = p.parse_args()
+     import horizon_game
+@@ -36,6 +37,8 @@ def main():
+     t = time.time()
+     hz.aot = ms.build(jit=a.jit, overrides=ovr, cache=a.cache)
+     print(f'built in {time.time() - t:.0f} s ({hz.aot.cache_hits} cached, {hz.aot.cache_misses} built, {len(hz.aot.unlifted)} not translated)', flush=True)
++    if a.build_only:
++        hz.aot.close(); print('[build] recompiled: the cache is ready', flush=True); return
+     hz.attach()
+     if a.display:
+         import horizon_display
+diff --git a/dm/tools/tests/test_horizon_run_build_only.py b/dm/tools/tests/test_horizon_run_build_only.py
+new file mode 100644
+index 0000000..80be338
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_run_build_only.py
+@@ -0,0 +1,23 @@
++"""horizon_run.py --build-only: the option exists and the run stops before the game starts. The recompilation itself needs Remill and is covered by the AOT tests. No game file needed."""
++import subprocess
++import sys
++import unittest
++from pathlib import Path
++
++TOOLS = Path(__file__).resolve().parents[1]
++
++
++class BuildOnly(unittest.TestCase):
++    def test_help_names_it(self):
++        r = subprocess.run([sys.executable, '-I', str(TOOLS / 'horizon_run.py'), '--help'], capture_output=True, text=True, timeout=120)
++        self.assertEqual(r.returncode, 0, r.stderr)
++        self.assertIn('--build-only', r.stdout)
++
++    def test_the_stop_is_before_the_boot(self):
++        src = (TOOLS / 'horizon_run.py').read_text()
++        self.assertLess(src.index('if a.build_only:'), src.index('hz.attach()'))
++        self.assertLess(src.index('hz.attach()'), src.index('hz.boot()'))
++
++
++if __name__ == '__main__':
++    unittest.main()

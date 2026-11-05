@@ -94,3 +94,4 @@ file	class	note
 0113-linux-host-elf-module-refuses-capstone-6-by-name.patch	linux	Touches the Linux module loader and its tests only
 0114-linux-host-a-synthetic-nsp-and-xci-and-a-test-th.patch	linux	Tests and a fixture only, nothing the Apple build uses
 0115-linux-host-the-apple-rewriter-and-its-patches-ar.patch	linux	Linux decision record and test
+0116-linux-host-horizon-run-build-only-recompiles-int.patch	linux	Linux runner option

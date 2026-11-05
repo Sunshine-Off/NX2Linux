@@ -55,3 +55,4 @@
 0113-linux-host-elf-module-refuses-capstone-6-by-name.patch
 0114-linux-host-a-synthetic-nsp-and-xci-and-a-test-th.patch
 0115-linux-host-the-apple-rewriter-and-its-patches-ar.patch
+0116-linux-host-horizon-run-build-only-recompiles-int.patch

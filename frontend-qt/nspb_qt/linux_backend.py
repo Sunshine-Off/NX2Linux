@@ -63,7 +63,7 @@ class LinuxBackend(QObject):
             if not hasattr(QProcess, 'UnixProcessFlag'):
                 raise ValueError('The Linux interface requires PySide6 6.7 or later')
             self.process.setUnixProcessParameters(QProcess.UnixProcessFlag.CreateNewSession)
-            args = ['-u', str(cli), action]
+            args = ['-u', str(cli), 'build-host' if action == 'build' else action]   # the CLI's `build` is the game build since phase 1
             if action == 'doctor':
                 args += ['--json']
             else:
