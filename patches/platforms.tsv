@@ -91,3 +91,4 @@ file	class	note
 0110-docs-linux-architecture-md-the-stages-the-host-t.patch	linux	by the paths it touches
 0111-test-elf-module-the-switch-test-is-skipped-when.patch	common	A test that needs Remill skips without it. Helps any runner without the toolchain
 0112-linux-host-a-test-that-the-linux-chain-reaches-n.patch	linux	A test of the Linux chain, which has no Apple counterpart
+0113-linux-host-elf-module-refuses-capstone-6-by-name.patch	linux	Touches the Linux module loader and its tests only

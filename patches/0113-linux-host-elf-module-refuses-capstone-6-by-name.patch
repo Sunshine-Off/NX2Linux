@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 00:03:35 +0100
+Subject: [PATCH] Linux host: elf_module refuses Capstone 6 by name, and
+ failure tests for the chain
+
+capstone_md() checks the major version (Capstone 6 renamed CS_ARCH_ARM64) and raises a ModuleError that names the version and the pip command, as patch_nso.py and arm64_survey.py already do. test_linux_failures.py covers the three Capstone checks, the architecture checks of the ELF reader (machine, type, class, endianness, a manifest over a foreign ELF), the NPDM 64-bit flag, and the run's no-profile line.
+
+Upstream-Status: fork-only
+Reason: The module loader names a Capstone 6 install instead of failing on a missing name, and the failure cases are tested
+Issue: Sunshine-Off/NX2Linux#9
+
+---
+ dm/tools/elf_module.py                |  16 +++-
+ dm/tools/tests/test_linux_failures.py | 113 ++++++++++++++++++++++++++
+ 2 files changed, 125 insertions(+), 4 deletions(-)
+ create mode 100644 dm/tools/tests/test_linux_failures.py
+
+diff --git a/dm/tools/elf_module.py b/dm/tools/elf_module.py
+index 0e83fe5..9fe743b 100644
+--- a/dm/tools/elf_module.py
++++ b/dm/tools/elf_module.py
+@@ -96,12 +96,20 @@ def read_relocs(img, dynamic):
+     return out
+ 
+ 
++def capstone_md():
++    """An AArch64 disassembler that skips data words. Capstone 5 only: Capstone 6 renamed CS_ARCH_ARM64 and the operand names, so the engine says which version it got instead of failing on a missing name"""
++    import capstone
++    if capstone.cs_version()[0] != 5: raise ModuleError(f'Capstone {capstone.__version__} is unsupported, the Linux chain needs Capstone 5.x. Run: {sys.executable} -m pip install "capstone>=5,<6"')
++    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM); md.detail = False; md.skipdata = True
++    return md
++
++
+ def find_functions(img, text_end, symbols, relocs):
+     """{start: (end, how)}: every function entry the recompiler must know. how: 'fde' (unwind data), 'export' (an exported function without one), 'call' (the target of a direct bl or b outside every known
+     function: the PLT stubs and tail-called code the unwind data does not describe) or 'pointer' (a function pointer a RELATIVE relocation stores). A discovered entry runs to the next known entry and is scanned
+     up to its first unconditional branch, so the data after a stub is not mistaken for code"""
+-    import bisect, capstone
+-    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM); md.detail = False; md.skipdata = True   # a data word inside a function is skipped, not an error: the lift follows control flow
++    import bisect
++    md = capstone_md()   # skipdata: a data word inside a function is skipped, not an error: the lift follows control flow
+     try: fde = [(s, e) for s, e in nso_code.fde_ranges(img) if 0 <= s < e <= text_end]
+     except (AssertionError, ValueError, IndexError, struct.error) as e: raise ModuleError(f'cannot read the function boundaries from the unwind data: {e}') from e
+     funcs = {s: [e, 'fde'] for s, e in fde}
+@@ -262,8 +270,8 @@ class ModuleSet:
+         """A direct bl or b from one module into another (main into sdk, laid out back to back as Horizon's rtld does) is encoded for that distance. Its target is an entry the other module's own scan
+         could not know: it lands inside a function, or on code its unwind data does not describe. Each such target becomes an entry (the function is split there, as find_functions does inside a module);
+         returns how many were added"""
+-        import bisect, capstone
+-        md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM); md.detail = False; md.skipdata = True
++        import bisect
++        md = capstone_md()
+         added = 0
+         for mod in self.modules:
+             targets = set()
+diff --git a/dm/tools/tests/test_linux_failures.py b/dm/tools/tests/test_linux_failures.py
+new file mode 100644
+index 0000000..d699bed
+--- /dev/null
++++ b/dm/tools/tests/test_linux_failures.py
+@@ -0,0 +1,113 @@
++"""Phase 1 failure tests of the Linux chain: a Capstone of the wrong major version, an architecture the chain cannot run, and a title with no profile each stop or say so in words, never in a
++traceback or silently. No game file, key or toolchain is needed."""
++import json
++import struct
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++TOOLS = HERE.parent
++sys.path.insert(0, str(TOOLS)); sys.path.insert(0, str(TOOLS.parent / 'games'))
++import elf_module as em
++import profile_guess
++
++# A stand-in for Capstone 6: it reports its major version and has the names Capstone 6 gave (CS_ARCH_AARCH64), not the ones the engine uses (CS_ARCH_ARM64)
++FAKE_CAPSTONE = '''__version__ = "6.0.0"
++def cs_version(): return (6, 0, 0)
++CS_ARCH_AARCH64 = 1
++CS_MODE_ARM = 0
++'''
++
++
++def run_with_fake_capstone(body, tmp, *argv):
++    """Run `body` in a clean interpreter (-I) whose `capstone` is the Capstone 6 stand-in; returns the CompletedProcess"""
++    fake = Path(tmp) / 'fake'
++    (fake / 'capstone').mkdir(parents=True, exist_ok=True)
++    (fake / 'capstone' / '__init__.py').write_text(FAKE_CAPSTONE)
++    code = f'import sys, runpy\nsys.path[:0] = [{str(fake)!r}, {str(TOOLS)!r}]\nsys.argv = {["x", *argv]!r}\n{body}'
++    return subprocess.run([sys.executable, '-I', '-c', code], capture_output=True, text=True, timeout=120)
++
++
++class WrongCapstone(unittest.TestCase):
++    def test_the_rewriter_names_the_version_and_the_fix(self):
++        with tempfile.TemporaryDirectory() as d:
++            r = run_with_fake_capstone(f'runpy.run_path({str(TOOLS / "patch_nso.py")!r}, run_name="__main__")', d, 'in.nso', d, 'main')
++        self.assertNotEqual(r.returncode, 0)
++        self.assertIn('Capstone 6.0.0 is unsupported', r.stderr + r.stdout)
++        self.assertIn('capstone>=5,<6', r.stderr + r.stdout)
++
++    def test_the_survey_names_the_version(self):
++        with tempfile.TemporaryDirectory() as d:
++            r = run_with_fake_capstone('import arm64_survey\ntry: arm64_survey._md()\nexcept arm64_survey.SurveyError as e: print("SurveyError:", e)', d)
++        self.assertIn('SurveyError: Capstone 6.0.0 is unsupported', r.stdout, r.stderr)
++
++    def test_the_module_loader_names_the_version(self):
++        # elf_module is the Linux chain's own use of Capstone: it must refuse Capstone 6 by name, not fail on a missing CS_ARCH_ARM64
++        with tempfile.TemporaryDirectory() as d:
++            r = run_with_fake_capstone('import elf_module\ntry: elf_module.capstone_md()\nexcept elf_module.ModuleError as e: print("ModuleError:", e)', d)
++        self.assertIn('ModuleError: Capstone 6.0.0 is unsupported', r.stdout, r.stderr)
++        self.assertIn('capstone>=5,<6', r.stdout)
++
++    def test_the_installed_capstone_is_accepted(self):
++        try: import capstone
++        except ImportError: self.skipTest('capstone is not installed in this interpreter')
++        if capstone.cs_version()[0] != 5: self.skipTest(f'Capstone {capstone.__version__} is installed, which is the case under test')
++        self.assertEqual(em.capstone_md().arch, capstone.CS_ARCH_ARM64)
++
++
++def elf_header(cls=2, data=1, etype=3, machine=183):
++    h = bytearray(0x40)
++    h[:4] = b'\x7fELF'; h[4], h[5], h[6] = cls, data, 1
++    struct.pack_into('<HH', h, 16, etype, machine)
++    return bytes(h)
++
++
++class UnsupportedArchitecture(unittest.TestCase):
++    def test_an_aarch64_shared_object_passes_the_architecture_check(self):
++        with self.assertRaisesRegex(em.ModuleError, 'no PT_LOAD segment'): em.parse_elf(elf_header())   # the header is accepted, the next check (it has no segment) is the one that stops
++
++    def test_other_machines_are_refused_by_number(self):
++        for machine, label in ((62, 'x86-64'), (40, '32-bit ARM'), (243, 'RISC-V')):
++            with self.subTest(label), self.assertRaisesRegex(em.ModuleError, rf'machine {machine}: a shared object \(3\) for AArch64 \(183\)'):
++                em.parse_elf(elf_header(machine=machine))
++
++    def test_an_executable_is_refused(self):
++        with self.assertRaisesRegex(em.ModuleError, 'ELF type 2'): em.parse_elf(elf_header(etype=2))
++
++    def test_a_32_bit_or_big_endian_file_is_refused(self):
++        for kw in ({'cls': 1}, {'data': 2}):
++            with self.subTest(kw), self.assertRaisesRegex(em.ModuleError, 'little-endian ELF64'): em.parse_elf(elf_header(**kw))
++
++    def test_not_an_elf_is_refused(self):
++        for blob in (b'', b'NSO0' + bytes(0x100), b'\x7fELF'):
++            with self.subTest(blob[:4]), self.assertRaisesRegex(em.ModuleError, 'little-endian ELF64'): em.parse_elf(blob)
++
++    def test_a_manifest_over_a_foreign_elf_is_refused(self):
++        with tempfile.TemporaryDirectory() as d:
++            (Path(d) / 'm.elf').write_bytes(elf_header(machine=62))
++            (Path(d) / 'm.manifest.json').write_text(json.dumps({'format': em.FORMAT, 'elf': 'm.elf', 'sha256': __import__('hashlib').sha256(elf_header(machine=62)).hexdigest(), 'name': 'm', 'build_id': ''}))
++            with self.assertRaisesRegex(em.ModuleError, 'machine 62'): em.load_manifest(Path(d) / 'm.manifest.json')
++
++    def test_a_32_bit_program_is_told_by_its_npdm(self):
++        with tempfile.TemporaryDirectory() as d:
++            for flags, want in ((0, False), (1, True), (0x3e, False), (0x3f, True)):
++                p = Path(d) / 'main.npdm'; p.write_bytes(b'META' + bytes(8) + bytes([flags]) + bytes(0x100))
++                self.assertIs(profile_guess.aarch64(p), want, flags)
++            self.assertTrue(profile_guess.aarch64(Path(d) / 'absent.npdm'))   # no NPDM, no verdict: assumed 64-bit
++
++
++class MissingProfile(unittest.TestCase):
++    def test_the_run_says_it_has_no_profile_before_anything_else(self):
++        with tempfile.TemporaryDirectory() as d:
++            r = subprocess.run([sys.executable, '-I', str(TOOLS / 'horizon_run.py'), '--modules', d, '--title', '0000000000000001', '--seconds', '1'],
++                               capture_output=True, text=True, timeout=120)
++        first = r.stdout.splitlines()[0] if r.stdout else ''
++        self.assertTrue(first.startswith('[profile] no profile dm/games/0000000000000001: generic Horizon defaults'), r.stdout + r.stderr)
++        self.assertIn('DM_GAMES_DIR', first)   # and says where a profile can come from
++
++
++if __name__ == '__main__':
++    unittest.main()
