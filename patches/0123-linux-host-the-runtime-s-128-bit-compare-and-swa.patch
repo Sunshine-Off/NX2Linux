@@ -1,0 +1,511 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 20:01:24 +0100
+Subject: [PATCH] Linux host: the runtime's 128-bit compare-and-swap, and the
+ tests of the instructions Remill patch 0010 lifts (#16)
+
+aot_runtime.cpp: __remill_compare_exchange_memory_128 (lock cmpxchg16b, alignment checked first), for
+ldxp/stxp of two X registers.
+
+Tests, each instruction assembled with aarch64-linux-gnu-as, lifted alone and compared with Unicorn
+(values, NZCV, memory, FPSR): pair exclusives (and four threads adding to both words of a pair), the
+saturating narrows with the QC flag, FRECPE and FRECPX with their flags, half precision conversions in
+the four rounding modes, register-form CCMN. lift_coverage.py prints which forms Remill lifts, by family.
+
+The tests that used a register-form ccmn as "an instruction Remill cannot lift" (test_aot_stub,
+test_aot_cache, test_elf_module, module_fixture) use cls instead, which Remill still does not lift.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: The runtime side of Remill patch 0010 (128-bit compare-and-swap) and the tests that compare the new instructions with Unicorn
+Issue: Sunshine-Off/NX2Linux#16
+
+---
+ dm/tools/aot_runtime.cpp             |  12 +++
+ dm/tools/tests/lift_coverage.py      | 118 +++++++++++++++++++++++++++
+ dm/tools/tests/module_fixture.py     |   4 +-
+ dm/tools/tests/test_aot_atomics.py   |  47 ++++++++++-
+ dm/tools/tests/test_aot_cache.py     |   6 +-
+ dm/tools/tests/test_aot_simd.py      |  82 ++++++++++++++++++-
+ dm/tools/tests/test_aot_stub.py      |  10 +--
+ dm/tools/tests/test_elf_module.py    |   2 +-
+ dm/tools/tests/test_lift_coverage.py |  46 +++++++++++
+ 9 files changed, 312 insertions(+), 15 deletions(-)
+ create mode 100644 dm/tools/tests/lift_coverage.py
+ create mode 100644 dm/tools/tests/test_lift_coverage.py
+
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index 4a70773a..afe8a3aa 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -224,6 +224,18 @@ ACCESS(f32, float) ACCESS(f64, double)   // scalar floating-point loads and stor
+         __atomic_compare_exchange_n((T *)guest(a, sizeof(T), "atomic access"), &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); \
+         count_write(); if (aot_write_hook) aot_write_hook(a, sizeof(T)); return m; }
+ CAS(8, uint8_t) CAS(16, uint16_t) CAS(32, uint32_t) CAS(64, uint64_t)
++// The pair exclusives (ldxp/stxp of two X registers, Remill patch 0010) store 16 bytes with one compare-and-swap: lock cmpxchg16b, which faults (#GP) on a location that is not 16-byte aligned, so the alignment is
++// checked first (the hardware requires it too). The mapping is page aligned and a region lives at nx2_gbase + address, so a guest address aligned to 16 is a host address aligned to 16. expected gets the value the
++// location held, as for the narrower ones
++Memory *__remill_compare_exchange_memory_128(Memory *m, uint64_t a, unsigned __int128 &expected, unsigned __int128 &desired) {
++    if (a % 16) fail("atomic access of 16 bytes at %#llx is not naturally aligned", (unsigned long long)a);
++    unsigned __int128 *p = (unsigned __int128 *)guest(a, 16, "atomic access");
++    uint64_t lo = (uint64_t)expected, hi = (uint64_t)(expected >> 64);
++    const uint64_t dlo = (uint64_t)desired, dhi = (uint64_t)(desired >> 64);
++    __asm__ __volatile__("lock cmpxchg16b %0" : "+m"(*p), "+a"(lo), "+d"(hi) : "b"(dlo), "c"(dhi) : "memory", "cc");
++    expected = ((unsigned __int128)hi << 64) | lo;
++    count_write(); if (aot_write_hook) aot_write_hook(a, 16); return m;
++}
+ Memory *__remill_atomic_begin(Memory *m) { return m; }   // the CAS above is the atomic operation; these only bracket the instruction
+ Memory *__remill_atomic_end(Memory *m) { return m; }
+ 
+diff --git a/dm/tools/tests/lift_coverage.py b/dm/tools/tests/lift_coverage.py
+new file mode 100644
+index 00000000..721279e1
+--- /dev/null
++++ b/dm/tools/tests/lift_coverage.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""Which AArch64 instructions Remill lifts, by family, with no game data (NX2Linux Phase 2, #16).
++Every line of FAMILIES is assembled with aarch64-linux-gnu-as, lifted alone by remill-lift (aot_lift.Aot with stub_unliftable) and classified: `lifted` (native recompiled code), `jit` (Remill cannot lift it:
++it runs in the dynarmic fallback, with the reason Remill gave) or `refused` (the assembler does not know the form: it is not a lifting gap). The table is what the issue asked for before and after a Remill patch.
++Counts per game are not here: they come from `module_validate.py census` on the game's own modules (Balatro 1,720 instructions in 153 classes, from blocages-connus.md, XC2 not measured).
++Needs aarch64-linux-gnu-as, REMILL_BUILD and clang++.
++Usage: lift_coverage.py [--json OUT] [--family NAME ...]"""
++import argparse, collections, json, os, shutil, struct, subprocess, sys, tempfile
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++
++AS = shutil.which('aarch64-linux-gnu-as')
++MARCH = '-march=armv8.2-a+fp16+crypto'
++
++SIZES = ('', 'b', 'h')
++LSE_ORDER = ('', 'a', 'l', 'al')
++
++
++def lse():
++    out = []
++    for o in LSE_ORDER:
++        out += [f'cas{o} x0, x1, [x2]', f'cas{o} w0, w1, [x2]', f'cas{o}b w0, w1, [x2]', f'cas{o}h w0, w1, [x2]', f'casp{o} x0, x1, x2, x3, [x4]',
++                f'swp{o} x0, x1, [x2]', f'swp{o} w0, w1, [x2]', f'swp{o}b w0, w1, [x2]', f'swp{o}h w0, w1, [x2]']
++        for op in ('add', 'clr', 'eor', 'set', 'smax', 'smin', 'umax', 'umin'):
++            out += [f'ld{op}{o} x0, x1, [x2]', f'ld{op}{o} w0, w1, [x2]', f'ld{op}{o}b w0, w1, [x2]', f'ld{op}{o}h w0, w1, [x2]']
++    out += [f'st{op} x0, [x1]' for op in ('add', 'clr', 'eor', 'set', 'smax', 'smin', 'umax', 'umin')]
++    return out
++
++
++def narrow(op):
++    return [f'{op} v0.8b, v1.8h', f'{op}2 v0.16b, v1.8h', f'{op} v0.4h, v1.4s', f'{op}2 v0.8h, v1.4s', f'{op} v0.2s, v1.2d', f'{op}2 v0.4s, v1.2d',
++            f'{op} b0, h1', f'{op} h0, s1', f'{op} s0, d1']
++
++
++# family -> (what it is, [assembly lines]). The family names are the ones of the issue
++FAMILIES = {
++    'pair-exclusives': ('ldxp, ldaxp, stxp, stlxp (128-bit and 64-bit pairs)',
++                        ['ldxp x0, x1, [x2]', 'ldaxp x0, x1, [x2]', 'stxp w3, x0, x1, [x2]', 'stlxp w3, x0, x1, [x2]',
++                         'ldxp w0, w1, [x2]', 'ldaxp w0, w1, [x2]', 'stxp w3, w0, w1, [x2]', 'stlxp w3, w0, w1, [x2]']),
++    'single-exclusives': ('control: ldxr, stxr and byte, half forms (already lifted by patches 0002 and the blocks 3 and 4 work)',
++                          ['ldxr x0, [x2]', 'ldaxr w0, [x2]', 'stxr w3, x0, [x2]', 'stlxr w3, w0, [x2]', 'ldxrb w0, [x2]', 'stxrh w3, w0, [x2]', 'ldar x0, [x2]', 'stlr x0, [x2]']),
++    'lse-atomics': ('ARMv8.1 LSE: cas*, casp*, swp*, ld<op>*, st<op> (not in the Switch CPU, present in outline-atomics code)', lse()),
++    'saturating-narrow': ('sqxtn, uqxtn, sqxtun (vector and scalar)', narrow('sqxtn') + narrow('uqxtn') + narrow('sqxtun')),
++    'reciprocal-estimate': ('frecpe, frecpx (single, double, scalar, vector)',
++                            ['frecpe v0.4s, v1.4s', 'frecpe v0.2s, v1.2s', 'frecpe v0.2d, v1.2d', 'frecpe s0, s1', 'frecpe d0, d1', 'frecpx s0, s1', 'frecpx d0, d1']),
++    'reciprocal-controls': ('control: frecps, frsqrte, frsqrts (patch 0009)', ['frecps s0, s1, s2', 'frecps v0.4s, v1.4s, v2.4s', 'frsqrte s0, s1', 'frsqrte v0.2d, v1.2d', 'frsqrts d0, d1, d2']),
++    'half-conversion': ('fcvt between half and single or double, fcvtn and fcvtl with 4h (the Cortex-A57 has these)',
++                        ['fcvt s0, h1', 'fcvt h0, s1', 'fcvt d0, h1', 'fcvt h0, d1', 'fcvtn v0.4h, v1.4s', 'fcvtn2 v0.8h, v1.4s', 'fcvtl v0.4s, v1.4h', 'fcvtl2 v0.4s, v1.8h']),
++    'half-arithmetic': ('FP16 arithmetic and loads (ARMv8.2, not in the Switch CPU)',
++                        ['fadd h0, h1, h2', 'fsub h0, h1, h2', 'fmul h0, h1, h2', 'fdiv h0, h1, h2', 'fsqrt h0, h1', 'fabs h0, h1', 'fneg h0, h1', 'fmadd h0, h1, h2, h3', 'fcmp h0, h1',
++                         'fcvtzs w0, h1', 'scvtf h0, w1', 'fadd v0.4h, v1.4h, v2.4h', 'fmul v0.8h, v1.8h, v2.8h', 'fmla v0.8h, v1.8h, v2.8h', 'ldr h0, [x1]', 'str h0, [x1]']),
++    'ccmn': ('conditional compare negative: register form (the issue) and immediate form (control)',
++             ['ccmn x0, x1, #0, eq', 'ccmn w0, w1, #4, ne', 'ccmn x0, x1, #15, lt', 'ccmn x0, #5, #0, eq', 'ccmn w0, #31, #2, hi']),
++    'system': ('mrs ctr_el0, udf and the barriers (patch 0007 and __remill_error)', ['mrs x0, ctr_el0', 'mrs x0, dczid_el0', 'mrs x0, cntfrq_el0', 'udf #0', 'dmb ish', 'dsb sy', 'isb', 'clrex']),
++    'found-unlifted': ('not in the issue, found while measuring: cls, mrs and msr of NZCV, scalar faddp, fmaxnmv, sqrdmlah (ARMv8.1, not in the Switch CPU)',
++                       ['cls x0, x1', 'cls w0, w1', 'mrs x0, nzcv', 'msr nzcv, x0', 'faddp s0, v1.2s', 'faddp d0, v1.2d', 'fmaxnmv s0, v1.4s', 'sqrdmlah v0.4s, v1.4s, v2.4s']),
++    'crypto-controls': ('control: AES, SHA, PMULL, CRC32 (patches 0005 and 0009)', ['aese v0.16b, v1.16b', 'aesmc v0.16b, v1.16b', 'sha256h q0, q1, v2.4s', 'pmull v0.1q, v1.1d, v2.1d', 'crc32w w0, w1, w2', 'crc32cx w0, w1, x2']),
++}
++
++
++def assembles(line):
++    """True when the assembler knows this form (and the reason when not)"""
++    with tempfile.TemporaryDirectory() as d:
++        src = Path(d) / 'i.s'; src.write_text('.text\n' + line + '\n')
++        r = subprocess.run([AS, MARCH, str(src), '-o', str(Path(d) / 'i.o')], capture_output=True, text=True, errors='replace')
++    return (True, '') if r.returncode == 0 else (False, (r.stderr.strip().splitlines() or ['refused'])[-1][:120])
++
++
++def measure(families):
++    """{family: [(line, 'lifted' | 'jit' | 'refused', reason)]}"""
++    import test_aot_simd as ts
++    out = {}
++    for name in families:
++        lines = FAMILIES[name][1]
++        ok, rows = [], {}
++        for l in lines:
++            good, why = assembles(l)
++            if good: ok.append(l)
++            else: rows[l] = ('refused', why)
++        if ok:
++            with tempfile.TemporaryDirectory() as tmp:
++                h = ts.Harness(ok, tmp)
++                try:
++                    for l in ok: rows[l] = ('jit', h.unlifted[l]) if l in h.unlifted else ('lifted', '')
++                finally: h.close()
++        out[name] = [(l, *rows[l]) for l in lines]
++    return out
++
++
++def table(result):
++    lines = [f'{"family":<20} {"forms":>5} {"lifted":>6} {"jit":>4} {"refused":>7}  what']
++    tot = collections.Counter()
++    for name, rows in result.items():
++        c = collections.Counter(r[1] for r in rows); tot.update(c)
++        lines.append(f'{name:<20} {len(rows):>5} {c["lifted"]:>6} {c["jit"]:>4} {c["refused"]:>7}  {FAMILIES[name][0]}')
++    lines.append(f'{"total":<20} {sum(tot.values()):>5} {tot["lifted"]:>6} {tot["jit"]:>4} {tot["refused"]:>7}')
++    return '\n'.join(lines)
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
++    ap.add_argument('--json', help='write every form and its result here'); ap.add_argument('--family', nargs='+', choices=list(FAMILIES))
++    ap.add_argument('--detail', action='store_true', help='also list every form that is not lifted, with Remill\'s reason')
++    a = ap.parse_args(argv)
++    if not AS or not os.environ.get('REMILL_BUILD'): sys.exit('[RED] lift_coverage: needs aarch64-linux-gnu-as and REMILL_BUILD')
++    res = measure(a.family or list(FAMILIES))
++    print(table(res))
++    if a.detail:
++        for name, rows in res.items():
++            for l, st, why in rows:
++                if st != 'lifted': print(f'  {name}: {l:<34} {st:<8} {why}')
++    if a.json: Path(a.json).write_text(json.dumps({n: [dict(asm=l, result=s, reason=w) for l, s, w in r] for n, r in res.items()}, indent=1) + '\n')
++    return 0
++
++
++if __name__ == '__main__': sys.exit(main())
+diff --git a/dm/tools/tests/module_fixture.py b/dm/tools/tests/module_fixture.py
+index 79f40502..7d1b8689 100644
+--- a/dm/tools/tests/module_fixture.py
++++ b/dm/tools/tests/module_fixture.py
+@@ -147,8 +147,8 @@ def module_b():
+ 
+ 
+ def module_c():
+-    """c_main starts with a register-form ccmn, which Remill cannot lift: it runs in the JIT, and its call through the PLT reaches the host function from there"""
+-    def c_main(c, me): return [STP_PRE(29, 30, 31, -16), 0xBA408000, fx.ADDR(0, 0, 1), fx.MOVZ(1, 3), fx.BL(me + 16, c.fn('plt_hle_add')), LDP_POST(29, 30, 31, 16), RET]
++    """c_main starts with a cls (count leading sign bits), which Remill cannot lift (it lifted the register-form ccmn until patch 0010): it runs in the JIT, and its call through the PLT reaches the host function from there"""
++    def c_main(c, me): return [STP_PRE(29, 30, 31, -16), 0xDAC01403, fx.ADDR(0, 0, 1), fx.MOVZ(1, 3), fx.BL(me + 16, c.fn('plt_hle_add')), LDP_POST(29, 30, 31, 16), RET]
+     return dict(name='c', funcs=[Fn('plt_hle_add', False, plt('hle_add'), fde=False), Fn('c_main', True, c_main)], imports=[('hle_add', False, 'plt')])
+ 
+ 
+diff --git a/dm/tools/tests/test_aot_atomics.py b/dm/tools/tests/test_aot_atomics.py
+index d90db2c5..3133550e 100644
+--- a/dm/tools/tests/test_aot_atomics.py
++++ b/dm/tools/tests/test_aot_atomics.py
+@@ -4,7 +4,7 @@
+   · an exclusive store with no exclusive load fails, as the hardware's does, and an unaligned exclusive access is an explicit error;
+   · several host threads incrementing one counter with an ldaxr/stlxr loop lose no update: the exclusive store is a real compare-and-swap.
+ Needs a Remill with the ADC/ADCS and exclusive-store patches (fork en cours/remill-patches), REMILL_BUILD, clang++ and unicorn; skipped otherwise."""
+-import re, struct, sys, tempfile, threading, unittest, os
++import re, shutil, struct, sys, tempfile, threading, unittest, os
+ from pathlib import Path
+ 
+ HERE = Path(__file__).resolve().parent
+@@ -143,5 +143,50 @@ class Atomics(unittest.TestCase):
+         self.skipTest('no lost update seen in 5 tries: this host did not interleave the threads')
+ 
+ 
++@unittest.skipUnless(READY and shutil.which('aarch64-linux-gnu-as') and shutil.which('aarch64-linux-gnu-objcopy'), 'needs REMILL_BUILD, clang++, unicorn and aarch64-linux-gnu-as')
++class PairExclusives(unittest.TestCase):
++    """ldaxp/stlxp of two X registers is a 16-byte compare-and-swap (lock cmpxchg16b): threads adding to both words of a pair lose no update, and the two words always agree (issue #16)"""
++    LOOP = '1: ldaxp x2, x3, [x0]; add x2, x2, #1; add x3, x3, #1; stlxp w4, x2, x3, [x0]; cbnz w4, 1b; subs x1, x1, #1; b.ne 1b'
++    PLAIN = '1: ldp x2, x3, [x0]; add x2, x2, #1; add x3, x3, #1; stp x2, x3, [x0]; subs x1, x1, #1; b.ne 1b'
++
++    def counts(self, line, nthreads=4, n=20000):
++        import test_aot_simd as ts
++        with tempfile.TemporaryDirectory() as tmp: (w,) = ts.assemble([line], tmp)
++        aot = mapped(struct.pack('<%dI' % len(w), *w))
++        try:
++            errs = []
++            def work():
++                r = aot.run(ADDR, {'x0': DATA + 0x80, 'x1': n, 'x30': ref.STOP}, 0, SP)
++                if 'fault' in r: errs.append(r['fault'])
++            threads = [threading.Thread(target=work) for _ in range(nthreads)]
++            for t in threads: t.start()
++            for t in threads: t.join()
++            self.assertEqual(errs, [])
++            lo, hi = struct.unpack_from('<QQ', aot.peek(DATA, DATA_SIZE), 0x80)
++            start = struct.unpack_from('<QQ', MEM[DATA], 0x80)
++            return (lo - start[0], hi - start[1]), nthreads * n
++        finally: aot.close()
++
++    def test_threads_adding_to_a_pair_lose_no_update(self):
++        for _ in range(3):
++            (lo, hi), want = self.counts(self.LOOP)
++            self.assertEqual((lo, hi), (want, want), 'a pair store succeeded although another thread had written the pair')
++
++    def test_the_race_is_real_without_pair_exclusives(self):
++        for _ in range(5):
++            (lo, hi), want = self.counts(self.PLAIN)
++            if lo < want or hi < want: return
++        self.skipTest('no lost update seen in 5 tries: this host did not interleave the threads')
++
++    def test_an_unaligned_pair_is_an_explicit_error_not_a_host_fault(self):
++        import test_aot_simd as ts
++        with tempfile.TemporaryDirectory() as tmp: (w,) = ts.assemble(['ldxp x4, x5, [x0]; stxp w2, x4, x5, [x0]'], tmp)
++        aot = mapped(struct.pack('<%dI' % len(w), *w))
++        try:
++            got = aot.run(ADDR, {'x0': DATA + 0x88, 'x30': ref.STOP}, 0, SP)   # 8-byte aligned, not 16
++            self.assertIn('not naturally aligned', got.get('fault', 'no fault: the store went through'))
++        finally: aot.close()
++
++
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/dm/tools/tests/test_aot_cache.py b/dm/tools/tests/test_aot_cache.py
+index c1c4e61a..2475c138 100644
+--- a/dm/tools/tests/test_aot_cache.py
++++ b/dm/tools/tests/test_aot_cache.py
+@@ -15,7 +15,7 @@ import arm64_ref as ref
+ from test_aot_t3 import DATA, MEM, SP, READY, fixture
+ from test_aot_stub import needs_missing_symbol
+ 
+-G, D = 0x500, 0x600   # an unliftable function (ccmn, register form) and a plain one that the tests make need a symbol nobody defines
++G, D = 0x500, 0x600   # an unliftable function (cls, count leading sign bits) and a plain one that the tests make need a symbol nobody defines
+ 
+ 
+ @unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++ and unicorn')
+@@ -58,14 +58,14 @@ class Cache(unittest.TestCase):
+         b = self.build([fs[0], fs[1], (fs[2][0] + 0x1000, fs[2][1])]); self.assertEqual((b.cache_hits, b.cache_misses), (2, 1)); b.close()   # the same bytes elsewhere lift differently (adrp, bl)
+ 
+     def test_an_unliftable_function_is_remembered_with_its_reason(self):
+-        g = (G, struct.pack('<4I', 0xBA408000, fx.ADDR(0, 0, 1), 0x9A9F57E2, aot_lift.RET))
++        g = (G, struct.pack('<4I', 0xDAC01403, fx.ADDR(0, 0, 1), 0x9A9F57E2, aot_lift.RET))
+         a = self.build([g] + self.funcs(('arith',)), stub_unliftable=True)
+         self.assertEqual((a.cache_hits, a.cache_misses), (0, 2)); why = a.unlifted[G]; a.close()
+         b = self.build([g] + self.funcs(('arith',)), stub_unliftable=True)
+         try: self.assertEqual((b.cache_hits, b.unlifted[G]), (2, why))
+         finally: b.close()
+         with self.assertRaises(aot_lift.LiftError) as c: self.build([g], stub_unliftable=False)   # not stubbing: the remembered reason is raised, still explicit
+-        self.assertIn('ccmn', str(c.exception))
++        self.assertIn('cls', str(c.exception))
+ 
+     def test_a_function_that_needs_an_undefined_runtime_symbol_is_stubbed_from_the_recorded_symbols(self):
+         d = (D, struct.pack('<2I', 0x91000400, aot_lift.RET))   # add x0, x0, #1 ; ret
+diff --git a/dm/tools/tests/test_aot_simd.py b/dm/tools/tests/test_aot_simd.py
+index 69302b42..41e0bb36 100644
+--- a/dm/tools/tests/test_aot_simd.py
++++ b/dm/tools/tests/test_aot_simd.py
+@@ -93,17 +93,18 @@ class Harness:
+         """-> (got, want) dicts of everything compared; got may be {'fault': ...}"""
+         from unicorn import UcError
+         from unicorn.arm64_const import UC_ARM64_REG_SP, UC_ARM64_REG_NZCV, UC_ARM64_REG_FPCR, UC_ARM64_REG_FPSR, UC_ARM64_REG_Q0
+-        x, nz, v = case
++        x, nz, v, *more = case
++        fpcr = more[0] if more else 0   # a case may carry the FPCR it runs under (the rounding mode)
+         uc, entry = self.uc, CODE + idx * STEP
+         uc.mem_write(DATA, DATA_BYTES); uc.mem_write(STACK, bytes(STACK_SIZE))
+         for i in range(31): uc.reg_write(ref.xreg(i), x.get(f'x{i}', 0))
+         for i in range(32): uc.reg_write(UC_ARM64_REG_Q0 + i, v.get(f'v{i}', 0))
+         uc.reg_write(ref.xreg(30), ref.STOP); uc.reg_write(UC_ARM64_REG_SP, SP); uc.reg_write(UC_ARM64_REG_NZCV, nz << 28)
+-        uc.reg_write(UC_ARM64_REG_FPCR, 0); uc.reg_write(UC_ARM64_REG_FPSR, 0)
++        uc.reg_write(UC_ARM64_REG_FPCR, fpcr); uc.reg_write(UC_ARM64_REG_FPSR, 0)
+         try: uc.emu_start(entry, ref.STOP, count=200); want_fault = None
+         except UcError as e: want_fault = str(e)
+         self.aot.reset()
+-        got = self.aot.run(entry, dict(x, x30=ref.STOP), nz, SP, vregs=v)
++        got = self.aot.run(entry, dict(x, x30=ref.STOP), nz, SP, vregs=v, fpcr=fpcr)
+         if want_fault or 'fault' in got: return got, ({'fault': want_fault} if want_fault else None)
+         want = {f'x{i}': uc.reg_read(ref.xreg(i)) for i in range(31)}
+         want.update({f'v{i}': uc.reg_read(UC_ARM64_REG_Q0 + i) for i in range(32)})
+@@ -162,6 +163,24 @@ EXCL = (   # batch 3: byte and halfword exclusives, release stores, CLREX, DSB,
+     ['clrex', 'clrex #5', 'dsb sy', 'dsb ish', 'dmb ish', 'isb', 'prfm pldl1keep, [x0]', 'prfm pstl2strm, [x0, #8]', 'prfm pldl3keep, [x0, x1]', 'prfum pldl1keep, [x0, #-3]', 'nop'])
+ 
+ 
++PAIRS = (   # batch 8: the pair exclusives (blocker "ldxp/stxp", issue #16): two X registers are a 16-byte compare-and-swap, two W registers an 8-byte one
++    [f'{ld} {r}4, {r}5, [x0]; {st} w2, {r}4, {r}5, [x0]' for r in 'xw' for ld, st in (('ldxp', 'stxp'), ('ldaxp', 'stlxp'), ('ldxp', 'stlxp'), ('ldaxp', 'stxp'))] +
++    [f'ldxp {r}4, {r}5, [x0]; add {r}4, {r}4, #1; add {r}5, {r}5, #2; stxp w2, {r}4, {r}5, [x0]' for r in 'xw'] +
++    [f'ldaxp {r}4, {r}5, [x0]; eor {r}4, {r}4, {r}3; stlxp w2, {r}4, {r}5, [x0]' for r in 'xw'] +
++    [f'ldxp {r}4, {r}5, [x0]; str {r}3, [x0]; stxp w2, {r}4, {r}5, [x0]' for r in 'xw'] +          # another store in between: fails unless it wrote the same value
++    [f'ldxp {r}4, {r}5, [x0]; str {r}3, [x0, #{8 if r == "x" else 4}]; stxp w2, {r}4, {r}5, [x0]' for r in 'xw'] +   # the other half of the pair changes
++    [f'ldxp {r}4, {r}5, [x0]; clrex; stxp w2, {r}4, {r}5, [x0]' for r in 'xw'] +
++    [f'ldxp {r}4, {r}5, [x0]; stxp w2, {r}4, {r}5, [x2]' for r in 'xw'] +                           # a different address than the load
++    [f'stxp w2, {r}4, {r}5, [x0]' for r in 'xw'] + [f'stlxp w2, {r}4, {r}5, [x0]' for r in 'xw'] +   # no load at all
++    [f'ldxp {r}4, {r}5, [x0]; stxp w2, {r}4, {r}5, [x0]; stxp w6, {r}4, {r}5, [x0]' for r in 'xw'] +   # the second store finds the monitor cleared
++    ['ldxp x4, x5, [x0]; ldxp x6, x7, [x2]; stxp w2, x4, x5, [x0]', 'ldxp x4, x5, [x0, #0]; mov x6, x5; mov x5, x4; mov x4, x6; stxp w2, x4, x5, [x0]'])
++NARROW = [f'{op} {a}' for op in ('sqxtn', 'uqxtn', 'sqxtun') for a in ('v0.8b, v1.8h', 'v0.4h, v1.4s', 'v0.2s, v1.2d', 'b0, h1', 'h0, s1', 's0, d1')] + \
++         [f'{op}2 {a}' for op in ('sqxtn', 'uqxtn', 'sqxtun') for a in ('v0.16b, v1.8h', 'v0.8h, v1.4s', 'v0.4s, v1.2d', 'v7.16b, v7.8h')]
++RECIP = ['frecpe s0, s1', 'frecpe d0, d1', 'frecpe v0.2s, v1.2s', 'frecpe v0.4s, v1.4s', 'frecpe v0.2d, v1.2d', 'frecpx s0, s1', 'frecpx d0, d1']
++CCMN = [f'ccmn {r}3, {r}4, #{n}, {c}' for r in 'xw' for n in (0, 5, 10, 15) for c in ('eq', 'ne', 'lt', 'hi')] + ['ccmn x3, x3, #2, al', 'ccmn w3, w3, #9, nv']
++
++
++HALF = ['fcvt s0, h1', 'fcvt d0, h1', 'fcvt h0, s1', 'fcvt h0, d1', 'fcvtn v0.4h, v1.4s', 'fcvtn2 v0.8h, v1.4s', 'fcvtl v0.4s, v1.4h', 'fcvtl2 v0.4s, v1.8h', 'fcvtn v3.4h, v3.4s', 'fcvtl v4.4s, v4.4h']
+ A_BHS = ['8b', '16b', '4h', '8h', '2s', '4s']; A_ALL = A_BHS + ['2d']; A_HS = ['4h', '8h', '2s', '4s']; A_B = ['8b', '16b']
+ def three(op, arrs, regs='v0, v1, v2'): return [f'{op} v0.{a}, v1.{a}, v2.{a}' for a in arrs]
+ NEON_INT = (   # batch 4: integer NEON (the instructions Balatro uses most: shifts, permutes, compares, saturating and halving arithmetic, moves between elements, tables, widening)
+@@ -350,5 +369,62 @@ class Batch(unittest.TestCase):
+ 
+     def test_exclusives_batch(self): self.check('excl', EXCL, nan_free=False)
+ 
++    def test_half_precision_conversions_equal_unicorn_values_and_flags_in_every_rounding_mode(self):
++        """fcvt, fcvtn and fcvtl between half and single or double: the bit patterns around every boundary (largest half, the overflow tie, smallest denormal and the tie below it, smallest normal, rounding ties,
++        NaNs, infinities, zeros), random bits, and the four FPCR rounding modes. Values and the FPSR flags (invalid, overflow, underflow, inexact) must equal Unicorn's"""
++        h = Harness(HALF, self.tmp.name); self.groups['half'] = h
++        self.assertEqual(h.unlifted, {})
++        rng = random.Random('half')
++        singles = [0, 0x80000000, 0x3F800000, 0xBF800000, 0x477FE000, 0x477FEFFF, 0x477FF000, 0x477FF001, 0x47800000, 0x7F7FFFFF, 0x7F800000, 0xFF800000, 0x7FC00000, 0x7F800001, 0xFFA00000, 0x7FC01234,
++                   0x38800000, 0x387FC000, 0x387FE000, 0x387FFFFF, 0x33800000, 0x33000000, 0x33000001, 0x337FFFFF, 0x33C00000, 0x00000001, 0x007FFFFF, 0x3F801000, 0x3F803000, 0x3F800FFF, 0x3F801001, 0xB3000000, 0xB8000001]
++        doubles = [0, 1 << 63, 0x3FF0000000000000, 0x40EFFC0000000000, 0x40EFFE0000000000, 0x40EFFE0000000001, 0x40F0000000000000, 0x7FEFFFFFFFFFFFFF, 0x7FF0000000000000, 0xFFF0000000000000, 0x7FF8000000000000, 0x7FF0000000000001,
++                   0x3E70000000000000, 0x3E60000000000000, 0x3E60000000000001, 0x3F10000000000000, 0x3F0FFFFFFFFFFFFF, 0x0000000000000001, 0x000FFFFFFFFFFFFF, 0x3FF0020000000000, 0x3FF0060000000000]
++        halves = [0, 0x8000, 0x3C00, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0x7C01, 0xFE00, 0x0001, 0x03FF, 0x0400, 0x83FF, 0x5555, 0xAAAA, 0xFFFF]
++        report = []
++        for i, line in enumerate(HALF):
++            cases = []
++            for mode in range(4):
++                for k in range(120):
++                    if k < len(singles) + len(doubles):
++                        lanes = [(singles[k] if k < len(singles) else rng.choice(singles)) for _ in range(4)]
++                        lanes[k % 4] = singles[k % len(singles)]
++                        dbl = doubles[k - len(singles)] if k >= len(singles) else rng.choice(doubles)
++                        v1 = sum(l << (32 * j) for j, l in enumerate(lanes)) if line.endswith(('4s', 's1', 'h1')) and 'd0, h1' not in line and 'h0, d1' not in line else dbl | dbl << 64
++                        if 'h1' in line or '4h' in line or '8h' in line: v1 = sum((halves[(k + j) % len(halves)] if k < len(halves) * 2 else rng.getrandbits(16)) << (16 * j) for j in range(8))
++                    else:
++                        v1 = rng.getrandbits(128)
++                    cases.append(({'x0': DATA}, 0, {f'v{n}': v1 if n in (1, 3, 4) else 0 for n in range(32)}, mode << 22))
++            eq, diffs, fpsr = h.compare(i, cases)
++            if diffs or fpsr: report.append(f'{line}: {len(diffs)} values differ ({diffs[:1]}), {len(fpsr)} flag words differ ({fpsr[:2]})')
++        self.assertEqual(report, [], '\n' + '\n'.join(r[:300] for r in report))
++
++    def test_pair_exclusives_equal_unicorn(self): self.check('pairs', PAIRS, cases=40, nan_free=False)
++
++    def test_register_form_ccmn_equals_unicorn(self): self.check('ccmn', CCMN, cases=60, nan_free=False)
++
++    def test_saturating_narrows_equal_unicorn_values_and_the_saturation_flag(self):
++        h = Harness(NARROW, self.tmp.name); self.groups['narrow'] = h
++        self.assertEqual(h.unlifted, {})
++        rng = random.Random('narrow'); report = []
++        edges = [0, 1, MASK, 0x7FFF, 0x8000, 0xFF, 0x100, 0x7F, 0x80, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x100000000, 0x7FFFFFFFFFFFFFFF, 0x8000000000000000, 0x00FF00FF00FF00FF, 0x0080007F00800081]
++        for i, line in enumerate(NARROW):
++            cases = [({'x0': DATA}, rng.randrange(16), {f'v{k}': (rng.choice(edges + [rng.getrandbits(64)])) | rng.choice(edges + [rng.getrandbits(64)]) << 64 for k in range(32)}) for _ in range(150)]
++            eq, diffs, fpsr = h.compare(i, cases)
++            if diffs or fpsr: report.append(f'{line}: {len(diffs)} values differ ({diffs[:1]}), {len(fpsr)} flag words differ ({fpsr[:1]})')
++        self.assertEqual(report, [])
++
++    def test_frecpe_and_frecpx_equal_unicorn_values_and_flags(self):
++        h = Harness(RECIP, self.tmp.name); self.groups['recip'] = h
++        self.assertEqual(h.unlifted, {})
++        rng = random.Random('recip')
++        special = [0, 1 << 63, 0x7F800000, 0xFF800000, 0x7FC00000, 0x7F800001, 0xFFC00000, 1, 0x007FFFFF, 0x00400000, 0x00200000, 0x001FFFFF, 0x80200000, 0x80000001, 0x3F800000, 0x40800000, 0x7F7FFFFF, 0x7F000000, 0x7E800000, 0x7E7FFFFF,
++                   0x7FF0000000000000, 0xFFF0000000000000, 0x7FF8000000000000, 0x7FF0000000000001, 0x000FFFFFFFFFFFFF, 0x0008000000000000, 0x0004000000000000, 0x0003FFFFFFFFFFFF, 0x3FF0000000000000, 0x7FEFFFFFFFFFFFFF, 0x7FE0000000000000, 0x4010000000000000]
++        for i, line in enumerate(RECIP):
++            cases = []
++            for bits in special + [rng.getrandbits(64) for _ in range(300)] + [(rng.getrandbits(32) & 0x7FFFFFFF) | (rng.getrandbits(32) & 0x7FFFFFFF) << 32 for _ in range(200)] + [rng.getrandbits(23) | rng.getrandbits(23) << 32 for _ in range(100)]:
++                cases.append(({'x0': DATA}, 0, {f'v{k}': (bits | rng.getrandbits(64) << 64) if k == 1 else 0 for k in range(32)}))
++            eq, diffs, fpsr = h.compare(i, cases)
++            self.assertEqual((diffs[:2], fpsr[:2]), ([], []), line)
++
+ 
+ if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_aot_stub.py b/dm/tools/tests/test_aot_stub.py
+index e24826fa..8f6b7b10 100644
+--- a/dm/tools/tests/test_aot_stub.py
++++ b/dm/tools/tests/test_aot_stub.py
+@@ -17,13 +17,13 @@ from test_aot_t3 import MEM, SP, READY, same
+ 
+ READY = READY and os.path.exists(os.path.join(os.environ.get('DYNARMIC_DIR', '/nonexistent'), 'build/src/dynarmic/libdynarmic.a'))
+ RET = aot_lift.RET
+-G, F, D, P = 0x100, 0x200, 0x500, 0x600   # G: not liftable (ccmn, register form); F calls G; D: fadd, which lifts but needs runtime symbols; P calls D
++G, F, D, P = 0x100, 0x200, 0x500, 0x600   # G: not liftable (cls, count leading sign bits); F calls G; D: fadd, which lifts but needs runtime symbols; P calls D
+ 
+ 
+ def code():
+     img = bytearray(0x1000)
+     def put(at, ws): img[at:at + 4 * len(ws)] = struct.pack('<%dI' % len(ws), *ws)
+-    put(G, [0xBA408000, fx.ADDR(0, 0, 1), 0x9A9F57E2, RET])                     # ccmn x0, x1, #0, hi ; add x0, x0, x1 ; cset x2, mi
++    put(G, [0xDAC01403, fx.ADDR(0, 0, 1), 0x9A9F57E2, RET])                     # cls x3, x0 ; add x0, x0, x1 ; cset x2, mi
+     put(F, [STP_PRE(29, 30, 31, -16), fx.BL(F + 4, G), LDP_POST(29, 30, 31, 16), RET])
+     put(D, [0x1E612800, RET])                                                  # fadd d0, d0, d1
+     put(P, [STP_PRE(29, 30, 31, -16), fx.BL(P + 4, D), LDP_POST(29, 30, 31, 16), RET])
+@@ -58,15 +58,15 @@ def mapped(a):
+ @unittest.skipUnless(READY, 'needs REMILL_BUILD, DYNARMIC_DIR, clang++ and unicorn')
+ class Stub(unittest.TestCase):
+     def test_by_default_it_is_an_explicit_error(self):
+-        with self.assertRaisesRegex(aot_lift.LiftError, 'ccmn'): aot_lift.Aot([fn(F, 4), fn(G, 4)])
++        with self.assertRaisesRegex(aot_lift.LiftError, 'cls'): aot_lift.Aot([fn(F, 4), fn(G, 4)])
+         with self.assertRaisesRegex(aot_lift.LinkError, 'sub_100'): aot_lift.Aot([fn(F, 4)])
+ 
+     def test_without_jit_it_stops_naming_the_function_and_the_reason(self):
+         a = mapped(aot_lift.Aot([fn(F, 4), fn(G, 4)], stub_unliftable=True))
+         try:
+-            self.assertEqual(list(a.unlifted), [G]); self.assertIn('ccmn', a.unlifted[G])
++            self.assertEqual(list(a.unlifted), [G]); self.assertIn('cls', a.unlifted[G])
+             r = a.run(F, {'x0': 1, 'x1': 2, 'x30': ref.STOP}, 0, SP)
+-            self.assertIn('0x100', r['fault']); self.assertIn('not translated', r['fault']); self.assertIn('ccmn', r['fault'])
++            self.assertIn('0x100', r['fault']); self.assertIn('not translated', r['fault']); self.assertIn('cls', r['fault'])
+             self.assertEqual(a.stat('unlifted_calls'), 1)
+         finally: a.close()
+ 
+diff --git a/dm/tools/tests/test_elf_module.py b/dm/tools/tests/test_elf_module.py
+index a04dbd83..d8c73123 100644
+--- a/dm/tools/tests/test_elf_module.py
++++ b/dm/tools/tests/test_elf_module.py
+@@ -211,7 +211,7 @@ class LoadingWithJit(unittest.TestCase):
+             aot = ms.build(jit=True)
+             try:
+                 entry = ms.symbol('c_main')
+-                self.assertEqual(list(aot.unlifted), [entry]); self.assertIn('ccmn', aot.unlifted[entry])
++                self.assertEqual(list(aot.unlifted), [entry]); self.assertIn('cls', aot.unlifted[entry])
+                 cases = [{'x0': x, 'x1': y} for x in (0, 5, M) for y in (0, 1, 1 << 63)]
+                 for regs, w in zip(cases, reference(ms, entry, cases)):
+                     aot.reset(); same(self, ms.call('c_main', regs), w, f'{regs}')
+diff --git a/dm/tools/tests/test_lift_coverage.py b/dm/tools/tests/test_lift_coverage.py
+new file mode 100644
+index 00000000..efd845fe
+--- /dev/null
++++ b/dm/tools/tests/test_lift_coverage.py
+@@ -0,0 +1,46 @@
++"""lift_coverage.py (NX2Linux Phase 2, #16): the table of instruction families is well formed, every form assembles, and the table prints. The lifting itself is measured by the tool and checked by test_aot_simd.py.
++Needs aarch64-linux-gnu-as; skipped otherwise."""
++import shutil, sys, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import lift_coverage as lc
++
++AS = shutil.which('aarch64-linux-gnu-as')
++# forms the assembler (binutils) does not know with the options the tool uses: none today
++KNOWN_REFUSED = set()
++
++
++class Table(unittest.TestCase):
++    def test_families_are_named_described_and_free_of_duplicates(self):
++        seen = set()
++        for name, (what, lines) in lc.FAMILIES.items():
++            self.assertTrue(what and lines, name)
++            for l in lines:
++                self.assertNotIn(l, seen, f'{l} is listed twice'); seen.add(l)
++                self.assertNotIn(';', l, 'one instruction per line: the tool lifts each line as one function')
++
++    def test_the_families_of_the_issue_are_there(self):
++        for want in ('pair-exclusives', 'lse-atomics', 'saturating-narrow', 'reciprocal-estimate', 'half-conversion', 'half-arithmetic', 'ccmn'):
++            self.assertIn(want, lc.FAMILIES)
++
++    def test_the_table_counts_each_result(self):
++        res = {'a': [('x', 'lifted', ''), ('y', 'jit', 'why'), ('z', 'refused', '')]}
++        with unittest.mock.patch.dict(lc.FAMILIES, {'a': ('what', ['x', 'y', 'z'])}):
++            out = lc.table(res)
++        self.assertRegex(out, r'a\s+3\s+1\s+1\s+1\s+what'); self.assertRegex(out, r'total\s+3\s+1\s+1\s+1')
++
++    @unittest.skipUnless(AS, 'needs aarch64-linux-gnu-as')
++    def test_every_form_assembles(self):
++        bad = [(l, why) for _, (_, lines) in lc.FAMILIES.items() for l in lines for ok, why in [lc.assembles(l)] if not ok and l not in KNOWN_REFUSED]
++        self.assertEqual(bad, [])
++
++    @unittest.skipUnless(AS, 'needs aarch64-linux-gnu-as')
++    def test_the_assembler_refusing_a_form_is_reported_as_refused_not_as_a_lifting_gap(self):
++        self.assertFalse(lc.assembles('notaninstruction x0')[0]); self.assertTrue(lc.assembles('nop')[0])
++
++
++import unittest.mock  # noqa: E402  (used by the test above)
++
++if __name__ == '__main__': unittest.main()

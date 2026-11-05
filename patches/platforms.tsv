@@ -101,6 +101,7 @@ file	class	note
 0120-linux-host-horizon-run-report-json-and-aot-repor.patch	linux	Runner option and report tool
 0121-linux-host-horizon-records-the-calls-that-make-m.patch	linux	Horizon bookkeeping, report fields and tests
 0122-linux-host-validate-game-py-runs-every-module-va.patch	linux	Validation driver, tools only
+0123-linux-host-the-runtime-s-128-bit-compare-and-swa.patch	linux	Runtime CAS and tests for the Remill 0010 instructions
 0124-linux-host-aot-cost-py-measures-what-a-recompile.patch	linux	Measurement tool, nothing in the build changes
 0125-linux-host-aot-lift-lifts-the-functions-a-build.patch	linux	Linux AOT lift, needs Remill patch 0011 (fork-only)
 0126-linux-host-aot-cost-cache-stats-names-the-caches.patch	linux	Measurement tool, nothing in the build changes
