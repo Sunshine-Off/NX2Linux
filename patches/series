@@ -97,3 +97,4 @@
 0116-linux-host-horizon-run-build-only-recompiles-int.patch
 0117-linux-host-an-empty-module-folder-is-a-red-line.patch
 0118-linux-host-aot-cost-py-measures-what-a-recompile.patch
+0119-linux-host-aot-lift-lifts-the-functions-a-build.patch

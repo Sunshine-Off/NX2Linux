@@ -1,0 +1,137 @@
+From 160ba6dffb0cbdd577856e0e824c6a5d5e47e1f4 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 21:11:42 +0100
+Subject: [PATCH] remill-lift: --batch lifts many functions in one process
+
+The architecture semantics take most of the time of a run (about 85 ms of
+a 90 ms lift). With --batch FILE they are loaded once and each request,
+one per line as ADDRESS ENTRY_ADDRESS HEX_BYTES IR_OUT, is lifted by a
+forked copy of the process, so it starts from the same untouched state
+as a run of its own and gives the same IR. The parent prints one line
+per request, ok N or fail N STATUS.
+---
+ bin/lift/Lift.cpp | 87 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 86 insertions(+), 1 deletion(-)
+
+diff --git a/bin/lift/Lift.cpp b/bin/lift/Lift.cpp
+index 96ea713..b75ad39 100644
+--- a/bin/lift/Lift.cpp
++++ b/bin/lift/Lift.cpp
+@@ -52,6 +52,9 @@
+ #include <string>
+ #include <system_error>
+ 
++#include <sys/wait.h>
++#include <unistd.h>
++
+ DEFINE_string(os, REMILL_OS,
+               "Operating system name of the code being "
+               "translated. Valid OSes: linux, macos, windows, solaris.");
+@@ -75,6 +78,13 @@ DEFINE_string(
+     ir_pre_out, "",
+     "Path to the file where the LLVM IR (before optimization) should be saved");
+ 
++DEFINE_string(
++    batch, "",
++    "Lift many functions in one process. Path of a file with one request per line: "
++    "ADDRESS ENTRY_ADDRESS HEX_BYTES IR_OUT, in hexadecimal, ENTRY_ADDRESS being - for \"the "
++    "address\". The architecture semantics are loaded once and each request is lifted by a "
++    "forked copy of this process, so it starts from the same untouched state as a run of its "
++    "own and gives the same IR. One line per request on stdout: \"ok N\" or \"fail N STATUS\".");
+ DEFINE_string(ir_out, "", "Path to file where the LLVM IR should be saved.");
+ DEFINE_string(bc_out, "",
+               "Path to file where the LLVM bitcode should be "
+@@ -298,7 +308,7 @@ int main(int argc, char *argv[]) {
+   google::InitGoogleLogging(argv[0]);
+ 
+ 
+-  if (FLAGS_bytes.empty()) {
++  if (FLAGS_bytes.empty() && FLAGS_batch.empty()) {
+     std::cerr << "Please specify a sequence of hex bytes to -bytes."
+               << std::endl;
+     return EXIT_FAILURE;
+@@ -347,6 +357,81 @@ int main(int argc, char *argv[]) {
+ 
+   std::unique_ptr<llvm::Module> module(remill::LoadArchSemantics(arch.get()));
+ 
++  // Batch mode: the semantics above took most of the time of a run, so they are loaded once and
++  // every request is lifted by a forked child that carries on with the code below as a run of
++  // its own would. The parent only starts the children, one after the other.
++  if (!FLAGS_batch.empty()) {
++    std::ifstream requests(FLAGS_batch);
++    if (!requests) {
++      std::cerr << "Cannot read the batch file " << FLAGS_batch << std::endl;
++      return EXIT_FAILURE;
++    }
++    bool in_child = false;
++    bool all_ok = true;
++    uint64_t number = 0;
++    std::string line;
++    while (!in_child && std::getline(requests, line)) {
++      if (line.empty()) {
++        continue;
++      }
++      ++number;
++      std::istringstream fields(line);
++      std::string address, entry, hex, out;
++      if (!(fields >> address >> entry >> hex >> out)) {
++        std::cout << "fail " << number << " malformed" << std::endl;
++        all_ok = false;
++        continue;
++      }
++      char *end = nullptr;
++      const uint64_t request_address = strtoull(address.c_str(), &end, 16);
++      bool good = *end == '\0' && !address.empty();
++      uint64_t request_entry = request_address;
++      if (entry != "-") {
++        request_entry = strtoull(entry.c_str(), &end, 16);
++        good = good && *end == '\0';
++      }
++      if (!good || hex.size() % 2 || hex.empty() ||
++          request_address != (request_address & addr_mask) ||
++          request_entry != (request_entry & addr_mask)) {
++        std::cout << "fail " << number << " malformed" << std::endl;
++        all_ok = false;
++        continue;
++      }
++      std::cout.flush();
++      std::cerr.flush();
++      const pid_t child = fork();
++      if (child < 0) {
++        std::cout << "fail " << number << " fork" << std::endl;
++        return EXIT_FAILURE;
++      }
++      if (child == 0) {
++        FLAGS_address = request_address;
++        FLAGS_entry_address = request_entry;
++        FLAGS_bytes = hex;
++        FLAGS_ir_out = out;
++        in_child = true;
++        continue;
++      }
++      int status = 0;
++      if (waitpid(child, &status, 0) < 0) {
++        std::cout << "fail " << number << " wait" << std::endl;
++        return EXIT_FAILURE;
++      }
++      if (WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS) {
++        std::cout << "ok " << number << std::endl;
++      } else {
++        std::cout << "fail " << number << " "
++                  << (WIFSIGNALED(status) ? 128 + WTERMSIG(status)
++                                          : WEXITSTATUS(status))
++                  << std::endl;
++        all_ok = false;
++      }
++    }
++    if (!in_child) {
++      return all_ok ? EXIT_SUCCESS : EXIT_FAILURE;
++    }
++  }
++
+   const auto mem_ptr_type = arch->MemoryPointerType();
+ 
+   Memory memory = UnhexlifyInputBytes(addr_mask);
+-- 
+2.56.0
+

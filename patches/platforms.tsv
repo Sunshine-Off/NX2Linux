@@ -97,3 +97,4 @@ file	class	note
 0116-linux-host-horizon-run-build-only-recompiles-int.patch	linux	Linux runner option
 0117-linux-host-an-empty-module-folder-is-a-red-line.patch	linux	Linux runner and loader messages
 0118-linux-host-aot-cost-py-measures-what-a-recompile.patch	linux	Measurement tool, nothing in the build changes
+0119-linux-host-aot-lift-lifts-the-functions-a-build.patch	linux	Linux AOT lift, needs Remill patch 0011 (fork-only)

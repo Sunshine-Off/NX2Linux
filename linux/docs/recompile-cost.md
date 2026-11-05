@@ -1,8 +1,7 @@
 # Reducing the cost of recompiling a game (issue #18)
 
 A cold build of Xenoblade 2 is about 98,000 objects, about 12 GB of cache and 1,430 to 1,541 s on 16 cores (`S8` section 10, `S9` section 7).
-The code is derived from the game and cannot be shipped, so every user pays it. Nothing was implemented for this issue yet: this page measures,
-proposes, and waits for a choice. The measuring tool is `engine/dm/tools/aot_cost.py`.
+The code is derived from the game and cannot be shipped, so every user pays it. Option E below is implemented and measured. D waits for the numbers of `cache-stats` and B for them too. The measuring tool is `engine/dm/tools/aot_cost.py`.
 
 ## What was measured, on code that is not the game's
 
@@ -42,10 +41,30 @@ It may also be that part of the 12 GB is not objects (the finished libraries kep
 | C | thin LTO | none: larger objects | high link time on 100,000 functions. Not recommended |
 | F | lift only what is reached, the rest in the JIT | large | high: it gives up the static recompilation. Not recommended, and #14 and #17 are the measurements that would say how much the JIT can carry |
 
+## Option E is implemented: one lifter process for many functions
+
+`remill-lift --batch FILE` (Remill patch 0011) loads the architecture semantics once, then lifts each request of the file in a forked copy of itself.
+A request is one line, `ADDRESS ENTRY_ADDRESS HEX_BYTES IR_OUT` in hexadecimal, and the answer is one line per request on standard output, `ok N` or `fail N STATUS`.
+A forked child starts from the same untouched state as a run of its own, so the IR is the same byte for byte (the test compares the cached objects of both ways).
+`aot_lift.Aot` hands the functions the cache lacks to the lifter 32 at a time (`LIFT_BATCH`), one process per group, groups spread over the pool.
+A function the batch could not do (too long for the command-line cap, refused, or any failure) is lifted again alone, which gives the error a single run gives.
+`AOT_LIFT_BATCH=0` turns it off. A Remill built before patch 0011 is detected on first use (it says it does not know `--batch`) and the build goes on one process per function.
+The cache keys do not change because of this. They change anyway when Remill is rebuilt with the patch, since the key holds the hash of the `remill-lift` binary.
+
+Measured here on the generated corpus, a cold build of 400 functions with `Aot(..., cache=..., jobs=14)`, lift, compile and link included, run twice each:
+
+| | wall time | CPU time of the child processes |
+|---|---|---|
+| `AOT_LIFT_BATCH=0` (one process per function) | 6.1 s and 6.2 s | 68.0 s and 68.4 s |
+| default (32 per process) | 3.2 s and 3.2 s | 31.6 s and 31.6 s |
+
+The CPU time is cut by 54% and the time by 48% on this corpus, whose functions are small (90 bytes on average), so the compile is a small part. **On the game the share is smaller**, because the functions are larger and the compile and link weigh more. The deduced figure of 39% of a cold build stands as the estimate, and the first cold build on the game will tell. It is not measured on the game.
+
 ## My recommendation, to be confirmed
 
+0. **E is done** (above).
 1. **Run `cache-stats` on your real cache first** (read-only, a minute): it says what the 12 GB are, which decides between B, D and nothing for the disk.
-2. **E** for the time. It is the only option with a large gain on the time, and the cost is one Remill patch and one recompilation of every game.
+2. ~~E~~ done. Its cost is one Remill rebuild and one recompilation of every game, which patch 0010 of #16 asks for anyway.
 3. **D**, then **B** only if `cache-stats` shows that the objects are small. Drop A and C.
 
 ## The command to run on your cache
