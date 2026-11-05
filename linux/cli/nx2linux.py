@@ -355,6 +355,11 @@ def parser() -> argparse.ArgumentParser:
     san.add_argument('--leaks', action='store_true', help='also detect leaks (noisy: the drivers and Python leak at exit)')
     san.add_argument('--timeout', type=int, default=1800, help='seconds allowed to each case')
 
+    prune = sub.add_parser('cache-prune', help='list, and with --delete remove, the old finished libraries of an AOT cache (the objects are never touched)')
+    prune.add_argument('cache', help='an AOT cache folder, the one given as --cache or AOT_CACHE, with obj/ and lib/ inside')
+    prune.add_argument('--keep', type=int, default=2, help='how many of the newest libraries to keep (default 2)')
+    prune.add_argument('--delete', action='store_true', help='remove them: without it the command only lists what it would remove')
+
     ext = sub.add_parser('extract', help='extract a game package into the XDG cache (needs dotnet and your prod.keys)')
     ext.add_argument('nsp', help='the .nsp of the game')
     ext.add_argument('--keys', required=True, help='prod.keys, or the folder that holds it')
@@ -389,6 +394,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == 'sanitize':
         import nx2linux_sanitize
         return nx2linux_sanitize.run(args, ROOT, worker_python())
+    if args.command == 'cache-prune':
+        import nx2linux_cache
+        return nx2linux_cache.run(args)
     if args.command == 'extract':
         return extract(args)
     if args.command == 'survey':

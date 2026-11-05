@@ -68,6 +68,35 @@ Measured here on the generated corpus, a cold build of 400 functions with `Aot(.
 
 The CPU time is cut by 54% and the time by 48% on this corpus, whose functions are small (90 bytes on average), so the compile is a small part. **On the game the share is smaller**, because the functions are larger and the compile and link weigh more. The deduced figure of 39% of a cold build stands as the estimate, and the first cold build on the game will tell. It is not measured on the game.
 
+## Measured on Xenoblade 2 (a run by the team on its machine)
+
+`cache-stats` on the largest cache (`aot-cache`, 622,259 objects) and a cold `--jit` build of the whole game with the Remill of patches 0010 and 0011:
+
+| What | Figure |
+|---|---|
+| Cold build of XC2 (103,665 functions, 103,010 lifted, 655 replaced by the host, 0 left to the JIT) | **861 s**, against 1,430 to 1,541 s noted before. The Remill, the patches and the function count differ, so the gain is consistent with option E (deduced 39%) but not proved by it. `AOT_LIFT_BATCH=0` on the same build would isolate it |
+| Disk of that cold build | **1.3 GB** (1.1 GB of objects, 244 MB of library), not 12 GB |
+| Objects of `aot-cache` | 4,392 bytes on average, 2,040 at the median, 8,016 at the 90th percentile, 41,592 at the 99th. 2.7 GB of content but 6.3 GB on disk, because each small file takes at least one 4 KB block |
+| Libraries of `aot-cache` | 36 finished libraries, 8.6 GB. This is the biggest part of the cache |
+| Inside an object | code 51%, relocations 22%, headers 13%, symbols 12%, unwind 1.6% |
+| zstd 3 on 500 objects | 3.2 times smaller one at a time, 5.4 times smaller in one stream. xz 1: 6.6 times |
+
+What this changes:
+
+1. **Compressing each object alone (option D as written) gains nothing on disk.** A compressed object of 1.4 KB still takes a 4 KB block. Only a pack of many objects would gain from compression.
+2. **The old libraries are the real cost.** 34 of the 36 libraries of `aot-cache` (8.1 GB) are older builds. `nx2linux.py cache-prune` lists them and removes them on request (below).
+3. **Packing the objects (option B) would give back the wasted blocks** (about 3.5 GB in `aot-cache`) and make compression useful. It is not done.
+
+## Removing the old libraries
+
+```sh
+python3 linux/cli/nx2linux.py cache-prune ~/.cache/nx2linux/aot-cache              # lists, removes nothing
+python3 linux/cli/nx2linux.py cache-prune ~/.cache/nx2linux/aot-cache --delete     # removes
+```
+
+It keeps the 2 newest libraries (`--keep N` changes that) and removes the older ones with their `.json`. It only touches files named like a build key and never a link, and it never touches `obj/`.
+A removed library costs one relink from the objects the next time that build runs, never a new lift or compile.
+
 ## My recommendation, to be confirmed
 
 0. **E is done** (above).
