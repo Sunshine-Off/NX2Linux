@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 18:08:01 +0100
+Subject: [PATCH] Linux host: an empty module folder is a red line, and the
+ fixture can set the NPDM flags
+
+Upstream-Status: fork-only
+Reason: A missing module manifest stops horizon_run with one red line instead of a traceback
+Issue: Sunshine-Off/NX2Linux#9
+
+---
+ dm/tools/elf_module.py                |  1 +
+ dm/tools/horizon_run.py               |  6 +++++-
+ dm/tools/tests/nsp_fixture.py         |  4 ++--
+ dm/tools/tests/test_linux_failures.py | 11 +++++++++++
+ 4 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/dm/tools/elf_module.py b/dm/tools/elf_module.py
+index 9fe743b..cc3b014 100644
+--- a/dm/tools/elf_module.py
++++ b/dm/tools/elf_module.py
+@@ -229,6 +229,7 @@ class ModuleSet:
+     def __init__(self, manifests, hle=None, base=BASE):
+         """manifests: paths of `<name>.manifest.json` in load order. hle: {symbol name: fn(regs) or None}, the host functions an import can reach; fn gets x0..x30 as a list and changes it in place"""
+         self.hle, self.modules, self.imports, self.aot = dict(hle or {}), [], {}, None
++        if not manifests: raise ModuleError('no module to load: the folder holds no <name>.manifest.json (nx2linux build makes them from a game package)')
+         for p in manifests:
+             m, data = load_manifest(p)
+             if any(x.name == m['name'] for x in self.modules): raise ModuleError(f'module {m["name"]} loaded twice')
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 5d107bf..dc2767b 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -30,7 +30,11 @@ def main():
+     if not game.known: print(f'[profile] no profile dm/games/{game.id}: generic Horizon defaults, modules {",".join(order)} (set DM_GAMES_DIR for a profile outside the repository)', flush=True)
+     else: print(f'[profile] {game.name}: modules {",".join(order)}', flush=True)
+     mods = [f'{a.modules}/{n}.manifest.json' for n in order]
+-    ms = em.ModuleSet(mods, {})
++    missing = [m for m in mods if not Path(m).is_file()]
++    try:
++        if missing: raise em.ModuleError('module manifest not found: ' + ', '.join(missing))
++        ms = em.ModuleSet(mods, {})
++    except em.ModuleError as e: sys.exit(f'[RED] {e}')
+     hz = horizon_hle.Horizon(ms, verbose=a.verbose, romfs=a.romfs, title_id=a.title, game=game)
+     ovr = horizon_overrides.install(hz)
+     if not a.no_profile: ovr.update(horizon_overrides.install_profile(hz, game.workarounds()))
+diff --git a/dm/tools/tests/nsp_fixture.py b/dm/tools/tests/nsp_fixture.py
+index ccd6786..3fe5f41 100644
+--- a/dm/tools/tests/nsp_fixture.py
++++ b/dm/tools/tests/nsp_fixture.py
+@@ -240,7 +240,7 @@ class Package:
+         self.nacp_name, self.display_version, self.icon = GAME_NAME, DISPLAY_VERSION, None
+ 
+ 
+-def make(out_dir, kind='nsp', seed=7):
++def make(out_dir, kind='nsp', seed=7, npdm_flags=0x3f):
+     """Write <out_dir>/fixture.<kind> (nsp or xci) and <out_dir>/prod.keys; returns a Package"""
+     rng = random.Random(seed)
+     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+@@ -249,7 +249,7 @@ def make(out_dir, kind='nsp', seed=7):
+     pkg = Package(); pkg.keys = out / 'prod.keys'
+     import module_fixture as mf   # an NSO the loader tests already build: the package's `main` is a module the next stage can convert
+     main_nso, _ = mf.build(mf.module_a())
+-    pkg.exefs = {'main': main_nso, 'main.npdm': b'META' + bytes(8) + b'\x3f' + rng.randbytes(0x200), 'rtld': b'NSO0' + rng.randbytes(0x100)}
++    pkg.exefs = {'main': main_nso, 'main.npdm': b'META' + bytes(8) + bytes([npdm_flags]) + rng.randbytes(0x200), 'rtld': b'NSO0' + rng.randbytes(0x100)}
+     pkg.romfs = {'readme.txt': b'a fixture, not a game\n', 'Data/table.bin': rng.randbytes(0x9000), 'Data/deep/one.bin': rng.randbytes(77), 'Movie/empty.bin': b''}
+     pkg.icon = b'\xff\xd8\xff\xe0' + rng.randbytes(300) + b'\xff\xd9'
+     nacp = bytearray(0x4000); nacp[:len(GAME_NAME)] = GAME_NAME.encode(); nacp[0x200:0x206] = b'Nobody'
+diff --git a/dm/tools/tests/test_linux_failures.py b/dm/tools/tests/test_linux_failures.py
+index d699bed..6c4bac2 100644
+--- a/dm/tools/tests/test_linux_failures.py
++++ b/dm/tools/tests/test_linux_failures.py
+@@ -108,6 +108,17 @@ class MissingProfile(unittest.TestCase):
+         self.assertTrue(first.startswith('[profile] no profile dm/games/0000000000000001: generic Horizon defaults'), r.stdout + r.stderr)
+         self.assertIn('DM_GAMES_DIR', first)   # and says where a profile can come from
+ 
++    def test_an_empty_module_folder_is_one_red_line_not_a_traceback(self):
++        with tempfile.TemporaryDirectory() as d:
++            r = subprocess.run([sys.executable, '-I', str(TOOLS / 'horizon_run.py'), '--modules', d, '--title', '0000000000000001', '--seconds', '1'],
++                               capture_output=True, text=True, timeout=120)
++        self.assertEqual(r.returncode, 1)
++        self.assertNotIn('Traceback', r.stderr)
++        self.assertIn('[RED] module manifest not found', r.stderr)
++
++    def test_a_module_set_with_no_manifest_says_so(self):
++        with self.assertRaisesRegex(em.ModuleError, 'no module to load'): em.ModuleSet([], {})
++
+ 
+ if __name__ == '__main__':
+     unittest.main()

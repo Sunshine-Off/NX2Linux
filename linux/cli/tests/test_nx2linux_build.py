@@ -79,6 +79,13 @@ class Pipeline(unittest.TestCase):
         events = [json.loads(l) for l in text.splitlines() if l.startswith('{')]
         self.assertEqual([e['step'] for e in events if e['status'] == 'done'], ['check', 'extract', 'modules', 'manifest'])
 
+    def test_a_32_bit_program_is_refused(self):
+        out = self.tmp / 'g32'
+        pkg32 = fx.make(self.tmp / 'pkg32', 'nsp', npdm_flags=0x3e)   # the NPDM's 64-bit instruction flag clear
+        rc, text, err = cli('build', str(pkg32.path), '--keys', str(pkg32.keys), '--out', str(out), '--skip-recompile')
+        self.assertEqual(rc, 4, text + err); self.assertIn('32-bit ARM program', err)
+        self.assertFalse((out / f'{fx.TITLE_ID:016x}' / 'modules').exists())
+
     def test_stop_after(self):
         out = self.tmp / 'e'
         rc, text, _ = cli('build', str(self.pkg.path), '--keys', str(self.pkg.keys), '--out', str(out), '--stop-after', 'extract')
