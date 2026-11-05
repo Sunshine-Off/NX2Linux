@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 20:25:30 +0100
+Subject: [PATCH] Linux host: validate_game.py runs every module_validate.py
+ step on a game's modules and prints one table (#15)
+
+coverage, then diff on the leaf functions and on the functions with a jump table (one folder per pass and seed, so
+that the result files do not overwrite each other), with --jit the functions the fallback runs, and the census of
+all modules. A step whose result is in the work folder is skipped. The table adds the passes up and says "not a
+pass" for a mismatch, a timeout, a dead worker, a missing result or a table with no case behind it. The work folder
+must be outside any git repository. Tested without a game: the table and the verdict, the plan, the refusals, and a
+whole run and its resume on synthetic modules.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: One command and one table for the module_validate.py steps on a game's modules, so the XC2 validation is a run and a read
+Issue: Sunshine-Off/NX2Linux#15
+
+---
+ dm/tools/tests/test_validate_game.py | 144 +++++++++++++++++++++++++++
+ dm/tools/validate_game.py            | 139 ++++++++++++++++++++++++++
+ 2 files changed, 283 insertions(+)
+ create mode 100644 dm/tools/tests/test_validate_game.py
+ create mode 100644 dm/tools/validate_game.py
+
+diff --git a/dm/tools/tests/test_validate_game.py b/dm/tools/tests/test_validate_game.py
+new file mode 100644
+index 00000000..54ebbf8f
+--- /dev/null
++++ b/dm/tools/tests/test_validate_game.py
+@@ -0,0 +1,144 @@
++"""validate_game.py (NX2Linux Phase 2, #15): the table and the verdict from the files module_validate.py leaves, the steps it would run, what it refuses, and on a synthetic module the whole run next to Unicorn and
++the resume. No game data. The table and the plan need nothing: the whole run needs REMILL_BUILD, clang++, unicorn and capstone, and is skipped otherwise."""
++import contextlib, io, json, os, subprocess, sys, tempfile, unittest
++from pathlib import Path
++from unittest import mock
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import validate_game as vg
++
++TOOL = HERE.parent / 'validate_game.py'
++try:
++    import capstone  # noqa: F401
++    from test_aot_t3 import READY
++except ImportError: capstone, READY = None, False
++READY = bool(READY and capstone)
++
++
++def row(fn, status, **counts): return dict(function=fn, status=status, cases=sum(counts.values()), detail='', counts=counts)
++
++
++def write(work, sub, module, rows):
++    d = Path(work) / sub; d.mkdir(parents=True, exist_ok=True); (d / f'{module}.diff.json').write_text(json.dumps(rows))
++
++
++def args(**kw):
++    import argparse
++    return argparse.Namespace(**dict(dict(exefs='/x/ExeFS', functions=200, cases=12, seeds=[1], coverage_sample=3000, jit=False), **kw))
++
++
++class Table(unittest.TestCase):
++    def test_equal_functions_with_cases_behind_them_are_a_pass(self):
++        with tempfile.TemporaryDirectory() as d:
++            write(d, 'plain.seed1', 'main', [row('0x1', 'equal', equal=10, **{'both-fault': 2}), row('0x2', 'equal', equal=12), row('0x3', 'inconclusive', **{'both-fault': 12})])
++            write(d, 'switches.seed1', 'main', [row('0x4', 'equal', equal=12, **{'table-jumps': 30})])
++            table, ok = vg.summarize(d, ['main'])
++        self.assertTrue(ok); self.assertIn('| main | 4 | 3 | 0 | 1 |', table); self.assertIn('3 functions identical to Unicorn over 34 cases, 0 cases that differ', table)
++
++    def test_every_way_to_not_pass_is_not_a_pass_and_is_listed(self):
++        for status, extra in (('mismatch', dict(equal=3)), ('timeout', {}), ('worker-died', {})):
++            with self.subTest(status), tempfile.TemporaryDirectory() as d:
++                bad = row('0xdead', status, **extra); bad['detail'] = 'inputs {x0: 5}: differs in [x1]'
++                write(d, 'plain.seed1', 'm', [row('0x1', 'equal', equal=12), bad])
++                table, ok = vg.summarize(d, ['m'])
++                self.assertFalse(ok); self.assertIn('Not a pass', table); self.assertIn(f'm plain.seed1 0xdead: {status}', table)
++
++    def test_cases_that_differ_fail_even_when_the_function_status_says_equal(self):
++        with tempfile.TemporaryDirectory() as d:
++            write(d, 'plain.seed1', 'm', [row('0x1', 'equal', equal=11, **{'fault-differs': 1})])
++            self.assertFalse(vg.summarize(d, ['m'])[1])
++
++    def test_a_table_of_nothing_compared_is_not_a_pass(self):
++        with tempfile.TemporaryDirectory() as d:
++            write(d, 'plain.seed1', 'm', [row('0x1', 'inconclusive', **{'both-fault': 12}), row('0x2', 'unliftable')])
++            table, ok = vg.summarize(d, ['m'])
++        self.assertFalse(ok); self.assertIn('no case was compared', table)
++
++    def test_a_module_with_no_result_and_an_unreadable_file_fail(self):
++        with tempfile.TemporaryDirectory() as d:
++            write(d, 'plain.seed1', 'a', [row('0x1', 'equal', equal=5)])
++            self.assertFalse(vg.summarize(d, ['a', 'b'])[1]); self.assertIn('no diff result', vg.summarize(d, ['a', 'b'])[0])
++            (Path(d) / 'plain.seed1' / 'a.diff.json').write_text('{nope')
++            self.assertFalse(vg.summarize(d, ['a'])[1])
++
++    def test_coverage_and_census_are_added_when_the_files_are_there(self):
++        with tempfile.TemporaryDirectory() as d:
++            write(d, 'plain.seed1', 'm', [row('0x1', 'equal', equal=5)])
++            (Path(d) / 'm.coverage.json').write_text(json.dumps(dict(functions=200, lift=190, unliftable={'0x1': 'x'} | {hex(i): 'y' for i in range(2, 11)})))
++            (Path(d) / 'm.census.json').write_text(json.dumps({'ldxp': dict(count=18, classes=2, example='ldxp x0, x1, [x2]'), 'cls': dict(count=40, classes=1, example='cls x0, x1')}))
++            table, _ = vg.summarize(d, ['m'])
++        self.assertIn('m: 190 of 200 functions lift (95.0%), 10 do not', table); self.assertIn('cls 40, ldxp 18', table)
++
++
++class Plan(unittest.TestCase):
++    def run_main(self, *argv):
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out): code = vg.main(list(argv))
++        return code, out.getvalue()
++
++    def test_the_steps_are_in_the_order_of_the_docstring_for_every_module_and_seed(self):
++        labels = [s[0] for s in vg.steps(['main', 'sdk'], args(seeds=[1, 2], jit=True))]
++        self.assertEqual(labels[0], 'main: coverage')
++        self.assertEqual(labels[1:4], ['main: diff plain, seed 1', 'main: diff switches, seed 1', 'main: diff of the functions run by the JIT, seed 1'])
++        self.assertEqual(len([l for l in labels if 'diff' in l]), 2 * 2 * 3); self.assertTrue(labels[-1].startswith('census of main,sdk'))
++        self.assertFalse(any('JIT' in s[0] for s in vg.steps(['main'], args(jit=False))))
++
++    def test_the_jit_step_asks_for_the_unliftable_functions_and_the_fallback(self):
++        (step,) = [s for s in vg.steps(['main'], args(jit=True)) if 'JIT' in s[0]]
++        self.assertIn('--only-unliftable', step[2]); self.assertIn('--jit', step[2])
++
++    def test_a_dry_run_prints_what_it_would_do_and_needs_neither_the_game_nor_remill(self):
++        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {}, clear=False):
++            os.environ.pop('REMILL_BUILD', None)
++            code, out = self.run_main('/nonexistent/ExeFS', d, 'main,sdk,subsdk0', '--seeds', '1,2', '--dry-run')
++        self.assertEqual(code, 0); self.assertEqual(out.count('would run:'), 3 * (1 + 2 * 2) + 1); self.assertIn('--switches', out)
++
++    def test_it_refuses_a_work_folder_inside_a_repository_a_missing_exefs_and_a_missing_toolchain(self):
++        with tempfile.TemporaryDirectory() as d:
++            (Path(d) / 'repo' / '.git').mkdir(parents=True)
++            for argv, why in ((['/x', str(Path(d) / 'repo' / 'work'), 'm'], 'inside a git repository'), (['/nonexistent', str(Path(d) / 'w'), 'm'], 'not a folder')):
++                with self.subTest(why), self.assertRaises(SystemExit) as cm: self.run_main(*argv)
++                self.assertIn(why, str(cm.exception))
++            ex = Path(d) / 'ExeFS'; ex.mkdir()
++            with self.assertRaises(SystemExit) as cm: self.run_main(str(ex), str(Path(d) / 'w'), 'main')
++            self.assertIn('no module file main', str(cm.exception))
++            (ex / 'main').write_bytes(b'')
++            with mock.patch.dict(os.environ, {}, clear=False):
++                os.environ.pop('REMILL_BUILD', None)
++                with self.assertRaises(SystemExit) as cm: self.run_main(str(ex), str(Path(d) / 'w'), 'main')
++                self.assertIn('REMILL_BUILD', str(cm.exception))
++                os.environ['REMILL_BUILD'] = d; os.environ.pop('DYNARMIC_DIR', None)
++                with self.assertRaises(SystemExit) as cm: self.run_main(str(ex), str(Path(d) / 'w'), 'main', '--jit')
++                self.assertIn('DYNARMIC_DIR', str(cm.exception))
++
++    def test_bad_seeds_are_an_argument_error(self):
++        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit): self.run_main('/x', '/tmp/w', 'm', '--seeds', 'a,b', '--dry-run')
++
++    def test_the_summary_mode_reads_a_work_folder_and_writes_the_markdown(self):
++        with tempfile.TemporaryDirectory() as d:
++            write(d, 'plain.seed1', 'm', [row('0x1', 'equal', equal=5)])
++            code, out = self.run_main('--summary', d, 'm', '--md', str(Path(d) / 't.md'))
++            self.assertEqual(code, 0); self.assertEqual((Path(d) / 't.md').read_text(), out.rstrip('\n') + '\n'); self.assertIn('| m | 1 | 1 |', out)
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++, unicorn and capstone')
++class WholeRun(unittest.TestCase):
++    def test_a_synthetic_module_goes_through_every_step_then_resumes(self):
++        import module_fixture as mf
++        with tempfile.TemporaryDirectory() as d:
++            ex, work = Path(d) / 'ExeFS', Path(d) / 'work'; ex.mkdir()
++            (ex / 'a').write_bytes(mf.build(mf.module_a())[0])
++            cmd = [sys.executable, '-I', str(TOOL), str(ex), str(work), 'a', '--functions', '10', '--cases', '6', '--seeds', '1,2', '--coverage-sample', '0', '--jobs', '2', '--md', str(Path(d) / 't.md')]
++            env = dict(os.environ)
++            p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=900)
++            self.assertEqual(p.returncode, 0, p.stdout[-1500:] + p.stderr[-800:])
++            self.assertIn('a: 10 of 10 functions lift (100.0%), 0 do not', p.stdout)
++            self.assertRegex(p.stdout, r'\| a \| \d+ \| \d+ \| 0 \| \d+ \| 0 \| 0 \| [1-9]\d* \|')   # no mismatch, no timeout, and cases behind the "equal"
++            for sub in ('plain.seed1', 'plain.seed2', 'switches.seed1', 'switches.seed2'): self.assertTrue((work / sub / 'a.diff.json').is_file(), sub)
++            self.assertTrue((work / 'a.census.json').is_file()); self.assertTrue((Path(d) / 't.md').read_text().startswith('| module |'))
++            again = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=900)
++            self.assertEqual(again.returncode, 0); self.assertGreaterEqual(again.stdout.count('[skip]'), 6); self.assertEqual(again.stdout.count('[run]'), 0)
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/validate_game.py b/dm/tools/validate_game.py
+new file mode 100644
+index 00000000..4eb9e41f
+--- /dev/null
++++ b/dm/tools/validate_game.py
+@@ -0,0 +1,139 @@
++#!/usr/bin/env python3
++"""Runs the whole of module_validate.py on a game's modules and puts the result in one table (NX2Linux Phase 2, #15: the Xenoblade 2 modules against Unicorn, as Balatro's were). Nothing of the game is stored
++or printed beyond addresses, counts and mnemonics, and the work folder holds code derived from the game, so it stays outside the repository (the tool refuses a folder inside one).
++For each module, in this order (a step whose result file is already in the work folder is not run again, unless --force):
++  coverage          how much of the module Remill lifts (a sample of the functions with --coverage-sample, all of them with 0)
++  census            every instruction class Remill does not lift, with its count (all modules together, once)
++  diff              leaf functions next to the Unicorn ARM64 core: registers, NZCV and memory must be identical
++  diff --switches   functions with a jump table, the same comparison (the `br` of the table is allowed)
++  diff --only-unliftable --jit   with --jit: the functions Remill cannot lift, run in the dynarmic fallback next to Unicorn (needs the coverage of the module and DYNARMIC_DIR)
++Each diff step runs once per seed: --seeds 1,2,3 tests different functions and different inputs, and the table adds them up.
++Usage: validate_game.py <ExeFS dir> <work dir> <module>[,<module>...] [--functions N] [--cases K] [--seeds 1,2] [--coverage-sample N] [--jobs J] [--jit] [--force] [--dry-run] [--md FILE]
++       validate_game.py --summary <work dir> <module>[,<module>...] [--md FILE]      only the table, from what the work folder holds
++Exit status: 0 when no function differs from Unicorn and nothing timed out or died, else 1. A table of "equal" with no case behind it is not a pass: the cases are counted."""
++import argparse, collections, json, os, subprocess, sys, time
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++
++BAD = ('mismatch', 'timeout', 'worker-died')
++
++
++def steps(modules, a):
++    """[(label, file that proves it was done, argv of module_validate.py, folder it works in)]"""
++    out = []
++    for m in modules:
++        out.append((f'{m}: coverage', f'{m}.coverage.json', ['coverage', str(a.exefs), None, m] + (['--sample', str(a.coverage_sample)] if a.coverage_sample else []), '.'))
++        for seed in a.seeds:
++            for kind, extra in (('plain', []), ('switches', ['--switches'])):
++                out.append((f'{m}: diff {kind}, seed {seed}', f'{kind}.seed{seed}/{m}.diff.json', ['diff', str(a.exefs), None, m, '--functions', str(a.functions), '--cases', str(a.cases), '--seed', str(seed)] + extra, f'{kind}.seed{seed}'))
++            if a.jit: out.append((f'{m}: diff of the functions run by the JIT, seed {seed}', f'jit.seed{seed}/{m}.diff.json', ['diff', str(a.exefs), None, m, '--functions', str(a.functions), '--cases', str(a.cases),
++                                  '--seed', str(seed), '--only-unliftable', '--jit'], f'jit.seed{seed}'))
++    out.append((f'census of {",".join(modules)}', f'{"+".join(modules)}.census.json', ['census', str(a.exefs), None, ','.join(modules)], '.'))
++    return out
++
++
++def run_step(argv, work, sub, a):
++    import module_validate as mv
++    folder = Path(work) / sub
++    folder.mkdir(parents=True, exist_ok=True)
++    if argv[0] == 'diff' and sub != '.':   # a diff pass keeps the module's coverage (for --only-unliftable) and its converted module one folder up
++        for name in Path(work).glob('*.manifest.json'): _link(name, folder / name.name)
++        for name in Path(work).glob('*.elf'): _link(name, folder / name.name)
++        for name in Path(work).glob('*.coverage.json'): _link(name, folder / name.name)
++    cmd = [mv.worker_python(), '-I', str(HERE / 'module_validate.py')] + [str(folder) if x is None else x for x in argv] + ['--jobs', str(a.jobs)]
++    return subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=f'{HERE}:{HERE / "tests"}'))
++
++
++def _link(src, dst):
++    if not dst.exists(): dst.symlink_to(src.resolve())
++
++
++def summarize(work, modules):
++    """(markdown, ok): the table of everything the work folder holds"""
++    work = Path(work)
++    lines, ok, grand = [], True, collections.Counter()
++    lines.append('| module | functions tested | equal | mismatch | inconclusive | unliftable | timeout, died | cases equal | both fault | budget | fault differs | MISMATCH cases | jump-table jumps |')
++    lines.append('|---|---|---|---|---|---|---|---|---|---|---|---|---|')
++    details = []
++    for m in modules:
++        files = sorted(work.glob(f'*/{m}.diff.json')) + sorted(work.glob(f'{m}.diff.json'))
++        st, cases = collections.Counter(), collections.Counter()
++        for f in files:
++            try: rows = json.loads(f.read_text())
++            except (OSError, ValueError): st['unreadable file'] += 1; continue
++            for r in rows:
++                st[r.get('status', '?')] += 1
++                for k, v in r.get('counts', {}).items(): cases[k] += v
++                if r.get('status') in BAD: details.append(f'{m} {f.parent.name} {r.get("function")}: {r.get("status")} {r.get("detail", "")[:300]}')
++        if not files: lines.append(f'| {m} | no diff result in the work folder | | | | | | | | | | | |'); ok = False; continue
++        bad = sum(st[k] for k in BAD) + st['unreadable file']
++        ok = ok and not bad and not cases['MISMATCH'] and not cases['fault-differs']
++        lines.append(f"| {m} | {sum(st.values())} | {st['equal']} | {st['mismatch']} | {st['inconclusive']} | {st['unliftable']} | {st['timeout'] + st['worker-died']} | {cases['equal']} | {cases['both-fault']} | "
++                     f"{cases['budget']} | {cases['fault-differs']} | {cases['MISMATCH']} | {cases['table-jumps']} |")
++        grand.update({'functions': sum(st.values()), 'equal': st['equal'], 'cases': cases['equal'], 'mismatch': cases['MISMATCH'] + cases['fault-differs']})
++    lines.append('')
++    if ok and not grand['cases']: ok = False; why = 'no case was compared.'
++    else: why = 'a difference, a timeout, a dead worker or a missing result is listed above or below.'
++    lines.append(f"**{grand['equal']} functions identical to Unicorn over {grand['cases']} cases, {grand['mismatch']} cases that differ.**" if ok else '**Not a pass:** ' + why)
++    for d in details: lines.append(f'- {d}')
++    cov = []
++    for m in modules:
++        f = work / f'{m}.coverage.json'
++        if f.exists():
++            try: c = json.loads(f.read_text()); cov.append(f"{m}: {c['lift']} of {c['functions']} functions lift ({100 * c['lift'] / max(1, c['functions']):.1f}%), {len(c['unliftable'])} do not")
++            except (ValueError, KeyError): pass
++    if cov: lines += ['', 'Coverage: ' + '; '.join(cov)]
++    cen = work / f'{"+".join(modules)}.census.json'
++    if cen.exists():
++        try:
++            c = json.loads(cen.read_text())
++            lines += ['', 'Instruction classes Remill does not lift (all modules, by instructions): ' + ', '.join(f"{k} {v['count']}" for k, v in sorted(c.items(), key=lambda kv: -kv[1]['count'])[:15])]
++        except (ValueError, KeyError): pass
++    return '\n'.join(lines) + '\n', ok
++
++
++def inside_repository(path):
++    p = Path(path).resolve()
++    return any((q / '.git').exists() for q in [p, *p.parents])
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument('--summary', action='store_true'); ap.add_argument('paths', nargs='+')
++    ap.add_argument('--functions', type=int, default=200); ap.add_argument('--cases', type=int, default=12); ap.add_argument('--seeds', default='1')
++    ap.add_argument('--coverage-sample', type=int, default=3000, help='functions per module for the coverage step (0: all of them, slow on a big module)')
++    ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) - 2)); ap.add_argument('--jit', action='store_true')
++    ap.add_argument('--force', action='store_true'); ap.add_argument('--dry-run', action='store_true'); ap.add_argument('--md', help='also write the table here')
++    a = ap.parse_args(argv)
++    if a.summary:
++        if len(a.paths) != 2: ap.error('--summary takes <work dir> <modules>')
++        work, mods = a.paths[0], a.paths[1].split(',')
++    else:
++        if len(a.paths) != 3: ap.error('give <ExeFS dir> <work dir> <modules>')
++        a.exefs, work, mods = a.paths[0], a.paths[1], a.paths[2].split(',')
++    try: a.seeds = [int(s) for s in str(a.seeds).split(',')]
++    except ValueError: ap.error('--seeds is a list of integers, for example 1,2,3')
++    if not a.summary:
++        if inside_repository(work): sys.exit(f'[RED] {work} is inside a git repository: the work folder holds code derived from the game, give a folder outside it')
++        if not a.dry_run and not Path(a.exefs).is_dir(): sys.exit(f'[RED] {a.exefs} is not a folder (the ExeFS that `nx2linux extract` writes)')
++        missing = [m for m in mods if not (Path(a.exefs) / m).is_file()]
++        if missing and not a.dry_run: sys.exit(f'[RED] no module file {", ".join(missing)} in {a.exefs}')
++        if a.jit and not a.dry_run and not os.environ.get('DYNARMIC_DIR'): sys.exit('[RED] --jit needs DYNARMIC_DIR (source <toolchain>/env.sh)')
++        if not a.dry_run and not os.environ.get('REMILL_BUILD'): sys.exit('[RED] needs REMILL_BUILD (source <toolchain>/env.sh)')
++        for label, proof, argv_, sub in steps(mods, a):
++            if a.dry_run: print(f'would run: {label}:  module_validate.py ' + ' '.join('<work>' if x is None else x for x in argv_)); continue
++            if (Path(work) / proof).exists() and not a.force: print(f'[skip] {label}: {proof} is there', flush=True); continue
++            t = time.time(); print(f'[run] {label} ...', flush=True)
++            r = run_step(argv_, work, sub, a)
++            (Path(work) / 'validate.log').open('a').write(f'== {label}\n{r.stdout[-4000:]}\n{r.stderr[-1500:]}\n')
++            print(f'[done] {label}: exit {r.returncode}, {time.time() - t:.0f} s', flush=True)
++        if a.dry_run: return 0
++    table, ok = summarize(work, mods)
++    print(table)
++    if a.md: Path(a.md).write_text(table)
++    return 0 if ok else 1
++
++
++if __name__ == '__main__': sys.exit(main())
