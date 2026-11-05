@@ -1,0 +1,450 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 00:10:57 +0100
+Subject: [PATCH] Linux host: a synthetic NSP and XCI, and a test that
+ nx_extract opens them
+
+nsp_fixture.py writes a package of random bytes with fake keys: PFS0 or HFS0 container, NCA3 with an AES-XTS header, SHA-256 and IVFC hash trees, RomFS tables, a content meta. test_nx_extract.py checks the title ID, the control data, ExeFS and RomFS (folder and DMROMFS1 image) byte for byte, the hash check on a damaged byte, a wrong key, a cut-off file, and turns the extracted main into an ELF module and manifest. No game file or real key.
+
+Upstream-Status: fork-only
+Reason: A package fixture made of random bytes and fake keys, and the extraction test the phase 1 exit criteria ask for
+Issue: Sunshine-Off/NX2Linux#7
+
+---
+ dm/tools/tests/nsp_fixture.py     | 275 ++++++++++++++++++++++++++++++
+ dm/tools/tests/test_nx_extract.py | 144 ++++++++++++++++
+ 2 files changed, 419 insertions(+)
+ create mode 100644 dm/tools/tests/nsp_fixture.py
+ create mode 100644 dm/tools/tests/test_nx_extract.py
+
+diff --git a/dm/tools/tests/nsp_fixture.py b/dm/tools/tests/nsp_fixture.py
+new file mode 100644
+index 0000000..ccd6786
+--- /dev/null
++++ b/dm/tools/tests/nsp_fixture.py
+@@ -0,0 +1,275 @@
++"""A synthetic Switch game package, made of random bytes and fake keys, that nx_extract (LibHac) opens like a real one: an NSP (PFS0) or an XCI holding a Program NCA (ExeFS and RomFS), a Control NCA and a Meta NCA
++with its content meta. Nothing here comes from a game, and the keys are random: the package opens only with the prod.keys file written beside it.
++
++What is real: the container formats (PFS0, HFS0, NCA3 with its AES-XTS header, the SHA-256 and IVFC hash trees, RomFS tables, CNMT). What is left out: the sections are not encrypted (NCA encryption type None, so
++no title key is needed) and the signatures are zeros (LibHac does not check them). The AES here is a small pure Python encryptor (checked against FIPS-197 in the tests) so the fixture needs no package."""
++import hashlib
++import os
++import random
++import struct
++from pathlib import Path
++
++
++# ---- AES-128 (encryption only) and the XTS mode Nintendo uses for the NCA header ----
++def _make_sbox():
++    sbox, p, q = [0] * 256, 1, 1
++    while True:
++        p = p ^ ((p << 1) & 0xff) ^ (0x1b if p & 0x80 else 0)   # p *= 3
++        q ^= q << 1; q ^= q << 2; q ^= q << 4; q &= 0xff        # q /= 3
++        if q & 0x80: q ^= 0x09
++        x = q ^ (q << 1 | q >> 7) & 0xff ^ (q << 2 | q >> 6) & 0xff ^ (q << 3 | q >> 5) & 0xff ^ (q << 4 | q >> 4) & 0xff
++        sbox[p] = (x ^ 0x63) & 0xff
++        if p == 1: break
++    sbox[0] = 0x63
++    return sbox
++
++
++SBOX = _make_sbox()
++
++
++def _xtime(a): return ((a << 1) ^ 0x1b) & 0xff if a & 0x80 else a << 1
++
++
++def expand_key(key):
++    w = [list(key[i:i + 4]) for i in range(0, 16, 4)]
++    rcon = 1
++    for i in range(4, 44):
++        t = list(w[i - 1])
++        if i % 4 == 0:
++            t = [SBOX[b] for b in t[1:] + t[:1]]; t[0] ^= rcon; rcon = _xtime(rcon)
++        w.append([a ^ b for a, b in zip(w[i - 4], t)])
++    return [sum(w[r * 4:r * 4 + 4], []) for r in range(11)]
++
++
++def aes_encrypt_block(rk, block):
++    s = [b ^ k for b, k in zip(block, rk[0])]
++    for r in range(1, 11):
++        s = [SBOX[b] for b in s]
++        s = [s[(i + 4 * (i % 4)) % 16] for i in range(16)]   # ShiftRows (column-major state)
++        if r < 10:
++            m = []
++            for c in range(4):
++                a = s[c * 4:c * 4 + 4]
++                m += [_xtime(a[0]) ^ _xtime(a[1]) ^ a[1] ^ a[2] ^ a[3], a[0] ^ _xtime(a[1]) ^ _xtime(a[2]) ^ a[2] ^ a[3],
++                      a[0] ^ a[1] ^ _xtime(a[2]) ^ _xtime(a[3]) ^ a[3], _xtime(a[0]) ^ a[0] ^ a[1] ^ a[2] ^ _xtime(a[3])]
++            s = m
++        s = [b ^ k for b, k in zip(s, rk[r])]
++    return bytes(s)
++
++
++def aes_ecb_encrypt(key, data):
++    rk = expand_key(key)
++    return b''.join(aes_encrypt_block(rk, data[i:i + 16]) for i in range(0, len(data), 16))
++
++
++def xts_encrypt(key, data, first_sector=0, sector_size=0x200):
++    """AES-128-XTS with Nintendo's tweak (the sector number big-endian). key: 32 bytes (data key, tweak key)"""
++    rk1, rk2 = expand_key(key[:16]), expand_key(key[16:])
++    out = bytearray()
++    for n in range(len(data) // sector_size):
++        t = int.from_bytes(aes_encrypt_block(rk2, (first_sector + n).to_bytes(16, 'big')), 'little')
++        for i in range(sector_size // 16):
++            tb = t.to_bytes(16, 'little'); p = data[n * sector_size + i * 16:][:16]
++            out += bytes(a ^ b for a, b in zip(aes_encrypt_block(rk1, bytes(a ^ b for a, b in zip(p, tb))), tb))
++            t = ((t << 1) ^ (0x87 if t >> 127 else 0)) & ((1 << 128) - 1)
++    return bytes(out)
++
++
++# ---- containers ----
++def align(n, a): return (n + a - 1) // a * a
++
++
++def pfs0(files):
++    """PFS0 of [(name, bytes)]"""
++    names = b''.join(n.encode() + b'\0' for n, _ in files); names += bytes(align(len(names), 0x20) - len(names))
++    ents, off, data = b'', 0, b''
++    no = 0
++    for n, d in files:
++        ents += struct.pack('<QQII', off, len(d), no, 0); no += len(n) + 1; off += len(d); data += d
++    return b'PFS0' + struct.pack('<III', len(files), len(names), 0) + ents + names + data
++
++
++def hfs0_header_size(count, names_len): return 0x10 + 0x40 * count + align(names_len, 0x20)
++
++
++def hfs0(files, hashed=None):
++    """HFS0 of [(name, bytes)], with the hash of every file's first `hashed[name]` bytes (default 0x200, or all of it when shorter): for a nested HFS0 that is its header"""
++    hashed = hashed or {}
++    names = b''.join(n.encode() + b'\0' for n, _ in files); names += bytes(align(len(names), 0x20) - len(names))
++    ents, off, data, no = b'', 0, b'', 0
++    for n, d in files:
++        hs = min(len(d), hashed.get(n, 0x200))
++        ents += struct.pack('<QQIIQ', off, len(d), no, hs, 0) + hashlib.sha256(d[:hs]).digest()
++        no += len(n) + 1; off += len(d); data += d
++    return b'HFS0' + struct.pack('<III', len(files), len(names), 0) + ents + names + data
++
++
++def romfs(files):
++    """Nintendo RomFS of {'dir/name': bytes}: header, directory and file tables with their hash tables, data"""
++    dirs = {'': 0}; order = ['']
++    for path in sorted(files):
++        parts = path.split('/')
++        for i in range(1, len(parts)):
++            d = '/'.join(parts[:i])
++            if d not in dirs: dirs[d] = -1; order.append(d)
++    def h(parent, name):
++        x = (parent ^ 123456789) & 0xffffffff
++        for c in name: x = ((x >> 5) | (x << 27)) & 0xffffffff ^ c
++        return x
++    # sizes first: a directory entry is 0x18 + name padded to 4, a file entry 0x20 + name padded to 4
++    doff, o = {}, 0
++    for d in order: doff[d] = o; o += 0x18 + align(len(d.rsplit('/', 1)[-1].encode()), 4)
++    dsize = o
++    foff, o, doffs, data = {}, 0, {}, b''
++    for f in sorted(files):
++        foff[f] = o; o += 0x20 + align(len(f.rsplit('/', 1)[-1].encode()), 4)
++        data = data.ljust(align(len(data), 0x10), b'\0'); doffs[f] = len(data); data += files[f]
++    fsize = o
++    NONE = 0xffffffff
++    dbuckets, fbuckets = max(3, len(order) | 1), max(3, len(files) | 1)
++    dtab, ftab = [NONE] * dbuckets, [NONE] * fbuckets
++    dmeta, fmeta = bytearray(), bytearray()
++    sib_d = {d: NONE for d in order}; sib_f = {f: NONE for f in files}; child_d = {d: NONE for d in order}; child_f = {d: NONE for d in order}
++    for d in order[1:]:   # children chain: the first listed is the child, the others its siblings
++        parent = d.rsplit('/', 1)[0] if '/' in d else ''
++        if child_d[parent] == NONE: child_d[parent] = doff[d]
++        else:
++            last = next(x for x in order if x != d and sib_d[x] == NONE and x != parent and (x.rsplit('/', 1)[0] if '/' in x else '') == parent and x != '')
++            sib_d[last] = doff[d]
++    for f in sorted(files):
++        parent = f.rsplit('/', 1)[0] if '/' in f else ''
++        if child_f[parent] == NONE: child_f[parent] = foff[f]
++        else:
++            last = [x for x in sorted(files) if (x.rsplit('/', 1)[0] if '/' in x else '') == parent and sib_f[x] == NONE and x != f][-1]
++            sib_f[last] = foff[f]
++    nxt_d, nxt_f = {}, {}
++    for d in order:
++        name = d.rsplit('/', 1)[-1]; parent = d.rsplit('/', 1)[0] if '/' in d else ''
++        b = h(doff[parent] if d else 0, name.encode()) % dbuckets
++        nxt_d[d] = dtab[b]; dtab[b] = doff[d]
++    for f in sorted(files):
++        parent = f.rsplit('/', 1)[0] if '/' in f else ''
++        b = h(doff[parent], f.rsplit('/', 1)[-1].encode()) % fbuckets
++        nxt_f[f] = ftab[b]; ftab[b] = foff[f]
++    for d in order:
++        name = d.rsplit('/', 1)[-1].encode() if d else b''; parent = d.rsplit('/', 1)[0] if '/' in d else ''
++        dmeta += struct.pack('<IIIIII', doff[parent] if d else 0, sib_d[d], child_d[d], child_f[d], nxt_d[d], len(name)) + name.ljust(align(len(name), 4), b'\0')
++    for f in sorted(files):
++        name = f.rsplit('/', 1)[-1].encode(); parent = f.rsplit('/', 1)[0] if '/' in f else ''
++        fmeta += struct.pack('<IIQQII', doff[parent], sib_f[f], doffs[f], len(files[f]), nxt_f[f], len(name)) + name.ljust(align(len(name), 4), b'\0')
++    dht, fht = b''.join(struct.pack('<I', x) for x in dtab), b''.join(struct.pack('<I', x) for x in ftab)
++    pos = 0x50; offs = []
++    for blob in (dht, bytes(dmeta), fht, bytes(fmeta)): offs.append((pos, len(blob))); pos += len(blob)
++    pos = align(pos, 0x10)
++    head = struct.pack('<QQQQQQQQQQ', 0x50, offs[0][0], offs[0][1], offs[1][0], offs[1][1], offs[2][0], offs[2][1], offs[3][0], offs[3][1], pos)
++    body = (head + dht + bytes(dmeta) + fht + bytes(fmeta)).ljust(pos, b'\0')
++    return body + data
++
++
++def cnmt(title_id, contents):
++    """A packaged Application content meta: contents is [(content id bytes(16), nca bytes, type)] with type 1 Program, 3 Control"""
++    head = struct.pack('<QIBBHHHB3xI4x', title_id, 0, 0x80, 0, 16, len(contents), 0, 0, 0)
++    ext = struct.pack('<QII', title_id | 0x800, 0, 0)
++    ents = b''
++    for cid, nca, typ in contents:
++        ents += hashlib.sha256(nca).digest() + cid + len(nca).to_bytes(6, 'little') + bytes([typ, 0])
++    return head + ext + ents + bytes(0x20)
++
++
++# ---- NCA ----
++def _section_sha256(pfs):
++    """(section bytes, 0xF8 bytes of hash data) of a PFS0 under a two-layer SHA-256 tree: a hash table then the data"""
++    block = 0x1000
++    data = pfs.ljust(align(len(pfs), block), b'\0')
++    table = b''.join(hashlib.sha256(data[i:i + block]).digest() for i in range(0, len(data), block))
++    data_off = align(len(table), 0x200)
++    sec = table.ljust(data_off, b'\0') + data
++    hd = hashlib.sha256(table).digest() + struct.pack('<IIQQQQ', block, 2, 0, len(table), data_off, len(data))
++    return sec.ljust(align(len(sec), 0x200), b'\0'), hd.ljust(0xF8, b'\0')
++
++
++def _section_ivfc(rom):
++    """(section bytes, hash data) of a RomFS under an IVFC tree: five hash levels above the data, all with 0x4000 byte blocks"""
++    bs = 0x4000
++    data = rom.ljust(align(len(rom), bs), b'\0')
++    levels = [data]
++    while len(levels) < 6:
++        low = levels[0]
++        levels.insert(0, b''.join(hashlib.sha256(low[i:i + bs].ljust(bs, b'\0')).digest() for i in range(0, len(low), bs)))
++    master = hashlib.sha256(levels[0].ljust(bs, b'\0')).digest()
++    sec, info, off = b'', b'', 0
++    for lv in levels:
++        sec = sec.ljust(off, b'\0') + lv; info += struct.pack('<QQII', off, len(lv), 14, 0); off = align(off + len(lv), bs)
++    hd = b'IVFC' + struct.pack('<III', 0x20000, 0x20, 7) + info + bytes(0x20) + master
++    return sec.ljust(align(len(sec), 0x200), b'\0'), hd.ljust(0xF8, b'\0')
++
++
++def nca(keys, content_type, title_id, sections):
++    """An NCA3 file. sections: [('pfs0'|'romfs', bytes)] in order. content_type: 0 Program, 1 Meta, 2 Control"""
++    body, entries, fs_headers, fs_hashes = b'', [], [], []
++    for kind, payload in sections:
++        sec, hd = _section_sha256(payload) if kind == 'pfs0' else _section_ivfc(payload)
++        start = 0xC00 + len(body)
++        entries.append((start // 0x200, (start + len(sec)) // 0x200)); body += sec
++        fsh = struct.pack('<HBBBB2x', 2, 1 if kind == 'pfs0' else 0, 2 if kind == 'pfs0' else 3, 1, 0) + hd
++        fsh = fsh.ljust(0x200, b'\0'); fs_headers.append(fsh); fs_hashes.append(hashlib.sha256(fsh).digest())
++    h = bytearray(0x400)
++    h[0x200:0x204] = b'NCA3'; h[0x205] = content_type
++    struct.pack_into('<QQ', h, 0x208, 0xC00 + len(body), title_id)
++    h[0x220] = 0   # key generation
++    for i, (s, e) in enumerate(entries): struct.pack_into('<IIQ', h, 0x240 + i * 0x10, s, e, 0)
++    for i, x in enumerate(fs_hashes): h[0x280 + i * 0x20:0x2a0 + i * 0x20] = x
++    h[0x300:0x340] = aes_ecb_encrypt(keys['key_area_key_application_00'], bytes(random.Random(title_id ^ content_type).randbytes(0x40)))
++    header = bytes(h) + b''.join(fs_headers) + bytes(0x200 * (4 - len(fs_headers)))
++    return xts_encrypt(keys['header_key'], header) + body
++
++
++# ---- the package ----
++TITLE_ID = 0x0100F00DBEEF0000
++GAME_NAME = 'Fixture Game'
++DISPLAY_VERSION = '1.2.3-fixture'
++
++
++class Package:
++    """What was written and what extraction must give back"""
++    def __init__(self):
++        self.path = self.keys = None
++        self.title_id = TITLE_ID
++        self.exefs = {}      # name -> bytes
++        self.romfs = {}      # path -> bytes
++        self.nacp_name, self.display_version, self.icon = GAME_NAME, DISPLAY_VERSION, None
++
++
++def make(out_dir, kind='nsp', seed=7):
++    """Write <out_dir>/fixture.<kind> (nsp or xci) and <out_dir>/prod.keys; returns a Package"""
++    rng = random.Random(seed)
++    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
++    keys = {'header_key': rng.randbytes(32), 'key_area_key_application_00': rng.randbytes(16)}
++    (out / 'prod.keys').write_text(''.join(f'{k} = {v.hex()}\n' for k, v in keys.items()))
++    pkg = Package(); pkg.keys = out / 'prod.keys'
++    import module_fixture as mf   # an NSO the loader tests already build: the package's `main` is a module the next stage can convert
++    main_nso, _ = mf.build(mf.module_a())
++    pkg.exefs = {'main': main_nso, 'main.npdm': b'META' + bytes(8) + b'\x3f' + rng.randbytes(0x200), 'rtld': b'NSO0' + rng.randbytes(0x100)}
++    pkg.romfs = {'readme.txt': b'a fixture, not a game\n', 'Data/table.bin': rng.randbytes(0x9000), 'Data/deep/one.bin': rng.randbytes(77), 'Movie/empty.bin': b''}
++    pkg.icon = b'\xff\xd8\xff\xe0' + rng.randbytes(300) + b'\xff\xd9'
++    nacp = bytearray(0x4000); nacp[:len(GAME_NAME)] = GAME_NAME.encode(); nacp[0x200:0x206] = b'Nobody'
++    nacp[0x3060:0x3060 + len(DISPLAY_VERSION)] = DISPLAY_VERSION.encode()
++    program = nca(keys, 0, TITLE_ID, [('pfs0', pfs0(sorted(pkg.exefs.items()))), ('romfs', romfs(pkg.romfs))])
++    control = nca(keys, 2, TITLE_ID, [('romfs', romfs({'control.nacp': bytes(nacp), 'icon_AmericanEnglish.dat': pkg.icon}))])
++    pid, cid = hashlib.sha256(program).digest()[:16], hashlib.sha256(control).digest()[:16]
++    meta_name = f'Application_{TITLE_ID:016x}.cnmt'
++    meta = nca(keys, 1, TITLE_ID, [('pfs0', pfs0([(meta_name, cnmt(TITLE_ID, [(pid, program, 1), (cid, control, 3)]))]))])
++    mid = hashlib.sha256(meta).digest()[:16]
++    files = [(f'{pid.hex()}.nca', program), (f'{cid.hex()}.nca', control), (f'{mid.hex()}.cnmt.nca', meta)]
++    if kind == 'nsp': blob = pfs0(files)
++    elif kind == 'xci':
++        secure = hfs0(files, {n: 0x200 for n, _ in files}); root_files = [('secure', secure)]
++        root = hfs0(root_files, {'secure': hfs0_header_size(len(files), sum(len(n) + 1 for n, _ in files))})
++        head = bytearray(0x200)
++        head[0x100:0x104] = b'HEAD'
++        struct.pack_into('<QQ', head, 0x130, 0xF000, len(root) - len(secure))   # root partition offset and header size
++        head[0x140:0x160] = hashlib.sha256(root[:len(root) - len(secure)]).digest()
++        blob = bytes(head).ljust(0xF000, b'\0') + root
++    else: raise ValueError(kind)
++    pkg.path = out / f'fixture.{kind}'; pkg.path.write_bytes(blob)
++    return pkg
+diff --git a/dm/tools/tests/test_nx_extract.py b/dm/tools/tests/test_nx_extract.py
+new file mode 100644
+index 0000000..ac4f4f2
+--- /dev/null
++++ b/dm/tools/tests/test_nx_extract.py
+@@ -0,0 +1,144 @@
++"""nx_extract on a synthetic package: an NSP and an XCI made by nsp_fixture.py (random bytes, fake keys, written to a temporary folder) are opened by LibHac like real ones. The title ID, the control data,
++ExeFS, RomFS (as a folder and as a DMROMFS1 image) come back byte for byte, the hash trees catch a damaged byte, and a wrong key, a cut-off file or a package with no meta NCA stops with a non-zero exit.
++The extracted `main` is then turned into an ELF module and manifest, the first step of the Linux chain. No game file and no real key is used or read.
++Needs dotnet and the restored LibHac package (nx_extract builds offline once it is in the NuGet cache); skipped with the reason otherwise."""
++import hashlib
++import shutil
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++TOOLS = HERE.parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(TOOLS))
++import nsp_fixture as fx
++import romfs_image
++
++PROJECT = TOOLS / 'nx_extract'
++SKIP = None
++if not shutil.which('dotnet'): SKIP = 'dotnet is not installed (dotnet-sdk-10.0)'
++elif not (PROJECT / 'nx_extract.csproj').is_file(): SKIP = 'nx_extract is not in the engine tree'
++
++
++def nx(*args, check=False):
++    r = subprocess.run(['dotnet', 'run', '-c', 'Release', '--no-build', '--project', str(PROJECT), '--', *map(str, args)], capture_output=True, text=True, timeout=300)
++    if check: assert r.returncode == 0, r.stdout + r.stderr
++    return r
++
++
++class Aes(unittest.TestCase):
++    """The fixture's encryptor against the published vectors, so a wrong package is never blamed on a wrong cipher"""
++    def test_fips_197(self):
++        key, plain = bytes.fromhex('000102030405060708090a0b0c0d0e0f'), bytes.fromhex('00112233445566778899aabbccddeeff')
++        self.assertEqual(fx.aes_ecb_encrypt(key, plain).hex(), '69c4e0d86a7b0430d8cdb78070b4c55a')
++
++    def test_xts_ieee_1619_vector_1(self):   # all-zero keys, sector 0, 32 zero bytes (the tweak is the sector number, big-endian: 0 for sector 0 as well)
++        self.assertEqual(fx.xts_encrypt(bytes(32), bytes(32), sector_size=32).hex(), '917cf69ebd68b2ec9b9fe9a3eadda692cd43d2f59598ed858c02c2652fbf922e')
++
++
++@unittest.skipIf(SKIP, SKIP)
++class Extraction(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        built = subprocess.run(['dotnet', 'build', '-c', 'Release', '-v', 'q', str(PROJECT)], capture_output=True, text=True, timeout=600)
++        if built.returncode != 0: raise unittest.SkipTest('nx_extract does not build here (LibHac not restored and no network?): ' + (built.stdout + built.stderr).strip().splitlines()[-1][:300])
++        cls.tmp = Path(tempfile.mkdtemp(prefix='nx2linux-fixture-')); cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
++        cls.pkg = {k: fx.make(cls.tmp / k, k) for k in ('nsp', 'xci')}
++
++    def out(self, name): return self.tmp / name
++
++    def test_title_id(self):
++        for kind, pkg in self.pkg.items():
++            with self.subTest(kind):
++                r = nx(pkg.keys, '--title', pkg.path, check=True)
++                self.assertEqual(r.stdout.strip(), f'title {fx.TITLE_ID:016x}')
++
++    def test_folder_extraction_gives_the_files_back(self):
++        for kind, pkg in self.pkg.items():
++            with self.subTest(kind):
++                out = self.out(f'folder-{kind}')
++                r = nx(pkg.keys, pkg.path, '-', out, check=True)
++                self.assertIn(f'title {fx.TITLE_ID:016x}', r.stdout)
++                self.assertIn(f'display version {fx.DISPLAY_VERSION}', r.stdout)
++                self.assertIn(f'name {fx.GAME_NAME}', r.stdout)
++                self.assertEqual(sorted(p.name for p in (out / 'ExeFS').iterdir()), sorted(pkg.exefs))
++                for name, data in pkg.exefs.items(): self.assertEqual((out / 'ExeFS' / name).read_bytes(), data, name)
++                got = {str(p.relative_to(out / 'RomFS')): p.read_bytes() for p in (out / 'RomFS').rglob('*') if p.is_file()}
++                self.assertEqual(got, pkg.romfs)
++                self.assertEqual((out / 'icon.jpg').read_bytes(), pkg.icon)
++                self.assertEqual(len((out / 'control.nacp').read_bytes()), 0x4000)
++                self.assertIn(f'main build id {pkg.exefs["main"][0x40:0x50].hex()}', r.stdout)   # the NSO's build ID is the first 16 bytes of its module ID
++
++    def test_image_extraction_gives_the_same_files(self):
++        for kind, pkg in self.pkg.items():
++            with self.subTest(kind):
++                out = self.out(f'image-{kind}')
++                nx(pkg.keys, pkg.path, '-', out, '--romfs-image', check=True)
++                self.assertFalse((out / 'RomFS').exists())   # the image replaces the folder
++                img = out / 'RomFS.img'
++                index = romfs_image.read_index(img)
++                blob = img.read_bytes()
++                files = {p: blob[off:off + size] for p, (is_dir, off, size) in index.items() if not is_dir}
++                self.assertEqual(files, pkg.romfs)
++                self.assertEqual({p for p, (d, _, _) in index.items() if d}, {'Data', 'Data/deep', 'Movie'})
++
++    def test_manifest_lists_the_romfs_without_writing_it(self):
++        pkg = self.pkg['nsp']; out = self.out('manifest')
++        nx(pkg.keys, pkg.path, '-', out, '--manifest', check=True)
++        rows = [l.split('\t') for l in (out / 'romfs_manifest.tsv').read_text().splitlines() if l and not l.startswith('#')]
++        self.assertEqual({r[0].lstrip('/'): int(r[1]) for r in rows}, {k: len(v) for k, v in pkg.romfs.items()})
++        self.assertFalse((out / 'RomFS').exists() or (out / 'RomFS.img').exists())
++
++    def test_the_extracted_main_becomes_an_elf_module_with_a_manifest(self):
++        try: import capstone  # noqa: F401
++        except ImportError: self.skipTest('capstone is not installed in this interpreter')
++        import elf_module as em
++        pkg = self.pkg['nsp']; out = self.out('to-elf')
++        nx(pkg.keys, pkg.path, '-', out, '--romfs-image', check=True)
++        elf, man = em.convert_nso(out / 'ExeFS' / 'main', out / 'modules', 'main')
++        manifest, data = em.load_manifest(man)
++        self.assertEqual(manifest['name'], 'main')
++        self.assertEqual(hashlib.sha256(data).hexdigest(), manifest['sha256'])
++        again = em.convert_nso(out / 'ExeFS' / 'main', out / 'modules2', 'main')[1]
++        self.assertEqual(again.read_bytes(), man.read_bytes())   # the same input gives the same manifest
++
++    # ---- failures ----
++    def test_a_wrong_key_stops_and_writes_nothing(self):
++        pkg = self.pkg['nsp']; keys = self.out('wrong.keys')
++        keys.write_text(''.join(f'{k} = {"ab" * (32 if k == "header_key" else 16)}\n' for k in ('header_key', 'key_area_key_application_00')))
++        out = self.out('wrong-key')
++        r = nx(keys, pkg.path, '-', out)
++        self.assertNotEqual(r.returncode, 0)
++        self.assertFalse((out / 'ExeFS').exists())
++
++    def test_a_cut_off_package_stops(self):
++        pkg = self.pkg['nsp']; cut = self.out('cut.nsp'); cut.write_bytes(pkg.path.read_bytes()[:0x3000])
++        out = self.out('cut')
++        r = nx(pkg.keys, cut, '-', out)
++        self.assertNotEqual(r.returncode, 0)
++        self.assertFalse((out / 'ExeFS').exists())
++
++    def test_a_package_with_no_meta_nca_has_no_title(self):
++        pkg = self.pkg['nsp']; bare = self.out('bare.nsp'); bare.write_bytes(fx.pfs0([('notes.txt', b'not an NCA' * 40)]))
++        r = nx(pkg.keys, '--title', bare)
++        self.assertEqual(r.returncode, 5)
++        self.assertIn('[RED] no meta NCA in bare.nsp', r.stdout)
++
++    def test_a_damaged_byte_fails_the_hash_check_unless_allowed(self):
++        pkg = self.pkg['nsp']; blob = bytearray(pkg.path.read_bytes())
++        at = blob.find(pkg.romfs['Data/table.bin'][:64]); self.assertGreater(at, 0)
++        # a byte deep in the file, in a RomFS block after the one that holds the tables: the tables stay readable, the file does not
++        blob[at + 0x8800] ^= 0xff
++        bad = self.out('damaged.nsp'); bad.write_bytes(bytes(blob))
++        r = nx(pkg.keys, bad, '-', self.out('damaged'))
++        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
++        r = nx(pkg.keys, bad, '-', self.out('damaged-allowed'), '--allow-damaged')
++        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
++        self.assertIn('the NSP is damaged', r.stdout)
++        self.assertEqual((self.out('damaged-allowed') / 'RomFS' / 'Data' / 'table.bin').read_bytes()[0x8800], pkg.romfs['Data/table.bin'][0x8800] ^ 0xff)
++
++
++if __name__ == '__main__':
++    unittest.main()

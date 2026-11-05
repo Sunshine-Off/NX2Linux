@@ -92,3 +92,4 @@
 0111-test-elf-module-the-switch-test-is-skipped-when.patch
 0112-linux-host-a-test-that-the-linux-chain-reaches-n.patch
 0113-linux-host-elf-module-refuses-capstone-6-by-name.patch
+0114-linux-host-a-synthetic-nsp-and-xci-and-a-test-th.patch
