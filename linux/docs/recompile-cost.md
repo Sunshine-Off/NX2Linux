@@ -28,7 +28,15 @@ the start-up alone would be about 39% of that (**deduced**, not measured on the 
 
 **What this does not explain.** The corpus makes an object of about 2 KB. The reported cache is 12 GB for 97,763 objects, about 123 KB per object, 57 times more.
 The corpus functions are small (90 bytes), the game's are larger and the inline memory accesses (`AOT_INLINE_MEM=1`) make the code bigger, but that does not obviously reach 57 times.
-It may also be that part of the 12 GB is not objects (the finished libraries kept under `lib/`, one per key). **What the 12 GB holds is unknown.** One read-only command tells (below), and the choice depends on its answer.
+It may also be that part of the 12 GB is not objects (the finished libraries kept under `lib/`, one per key). **What the 12 GB holds was unknown.** The sizes of the folders (`du`, nothing opened) already say part of it, on the three caches of the machine of the team member who ran it:
+
+| Cache | Total | `obj/` | `lib/` | Objects | Finished libraries |
+|---|---|---|---|---|---|
+| `aot-cache` | 15 GB | 6.3 GB | **8.1 GB** | 622,259 | 36 (about 225 MB each) |
+| `aot` | 2.4 GB | 1.9 GB | 518 MB | 152,942 | 4 |
+| `aot-cache-b` | 2.2 GB | 1.1 GB | 1.2 GB | 103,029 | 5 |
+
+So in the largest cache more than half of the disk is **finished libraries, one per build key, and nothing removes the old ones**: each change of the toolchain, of the runtime or of the set of functions leaves a new `lib/<key>.so` beside the older ones. The objects are about 10 KB each on average there (files of all kinds counted), not 123 KB. This points at pruning the old libraries (a `--prune` that lists first and deletes only on request) before compressing objects. It is a finding to confirm with `cache-stats`, which gives the exact sizes and says how the objects compress.
 
 ## Options
 
@@ -73,9 +81,9 @@ It reads sizes and the sections of a random sample of objects, and compresses th
 
 ```sh
 cd <your clone>
-python3 -I engine/dm/tools/aot_cost.py cache-stats ~/.cache/nx2linux/aot-xc2c --sample 500 --json ~/xc2-cache-stats.json
+python3 -I engine/dm/tools/aot_cost.py cache-stats ~/.cache/nx2linux/aot-cache --sample 500 --json ~/xc2-cache-stats.json
 ```
 
-Use the folder of the build you want to know about (the ones under `~/.cache/nx2linux/` are `aot-cache`, `aot-xc2`, `aot-xc2b`, `aot-xc2c` and others). The time is unknown, mostly the reading of 500 objects.
+Use a cache folder, the one given as `--cache` or `AOT_CACHE`, with `obj/` and `lib/` inside. A folder of `.elf` and `.manifest.json` files holds modules, not a cache, and the tool says so and names its neighbours that are caches. The time is unknown, mostly the reading of 500 objects.
 Add `--no-compress` to skip the compression. Send back the printed text and the JSON file. They hold counts and sizes only.
 The measurement on the corpus is `python3 -I engine/dm/tools/aot_cost.py measure` with `REMILL_BUILD` set (about 2 minutes for 400 functions with `--jobs 1`).

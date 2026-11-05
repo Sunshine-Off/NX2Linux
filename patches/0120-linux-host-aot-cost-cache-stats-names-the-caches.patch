@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 21:34:46 +0100
+Subject: [PATCH] Linux host: aot_cost cache-stats names the caches next to a
+ module folder (#18)
+
+Pointing cache-stats at a folder of ELF modules said only that it was not
+a cache. It now explains what a cache is (obj/ and lib/, the --cache or
+AOT_CACHE folder) and lists the neighbouring folders that are caches.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: cache-stats says what a cache folder is when given a module folder
+Issue: Sunshine-Off/NX2Linux#18
+
+---
+ dm/tools/aot_cost.py            | 5 ++++-
+ dm/tools/tests/test_aot_cost.py | 9 +++++++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/dm/tools/aot_cost.py b/dm/tools/aot_cost.py
+index 4c731146..03c19761 100644
+--- a/dm/tools/aot_cost.py
++++ b/dm/tools/aot_cost.py
+@@ -207,7 +207,10 @@ def measure_text(res):
+ def cache_stats(a):
+     root = Path(a.cache)
+     objd = root / 'obj'
+-    if not objd.is_dir(): sys.exit(f'[RED] aot_cost: {root} has no obj/ folder: it is not an AOT cache')
++    if not objd.is_dir():
++        near = sorted(p.name for p in root.resolve().parent.iterdir() if (p / 'obj').is_dir()) if root.resolve().parent.is_dir() else []
++        sys.exit(f'[RED] aot_cost: {root} has no obj/ folder: it is not an AOT cache. A cache is the folder given as --cache or AOT_CACHE, with obj/ and lib/ inside (a folder of .elf and .manifest.json files holds modules)'
++                 + (f'. Next to it: {", ".join(near)}' if near else ''))
+     if not shutil.which('llvm-readelf'): sys.exit('[RED] aot_cost: needs llvm-readelf')
+     kinds = {'.o': [], '.syms': [], '.fail': []}
+     for p in objd.rglob('*'):
+diff --git a/dm/tools/tests/test_aot_cost.py b/dm/tools/tests/test_aot_cost.py
+index 79414d20..92b6ea31 100644
+--- a/dm/tools/tests/test_aot_cost.py
++++ b/dm/tools/tests/test_aot_cost.py
+@@ -130,6 +130,15 @@ class CacheStats(unittest.TestCase):
+         with tempfile.TemporaryDirectory() as d, self.assertRaises(SystemExit) as cm: ac.cache_stats(argparse.Namespace(cache=d, sample=1, seed=1, no_compress=False))
+         self.assertIn('not an AOT cache', str(cm.exception))
+ 
++    def test_a_module_folder_next_to_a_cache_names_the_cache(self):
++        import argparse
++        with tempfile.TemporaryDirectory() as d:
++            modules = Path(d) / 'aot-xc2c'; modules.mkdir(); (modules / 'main.elf').write_bytes(b'x')
++            (Path(d) / 'aot-cache' / 'obj').mkdir(parents=True); (Path(d) / 'aot-cache' / 'lib').mkdir()
++            with self.assertRaises(SystemExit) as cm: ac.cache_stats(argparse.Namespace(cache=str(modules), sample=1, seed=1, no_compress=False))
++        msg = str(cm.exception)
++        self.assertIn('not an AOT cache', msg); self.assertIn('aot-cache', msg); self.assertIn('--cache', msg)
++
+     def test_the_command_line_prints_and_writes_json(self):
+         with tempfile.TemporaryDirectory() as d:
+             root = self.make_cache(d, 3)
