@@ -1,0 +1,530 @@
+From 0f553a88d4814a6ba092d36f3070cb2071009739 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 00:37:59 +0100
+Subject: [PATCH] AArch64: cryptographic extension (AES, SHA-1, SHA-256, PMULL)
+ and FRSQRTE
+
+AESE/AESD/AESMC/AESIMC call the runtime (nx2_aes: the S-box is computed from its definition there); SHA1C/P/M/H/SU0/SU1, SHA256H/H2/SU0/SU1, PMULL/PMULL2 (8 bit and 64 bit) and FRSQRTE (scalar and vector, single and double) are the pseudocode of the Arm manual. Compared with Unicorn on random and edge inputs, FPSR included for FRSQRTE. The half-precision FRSQRTE stays undecoded.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ lib/Arch/AArch64/Arch.cpp           |  56 +++++++
+ lib/Arch/AArch64/Decode.cpp         |  63 --------
+ lib/Arch/AArch64/Semantics/SIMD.cpp | 223 ++++++++++++++++++++++++++++
+ 3 files changed, 279 insertions(+), 63 deletions(-)
+
+diff --git a/lib/Arch/AArch64/Arch.cpp b/lib/Arch/AArch64/Arch.cpp
+index efb1a0b..7ba0b77 100644
+--- a/lib/Arch/AArch64/Arch.cpp
++++ b/lib/Arch/AArch64/Arch.cpp
+@@ -5451,6 +5451,62 @@ static bool NxFmovImm(const InstData &data, Instruction &inst, bool dbl) {
+ bool TryDecodeFADD_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+ bool TryDecodeFSUB_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+ bool TryDecodeFADDP_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
++
++// Cryptographic extension (AES, SHA-1, SHA-256, PMULL) and FRSQRTE. The operands are whole Q registers: the semantics read the lanes they need.
++static bool NxCrypto3(const InstData &data, Instruction &inst) {   // Vd = f(Vd, Vn, Vm)
++  AddRegOperand(inst, kActionWrite, kRegQ, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rn);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rm);
++  return true;
++}
++static bool NxCrypto2(const InstData &data, Instruction &inst) {   // Vd = f(Vd, Vn)
++  AddRegOperand(inst, kActionWrite, kRegQ, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rn);
++  return true;
++}
++static bool NxCrypto1(const InstData &data, Instruction &inst) {   // Vd = f(Vn)
++  AddRegOperand(inst, kActionWrite, kRegQ, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rn);
++  return true;
++}
++bool TryDecodeAESE_B_CRYPTOAES(const InstData &data, Instruction &inst) { return NxCrypto2(data, inst); }
++bool TryDecodeAESD_B_CRYPTOAES(const InstData &data, Instruction &inst) { return NxCrypto2(data, inst); }
++bool TryDecodeAESMC_B_CRYPTOAES(const InstData &data, Instruction &inst) { return NxCrypto1(data, inst); }
++bool TryDecodeAESIMC_B_CRYPTOAES(const InstData &data, Instruction &inst) { return NxCrypto1(data, inst); }
++bool TryDecodeSHA1C_QSV_CRYPTOSHA3(const InstData &data, Instruction &inst) { return NxCrypto3(data, inst); }
++bool TryDecodeSHA1P_QSV_CRYPTOSHA3(const InstData &data, Instruction &inst) { return NxCrypto3(data, inst); }
++bool TryDecodeSHA1M_QSV_CRYPTOSHA3(const InstData &data, Instruction &inst) { return NxCrypto3(data, inst); }
++bool TryDecodeSHA1H_SS_CRYPTOSHA2(const InstData &data, Instruction &inst) { return NxCrypto1(data, inst); }
++bool TryDecodeSHA1SU0_VVV_CRYPTOSHA3(const InstData &data, Instruction &inst) { return NxCrypto3(data, inst); }
++bool TryDecodeSHA1SU1_VV_CRYPTOSHA2(const InstData &data, Instruction &inst) { return NxCrypto2(data, inst); }
++bool TryDecodeSHA256H_QQV_CRYPTOSHA3(const InstData &data, Instruction &inst) { return NxCrypto3(data, inst); }
++bool TryDecodeSHA256H2_QQV_CRYPTOSHA3(const InstData &data, Instruction &inst) { return NxCrypto3(data, inst); }
++bool TryDecodeSHA256SU0_VV_CRYPTOSHA2(const InstData &data, Instruction &inst) { return NxCrypto2(data, inst); }
++bool TryDecodeSHA256SU1_VVV_CRYPTOSHA3(const InstData &data, Instruction &inst) { return NxCrypto3(data, inst); }
++// PMULL{2} <Vd>.<Ta>, <Vn>.<Tb>, <Vm>.<Tb>: size 0 = 8 bit polynomials (8B / 16B), size 3 = 64 bit (1D / 2D); the others are unallocated
++bool TryDecodePMULL_ASIMDDIFF_L(const InstData &data, Instruction &inst) {
++  if (data.size != 0 && data.size != 3) return false;
++  AddArrangementSpecifier(inst, data.Q ? 128 : 64, 8UL << data.size);
++  AddRegOperand(inst, kActionWrite, kRegQ, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rn);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rm);
++  return true;
++}
++// FRSQRTE: the vector form (2S / 4S / 2D) and the scalar one (S / D); the half-precision forms stay undecoded
++bool TryDecodeFRSQRTE_ASIMDMISC_R(const InstData &data, Instruction &inst) { return NxFMisc(data, inst); }
++// the Newton-Raphson steps: FRECPS / FRSQRTS, vector and scalar
++bool TryDecodeFRECPS_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
++bool TryDecodeFRSQRTS_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
++bool TryDecodeFRECPS_ASISDSAME_ONLY(const InstData &data, Instruction &inst) { return NxScalarF3(data, inst); }
++bool TryDecodeFRSQRTS_ASISDSAME_ONLY(const InstData &data, Instruction &inst) { return NxScalarF3(data, inst); }
++bool TryDecodeFRSQRTE_ASISDMISC_R(const InstData &data, Instruction &inst) {
++  inst.function += data.sz ? "_D" : "_S";
++  AddRegOperand(inst, kActionWrite, kRegQ, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rn);
++  return true;
++}
+ bool TryDecodeFMUL_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+ bool TryDecodeFDIV_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+ bool TryDecodeFMAX_ASIMDSAME_ONLY(const InstData &data, Instruction &inst) { return NxFSame(data, inst, false); }
+diff --git a/lib/Arch/AArch64/Decode.cpp b/lib/Arch/AArch64/Decode.cpp
+index 63e2b7a..ef1e23d 100644
+--- a/lib/Arch/AArch64/Decode.cpp
++++ b/lib/Arch/AArch64/Decode.cpp
+@@ -2431,9 +2431,6 @@ bool TryDecodeLDUMINLB_32_MEMOP(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SHA256SU0  <Vd>.4S, <Vn>.4S
+-bool TryDecodeSHA256SU0_VV_CRYPTOSHA2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMINP FMINP_asimdsamefp16_only:
+ //   0 x Rd       0
+@@ -4163,9 +4160,6 @@ bool TryDecodeUSRA_ASISDSHF_R(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // AESIMC  <Vd>.16B, <Vn>.16B
+-bool TryDecodeAESIMC_B_CRYPTOAES(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // UADDW UADDW_asimddiff_W:
+ //   0 x Rd       0
+@@ -4759,9 +4753,6 @@ bool TryDecodeLDUMAXLB_32_MEMOP(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // AESE  <Vd>.16B, <Vn>.16B
+-bool TryDecodeAESE_B_CRYPTOAES(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STXR STXR_SR32_ldstexcl:
+ //   0 x Rt       0
+@@ -9727,9 +9718,6 @@ bool TryDecodeFMAX_H_FLOATDP2(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // AESD  <Vd>.16B, <Vn>.16B
+-bool TryDecodeAESD_B_CRYPTOAES(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // AESMC AESMC_B_cryptoaes:
+ //   0 x Rd       0
+@@ -9765,9 +9753,6 @@ bool TryDecodeAESD_B_CRYPTOAES(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // AESMC  <Vd>.16B, <Vn>.16B
+-bool TryDecodeAESMC_B_CRYPTOAES(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LD2 LD2_asisdlso_B2_2b:
+ //   0 x Rt       0
+@@ -14952,9 +14937,6 @@ bool TryDecodeFNMSUB_H_FLOATDP3(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SHA1M  <Qd>, <Sn>, <Vm>.4S
+-bool TryDecodeSHA1M_QSV_CRYPTOSHA3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDAXP LDAXP_LP32_ldstexcl:
+ //   0 x Rt       0
+@@ -15586,9 +15568,6 @@ bool TryDecodeFCVTZU_64H_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SHA1P  <Qd>, <Sn>, <Vm>.4S
+-bool TryDecodeSHA1P_QSV_CRYPTOSHA3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // TBL TBL_asimdtbl_L2_2:
+ //   0 x Rd       0
+@@ -16243,9 +16222,6 @@ bool TryDecodeSTTRH_32_LDST_UNPRIV(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SHA256SU1  <Vd>.4S, <Vn>.4S, <Vm>.4S
+-bool TryDecodeSHA256SU1_VVV_CRYPTOSHA3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMSUB FMSUB_H_floatdp3:
+ //   0 x Rd       0
+@@ -18674,9 +18650,6 @@ bool TryDecodeFRECPS_ASISDSAMEFP16_ONLY(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // FRECPS  <V><d>, <V><n>, <V><m>
+-bool TryDecodeFRECPS_ASISDSAME_ONLY(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRECPS FRECPS_asimdsamefp16_only:
+ //   0 x Rd       0
+@@ -18750,9 +18723,6 @@ bool TryDecodeFRECPS_ASIMDSAMEFP16_ONLY(const InstData &, Instruction &) {
+ //  30 x Q        0
+ //  31 0
+ // FRECPS  <Vd>.<T>, <Vn>.<T>, <Vm>.<T>
+-bool TryDecodeFRECPS_ASIMDSAME_ONLY(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SMLAL SMLAL_asimddiff_L:
+ //   0 x Rd       0
+@@ -19924,9 +19894,6 @@ bool TryDecodeFRSQRTS_ASISDSAMEFP16_ONLY(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // FRSQRTS  <V><d>, <V><n>, <V><m>
+-bool TryDecodeFRSQRTS_ASISDSAME_ONLY(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRSQRTS FRSQRTS_asimdsamefp16_only:
+ //   0 x Rd       0
+@@ -20000,9 +19967,6 @@ bool TryDecodeFRSQRTS_ASIMDSAMEFP16_ONLY(const InstData &, Instruction &) {
+ //  30 x Q        0
+ //  31 0
+ // FRSQRTS  <Vd>.<T>, <Vn>.<T>, <Vm>.<T>
+-bool TryDecodeFRSQRTS_ASIMDSAME_ONLY(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRINTN FRINTN_H_floatdp1:
+ //   0 x Rd       0
+@@ -22109,9 +22073,6 @@ bool TryDecodeFRSQRTE_ASISDMISCFP16_R(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // FRSQRTE  <V><d>, <V><n>
+-bool TryDecodeFRSQRTE_ASISDMISC_R(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRSQRTE FRSQRTE_asimdmiscfp16_R:
+ //   0 x Rd       0
+@@ -22185,9 +22146,6 @@ bool TryDecodeFRSQRTE_ASIMDMISCFP16_R(const InstData &, Instruction &) {
+ //  30 x Q        0
+ //  31 0
+ // FRSQRTE  <Vd>.<T>, <Vn>.<T>
+-bool TryDecodeFRSQRTE_ASIMDMISC_R(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // ADD ADD_asisdsame_only:
+ //   0 x Rd       0
+@@ -23526,9 +23484,6 @@ bool TryDecodeSTUMINL_64S_MEMOP(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SHA1SU1  <Vd>.4S, <Vn>.4S
+-bool TryDecodeSHA1SU1_VV_CRYPTOSHA2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LD1 LD1_asisdlsep_R1_r1:
+ //   0 x Rt       0
+@@ -23704,9 +23659,6 @@ bool TryDecodeSHA1SU1_VV_CRYPTOSHA2(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SHA1H  <Sd>, <Sn>
+-bool TryDecodeSHA1H_SS_CRYPTOSHA2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRINTM FRINTM_asimdmiscfp16_R:
+ //   0 x Rd       0
+@@ -26892,9 +26844,6 @@ bool TryDecodeFCMP_HZ_FLOATCMP(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SHA1SU0  <Vd>.4S, <Vn>.4S, <Vm>.4S
+-bool TryDecodeSHA1SU0_VVV_CRYPTOSHA3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STSET STSET_32S_memop:
+ //   0 1 Rt       0
+@@ -36069,9 +36018,6 @@ bool TryDecodeFMLS_ASIMDELEM_RH_H(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SHA256H2  <Qd>, <Qn>, <Vm>.4S
+-bool TryDecodeSHA256H2_QQV_CRYPTOSHA3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // RBIT RBIT_asimdmisc_R:
+ //   0 x Rd       0
+@@ -36919,9 +36865,6 @@ bool TryDecodeNEG_ASISDMISC_R(const InstData &, Instruction &) {
+ //  30 x Q        0
+ //  31 0
+ // PMULL{2}  <Vd>.<Ta>, <Vn>.<Tb>, <Vm>.<Tb>
+-bool TryDecodePMULL_ASIMDDIFF_L(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMLS FMLS_asimdsamefp16_only:
+ //   0 x Rd       0
+@@ -38697,9 +38640,6 @@ bool TryDecodeSXTH_SBFM_64M_BITFIELD(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SHA256H  <Qd>, <Qn>, <Vm>.4S
+-bool TryDecodeSHA256H_QQV_CRYPTOSHA3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LD4R LD4R_asisdlso_R4:
+ //   0 x Rt       0
+@@ -39430,9 +39370,6 @@ bool TryDecodeFNEG_H_FLOATDP1(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SHA1C  <Qd>, <Sn>, <Vm>.4S
+-bool TryDecodeSHA1C_QSV_CRYPTOSHA3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SQDMLSL SQDMLSL_asisddiff_only:
+ //   0 x Rd       0
+diff --git a/lib/Arch/AArch64/Semantics/SIMD.cpp b/lib/Arch/AArch64/Semantics/SIMD.cpp
+index c602fb2..5b4f362 100644
+--- a/lib/Arch/AArch64/Semantics/SIMD.cpp
++++ b/lib/Arch/AArch64/Semantics/SIMD.cpp
+@@ -3149,3 +3149,226 @@ DEF_ISEL(UMSUBL_64WA_DP_3SRC) = UMSUBL;
+ DEF_ISEL(LDURSB_64_LDST_UNSCALED) = LoadSExt<R64W, M8, int64_t>;
+ DEF_ISEL(LDURSH_64_LDST_UNSCALED) = LoadSExt<R64W, M16, int64_t>;
+ 
++
++// Cryptographic extension and FRSQRTE (NX2Linux). The AES steps need the S-box: they call the runtime (nx2_aes, aot_runtime.cpp), which any program that lifts this code links.
++// SHA-1, SHA-256, PMULL and FRSQRTE are plain integer arithmetic, written from the pseudocode of the Arm Architecture Reference Manual.
++extern "C" void nx2_aes(unsigned op, uint64_t *result, const uint64_t *d, const uint64_t *n);
++
++namespace {
++
++ALWAYS_INLINE static uint32_t NxRol32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
++ALWAYS_INLINE static uint32_t NxRor32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
++
++// OP: 0 AESE, 1 AESD, 2 AESMC, 3 AESIMC (the two last ignore d)
++template <unsigned OP> DEF_SEM(NX_AES2, V128W dst, V128 dv, V128 nv) {
++  NxVec a = NxRead(dv), b = NxRead(nv), r = {};
++  nx2_aes(OP, r.d, a.d, b.d);
++  NxWrite(dst, r); return memory;
++}
++template <unsigned OP> DEF_SEM(NX_AES1, V128W dst, V128 nv) {
++  NxVec b = NxRead(nv), r = {};
++  nx2_aes(OP, r.d, b.d, b.d);
++  NxWrite(dst, r); return memory;
++}
++
++// SHA1C / SHA1P / SHA1M: KIND 0 choose, 1 parity, 2 majority. Qd = X, Sn = Y (its low 32 bits), Vm = W
++template <int KIND> DEF_SEM(NX_SHA1HASH, V128W dst, V128 dv, V128 nv, V128 mv) {
++  NxVec x = NxRead(dv), n = NxRead(nv), w = NxRead(mv);
++  uint32_t y = n.s[0];
++  for (int e = 0; e < 4; e++) {
++    uint32_t p = x.s[1], q = x.s[2], z = x.s[3], t;
++    if (KIND == 0) t = ((q ^ z) & p) ^ z; else if (KIND == 1) t = p ^ q ^ z; else t = (p & q) | ((p | q) & z);
++    y = y + NxRol32(x.s[0], 5) + t + w.s[e];
++    x.s[1] = NxRol32(x.s[1], 30);
++    uint32_t top = x.s[3];   // <Y, X> = ROL(Y:X, 32)
++    x.s[3] = x.s[2]; x.s[2] = x.s[1]; x.s[1] = x.s[0]; x.s[0] = y; y = top;
++  }
++  NxWrite(dst, x); return memory;
++}
++DEF_SEM(NX_SHA1H, V128W dst, V128 nv) {
++  NxVec n = NxRead(nv), r = {};
++  r.s[0] = NxRol32(n.s[0], 30);
++  NxWrite(dst, r); return memory;
++}
++DEF_SEM(NX_SHA1SU0, V128W dst, V128 dv, V128 nv, V128 mv) {
++  NxVec a = NxRead(dv), b = NxRead(nv), c = NxRead(mv), r = {};
++  r.d[1] = b.d[0] ^ a.d[1] ^ c.d[1];   // (Vn<63:0> : Vd<127:64>) ^ Vd ^ Vm
++  r.d[0] = a.d[1] ^ a.d[0] ^ c.d[0];
++  NxWrite(dst, r); return memory;
++}
++DEF_SEM(NX_SHA1SU1, V128W dst, V128 dv, V128 nv) {
++  NxVec a = NxRead(dv), b = NxRead(nv), r = {};
++  uint32_t t0 = a.s[0] ^ b.s[1], t1 = a.s[1] ^ b.s[2], t2 = a.s[2] ^ b.s[3], t3 = a.s[3];
++  r.s[0] = NxRol32(t0, 1); r.s[1] = NxRol32(t1, 1); r.s[2] = NxRol32(t2, 1);
++  r.s[3] = NxRol32(t3, 1) ^ NxRol32(t0, 2);
++  NxWrite(dst, r); return memory;
++}
++
++// SHA256hash of the manual: PART1 returns X (SHA256H, the new abcd), else Y (SHA256H2, the new efgh)
++template <bool PART1> ALWAYS_INLINE static NxVec NxSha256Hash(NxVec x, NxVec y, const NxVec &w) {
++  for (int e = 0; e < 4; e++) {
++    uint32_t chs = ((y.s[1] ^ y.s[2]) & y.s[0]) ^ y.s[2];
++    uint32_t maj = (x.s[0] & x.s[1]) | ((x.s[0] | x.s[1]) & x.s[2]);
++    uint32_t s1 = NxRor32(y.s[0], 6) ^ NxRor32(y.s[0], 11) ^ NxRor32(y.s[0], 25);
++    uint32_t s0 = NxRor32(x.s[0], 2) ^ NxRor32(x.s[0], 13) ^ NxRor32(x.s[0], 22);
++    uint32_t t = y.s[3] + s1 + chs + w.s[e];
++    x.s[3] = t + x.s[3];
++    y.s[3] = t + s0 + maj;
++    uint32_t xt = x.s[3], yt = y.s[3];   // <Y, X> = ROL(Y:X, 32)
++    x.s[3] = x.s[2]; x.s[2] = x.s[1]; x.s[1] = x.s[0]; x.s[0] = yt;
++    y.s[3] = y.s[2]; y.s[2] = y.s[1]; y.s[1] = y.s[0]; y.s[0] = xt;
++  }
++  return PART1 ? x : y;
++}
++DEF_SEM(NX_SHA256H, V128W dst, V128 dv, V128 nv, V128 mv) {
++  NxVec x = NxRead(dv), y = NxRead(nv), w = NxRead(mv);
++  NxVec r = NxSha256Hash<true>(x, y, w);
++  NxWrite(dst, r); return memory;
++}
++DEF_SEM(NX_SHA256H2, V128W dst, V128 dv, V128 nv, V128 mv) {
++  NxVec y = NxRead(dv), x = NxRead(nv), w = NxRead(mv);   // Vd holds the second state (efgh), Vn the first
++  NxVec r = NxSha256Hash<false>(x, y, w);
++  NxWrite(dst, r); return memory;
++}
++DEF_SEM(NX_SHA256SU0, V128W dst, V128 dv, V128 nv) {
++  NxVec x = NxRead(dv), y = NxRead(nv), r = {};
++  uint32_t t[4] = {x.s[1], x.s[2], x.s[3], y.s[0]};
++  for (int e = 0; e < 4; e++) r.s[e] = x.s[e] + (NxRor32(t[e], 7) ^ NxRor32(t[e], 18) ^ (t[e] >> 3));
++  NxWrite(dst, r); return memory;
++}
++DEF_SEM(NX_SHA256SU1, V128W dst, V128 dv, V128 nv, V128 mv) {
++  NxVec x = NxRead(dv), y = NxRead(nv), z = NxRead(mv), r = {};
++  uint32_t t0[4] = {y.s[1], y.s[2], y.s[3], z.s[0]};
++  uint32_t t1[2] = {z.s[2], z.s[3]};
++  for (int e = 0; e < 2; e++) r.s[e] = (NxRor32(t1[e], 17) ^ NxRor32(t1[e], 19) ^ (t1[e] >> 10)) + x.s[e] + t0[e];
++  for (int e = 2; e < 4; e++) r.s[e] = (NxRor32(r.s[e - 2], 17) ^ NxRor32(r.s[e - 2], 19) ^ (r.s[e - 2] >> 10)) + x.s[e] + t0[e];
++  NxWrite(dst, r); return memory;
++}
++
++// PMULL / PMULL2: carry-less products. E = 1: eight 8x8 -> 16 bit products of the low (Q = 0) or high (Q = 1) eight bytes; E = 8: one 64x64 -> 128 bit product of the low or high lane
++template <int E, int Q> DEF_SEM(NX_PMULL, V128W dst, V128 av, V128 bv) {
++  NxVec a = NxRead(av), b = NxRead(bv), r = {};
++  if constexpr (E == 1) {
++    for (int i = 0; i < 8; i++) {
++      uint16_t x = a.b[Q * 8 + i], y = b.b[Q * 8 + i], p = 0;
++      for (int k = 0; k < 8; k++) if ((y >> k) & 1) p ^= static_cast<uint16_t>(x << k);
++      r.h[i] = p;
++    }
++  } else {
++    uint64_t x = a.d[Q], y = b.d[Q], lo = 0, hi = 0;
++    for (int k = 0; k < 64; k++) if ((y >> k) & 1) { lo ^= x << k; if (k) hi ^= x >> (64 - k); }
++    r.d[0] = lo; r.d[1] = hi;
++  }
++  NxWrite(dst, r); return memory;
++}
++
++// FRSQRTE: FPRSqrtEstimate / RecipSqrtEstimate of the manual, on the bits (single: E = 4, double: E = 8). FPCR.FZ and the alternative NaN handling are not modelled
++ALWAYS_INLINE static unsigned NxRecipSqrtEstimate(unsigned a) {   // 128 <= a < 512
++  if (a < 256) a = a * 2 + 1; else a = ((a >> 1) << 1 | 1) * 2;
++  unsigned b = 512;
++  while (static_cast<uint64_t>(a) * (b + 1) * (b + 1) < (1ull << 28)) b++;
++  return (b + 1) / 2;
++}
++template <int E> ALWAYS_INLINE static uint64_t NxFrsqrte(uint64_t bits, State &state) {
++  constexpr int fb = E == 4 ? 23 : 52, eb = E == 4 ? 8 : 11;
++  const uint64_t fmask = (1ull << fb) - 1, emax = (1ull << eb) - 1;
++  uint64_t sign = bits >> (fb + eb), exp = (bits >> fb) & emax, frac = bits & fmask;
++  if (exp == emax && frac) {   // NaN: quieted, and an invalid operation if it was signalling
++    if (!(frac >> (fb - 1))) state.sr.ioc = 1;
++    return bits | (1ull << (fb - 1));
++  }
++  if (exp == 0 && frac == 0) { state.sr.dzc = 1; return (sign << (fb + eb)) | (emax << fb); }   // zero -> infinity
++  if (sign) { state.sr.ioc = 1; return (emax << fb) | (3ull << (fb - 1)); }   // negative -> the default NaN
++  if (exp == emax) return 0;   // +infinity -> +0
++  uint64_t fraction = E == 4 ? frac << 29 : frac;   // 52 bits
++  int64_t e = static_cast<int64_t>(exp);
++  if (e == 0) {   // denormal: normalise
++    while (!((fraction >> 51) & 1)) { fraction = (fraction << 1) & ((1ull << 52) - 1); e--; }
++    fraction = (fraction << 1) & ((1ull << 52) - 1);
++  }
++  unsigned scaled = (e & 1) == 0 ? (256u | static_cast<unsigned>((fraction >> 44) & 0xFF)) : (128u | static_cast<unsigned>((fraction >> 45) & 0x7F));
++  int64_t re = E == 4 ? (380 - e) : (3068 - e);
++  re = re >= 0 ? re / 2 : -((-re + 1) / 2);   // DIV rounds towards minus infinity
++  uint64_t estimate = NxRecipSqrtEstimate(scaled) & 0xFF;
++  return (static_cast<uint64_t>(re) & emax) << fb | estimate << (fb - 8);
++}
++template <int E, int Q> DEF_SEM(NX_FRSQRTE, V128W dst, V128 src) {
++  NxVec a = NxRead(src), r = {};
++  for (int i = 0; i < NxN<E, Q>::n; i++) {
++    if constexpr (E == 4) r.s[i] = static_cast<uint32_t>(NxFrsqrte<4>(a.s[i], state)); else r.d[i] = NxFrsqrte<8>(a.d[i], state);
++  }
++  NxWrite(dst, r); return memory;
++}
++
++// FRECPS (2 - a*b) and FRSQRTS ((3 - a*b) / 2): one fused multiply-add, and 1.5 / 2.0 when an infinity meets a zero (FPRecipStepFused / FPRSqrtStepFused)
++template <typename T> struct NxBits;
++template <> struct NxBits<float> { typedef uint32_t U; };
++template <> struct NxBits<double> { typedef uint64_t U; };
++template <typename T> ALWAYS_INLINE static T NxRecipStep(T a, T b) {
++  if ((__builtin_isinf(a) && b == 0) || (a == 0 && __builtin_isinf(b))) return static_cast<T>(2.0);
++  if constexpr (sizeof(T) == 4) return __builtin_fmaf(-a, b, 2.0f); else return __builtin_fma(-a, b, 2.0);
++}
++template <typename T> ALWAYS_INLINE static T NxRsqrtStep(T a, T b) {
++  if ((__builtin_isinf(a) && b == 0) || (a == 0 && __builtin_isinf(b))) return static_cast<T>(1.5);
++  // (3 - a*b) / 2 with one rounding, and no overflow of a*b: halve an operand that stays exact when halved (a normal number far from the bottom of the range). When both are tiny the product is only a sticky bit
++  // next to 3, and the plain fused step followed by the exact halving is right
++  if constexpr (sizeof(T) == 4) {
++    if (__builtin_fabsf(a) >= 0x1p-124f) return __builtin_fmaf(-a * 0.5f, b, 1.5f);
++    if (__builtin_fabsf(b) >= 0x1p-124f) return __builtin_fmaf(-a, b * 0.5f, 1.5f);
++    return __builtin_fmaf(-a, b, 3.0f) * 0.5f;
++  } else {
++    if (__builtin_fabs(a) >= 0x1p-1020) return __builtin_fma(-a * 0.5, b, 1.5);
++    if (__builtin_fabs(b) >= 0x1p-1020) return __builtin_fma(-a, b * 0.5, 1.5);
++    return __builtin_fma(-a, b, 3.0) * 0.5;
++  }
++}
++// a NaN operand: the first operand is negated before the NaNs are chosen (signalling before quiet, the first before the second), the result is quieted
++template <typename T> ALWAYS_INLINE static bool NxStepNaN(T x, T y, T &out) {
++  typedef typename NxBits<T>::U U;
++  constexpr U qb = static_cast<U>(1) << (sizeof(T) == 4 ? 22 : 51);
++  T a = -x;
++  bool na = __builtin_isnan(a), ny = __builtin_isnan(y);
++  if (!na && !ny) return false;
++  U ua = __builtin_bit_cast(U, a), uy = __builtin_bit_cast(U, y);
++  U r = (na && !(ua & qb)) ? ua : (ny && !(uy & qb)) ? uy : na ? ua : uy;
++  out = __builtin_bit_cast(T, static_cast<U>(r | qb));
++  return true;
++}
++NX_FSAME(NX_FRECPS, ({ T o_; NxStepNaN(x, y, o_) ? o_ : NxRecipStep(x, y); }))
++NX_FSAME(NX_FRSQRTS, ({ T o_; NxStepNaN(x, y, o_) ? o_ : NxRsqrtStep(x, y); }))
++
++}  // namespace
++
++DEF_ISEL(FRECPS_ASIMDSAME_ONLY_2S) = NX_FRECPS<4, 0>;
++DEF_ISEL(FRECPS_ASIMDSAME_ONLY_4S) = NX_FRECPS<4, 1>;
++DEF_ISEL(FRECPS_ASIMDSAME_ONLY_2D) = NX_FRECPS<8, 1>;
++DEF_ISEL(FRECPS_ASISDSAME_ONLY_S) = NX_FRECPS<4, 2>;
++DEF_ISEL(FRECPS_ASISDSAME_ONLY_D) = NX_FRECPS<8, 2>;
++DEF_ISEL(FRSQRTS_ASIMDSAME_ONLY_2S) = NX_FRSQRTS<4, 0>;
++DEF_ISEL(FRSQRTS_ASIMDSAME_ONLY_4S) = NX_FRSQRTS<4, 1>;
++DEF_ISEL(FRSQRTS_ASIMDSAME_ONLY_2D) = NX_FRSQRTS<8, 1>;
++DEF_ISEL(FRSQRTS_ASISDSAME_ONLY_S) = NX_FRSQRTS<4, 2>;
++DEF_ISEL(FRSQRTS_ASISDSAME_ONLY_D) = NX_FRSQRTS<8, 2>;
++DEF_ISEL(AESE_B_CRYPTOAES) = NX_AES2<0>;
++DEF_ISEL(AESD_B_CRYPTOAES) = NX_AES2<1>;
++DEF_ISEL(AESMC_B_CRYPTOAES) = NX_AES1<2>;
++DEF_ISEL(AESIMC_B_CRYPTOAES) = NX_AES1<3>;
++DEF_ISEL(SHA1C_QSV_CRYPTOSHA3) = NX_SHA1HASH<0>;
++DEF_ISEL(SHA1P_QSV_CRYPTOSHA3) = NX_SHA1HASH<1>;
++DEF_ISEL(SHA1M_QSV_CRYPTOSHA3) = NX_SHA1HASH<2>;
++DEF_ISEL(SHA1H_SS_CRYPTOSHA2) = NX_SHA1H;
++DEF_ISEL(SHA1SU0_VVV_CRYPTOSHA3) = NX_SHA1SU0;
++DEF_ISEL(SHA1SU1_VV_CRYPTOSHA2) = NX_SHA1SU1;
++DEF_ISEL(SHA256H_QQV_CRYPTOSHA3) = NX_SHA256H;
++DEF_ISEL(SHA256H2_QQV_CRYPTOSHA3) = NX_SHA256H2;
++DEF_ISEL(SHA256SU0_VV_CRYPTOSHA2) = NX_SHA256SU0;
++DEF_ISEL(SHA256SU1_VVV_CRYPTOSHA3) = NX_SHA256SU1;
++DEF_ISEL(PMULL_ASIMDDIFF_L_8B) = NX_PMULL<1, 0>;
++DEF_ISEL(PMULL_ASIMDDIFF_L_16B) = NX_PMULL<1, 1>;
++DEF_ISEL(PMULL_ASIMDDIFF_L_1D) = NX_PMULL<8, 0>;
++DEF_ISEL(PMULL_ASIMDDIFF_L_2D) = NX_PMULL<8, 1>;
++DEF_ISEL(FRSQRTE_ASIMDMISC_R_2S) = NX_FRSQRTE<4, 0>;
++DEF_ISEL(FRSQRTE_ASIMDMISC_R_4S) = NX_FRSQRTE<4, 1>;
++DEF_ISEL(FRSQRTE_ASIMDMISC_R_2D) = NX_FRSQRTE<8, 1>;
++DEF_ISEL(FRSQRTE_ASISDMISC_R_S) = NX_FRSQRTE<4, 2>;
++DEF_ISEL(FRSQRTE_ASISDMISC_R_D) = NX_FRSQRTE<8, 2>;
+-- 
+2.56.0
+

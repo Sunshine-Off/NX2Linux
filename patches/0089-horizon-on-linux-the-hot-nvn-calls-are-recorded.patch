@@ -1,0 +1,440 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 22:38:17 +0100
+Subject: [PATCH] horizon on linux: the hot NVN calls are recorded in C
+
+Bindings, viewports, draws, render targets and the setters of state objects are host functions in libnx2linux_gpu.so (linux/host/nvnrec.c) that the recompiled game calls without Python; nvn_rec.py takes each command buffer's stream back as the tuples horizon_nvn.py records itself. NX2LINUX_NVN_NATIVE=0 turns it off. Tests compare the C and Python versions on random arguments. 150 s of Xenoblade Chronicles 2: 637 frames against 517.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: the hot NVN calls recorded in C, off the Python bridge
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/aot_lift.py           |   6 ++
+ dm/tools/horizon_nvn.py        |  45 ++++++++---
+ dm/tools/horizon_run.py        |   4 +-
+ dm/tools/nvn_rec.py            | 141 +++++++++++++++++++++++++++++++++
+ dm/tools/tests/test_nvn_rec.py | 113 ++++++++++++++++++++++++++
+ 5 files changed, 297 insertions(+), 12 deletions(-)
+ create mode 100644 dm/tools/nvn_rec.py
+ create mode 100644 dm/tools/tests/test_nvn_rec.py
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index 91f4a8d..9decbbe 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -349,6 +349,12 @@ class Aot:
+             cb = self.IMPORT(call); self._imports = getattr(self, '_imports', []) + [cb]   # kept alive: the library holds only the raw pointer
+         return L.aot_register_import(addr, ctypes.cast(cb, ctypes.c_void_p).value if cb else None, None, name.encode())
+ 
++    def register_native(self, addr, fn, ctx, name):
++        """A host function written in C (a function pointer and its context, from a library loaded in this process) at a guest address: the call never reaches Python. Returns 0, or 1 when the address is taken"""
++        L = self.lib
++        L.aot_register_import.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
++        return L.aot_register_import(addr, fn, ctx, name.encode())
++
+     def peek(self, base, size):
+         buf = ctypes.create_string_buffer(size)
+         assert self.lib.aot_peek(base, buf, size) == 0
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+index 67cb9ba..484414a 100644
+--- a/dm/tools/horizon_nvn.py
++++ b/dm/tools/horizon_nvn.py
+@@ -4,7 +4,7 @@ What exists: devices and limits (Tegra X1 values), memory pools and buffers over
+ and replay at submit (render targets, clears, copies), and the window whose textures are shown through horizon_display. State objects (nvn_state.py), programs (their shaders hashed
+ and optionally dumped), bindings and the parameters of every draw are recorded and replayed into a DrawCall per draw (Nvn.draw_log, Nvn.draw_sink): the data a Vulkan backend needs. Nothing
+ is rasterized yet: the picture is what the game clears and copies. Anything not implemented answers 0 and is logged once with its name and arguments, never faked as a result the game could act on."""
+-import hashlib, json, os, re, struct, threading, time
++import ctypes, hashlib, json, os, re, struct, threading, time
+ from pathlib import Path
+ 
+ import nvn_layout
+@@ -48,6 +48,7 @@ class Nvn:
+             import cProfile
+             self.gpu_profile = cProfile.Profile()
+         self.input = None
++        self.rec = None          # a nvn_rec.Recorder: the hot calls are host functions in C and their commands are taken from there
+         self.draw_sink = None   # called with the described draw (describe_draw) of every draw at submit: the hook of a rendering backend
+         self.draw_log, self.draw_log_max = None, int(os.environ.get('NX2LINUX_DRAW_LOG_MAX', '2000'))
+         if os.environ.get('NX2LINUX_DRAW_LOG'): self.draw_log = open(os.environ['NX2LINUX_DRAW_LOG'], 'w')   # JSON lines, one per draw, the first NX2LINUX_DRAW_LOG_MAX of them
+@@ -67,6 +68,11 @@ class Nvn:
+             self.hz.log(f'[nvn] address lookup of an unknown name: {name}')
+             return 0
+         a = self.hz.ms._import_address(name)
++        nat = self.rec.native(name) if self.rec and not self.trace else None
++        if nat:   # a host function in C: the call never reaches Python
++            if self.hz.aot.register_native(a, nat[0], nat[1], name): raise RuntimeError(f'cannot register {name}')
++            self.addr[name] = a
++            return a
+         impl = IMPL.get(name)
+         if impl is None:
+             if name.endswith('Initialize'): impl = lambda nvn, r: r.__setitem__(0, OK_BOOL)
+@@ -81,6 +87,19 @@ class Nvn:
+         self.addr[name] = a
+         return a
+ 
++    def all_calls(self):
++        """The calls counted in Python and in C"""
++        out = dict(self.calls)
++        if self.rec:
++            for k, v in self.rec.counts().items(): out[k] = out.get(k, 0) + v
++        return out
++
++    def commands(self, cb):
++        """The commands recorded so far for the command buffer at cb (the list that grows), the ones recorded in C taken in first so the order is the game's"""
++        lst = self.get(cb).setdefault('cmds', [])
++        if self.rec: lst.extend(self.rec.take(cb))
++        return lst
++
+     def unimplemented(self, name):
+         def f(nvn, r):
+             nvn.unimpl[name] = nvn.unimpl.get(name, 0) + 1
+@@ -565,20 +584,22 @@ def _(n, r): pass
+ @nvn('nvnCommandBufferAddControlMemory')
+ def _(n, r): pass
+ @nvn('nvnCommandBufferBeginRecording')
+-def _(n, r): c = n.get(r[0]); c['cmds'] = []; c['recording'] = True
++def _(n, r):
++    c = n.get(r[0]); c['cmds'] = []; c['recording'] = True
++    if n.rec: n.rec.reset(r[0])
+ @nvn('nvnCommandBufferEndRecording')
+ def _(n, r):
+     c = n.get(r[0]); c['recording'] = False
+-    h = n.new_handle(); n.cmdlists[h] = c['cmds']; c['used'] = 16 * (len(c['cmds']) + 1); c['cmds'] = []
++    cmds = n.commands(r[0]); h = n.new_handle(); n.cmdlists[h] = cmds; c['used'] = 16 * (len(cmds) + 1); c['cmds'] = []
+     ret(r, h)
+ @nvn('nvnCommandBufferGetCommandMemoryUsed')
+-def _(n, r): c = n.get(r[0]); ret(r, c.get('used', 0) if not c.get('recording') else 16 * (len(c.get('cmds', [])) + 1))
++def _(n, r): c = n.get(r[0]); ret(r, c.get('used', 0) if not c.get('recording') else 16 * (len(n.commands(r[0])) + 1))
+ @nvn('nvnCommandBufferGetControlMemoryUsed')
+ def _(n, r): ret(r, 0)
+ @nvn('nvnCommandBufferIsRecording')
+ def _(n, r): ret(r, int(bool(n.get(r[0]).get('recording'))))
+ @nvn('nvnCommandBufferCopyCommands')
+-def _(n, r): c = n.get(r[0]); k = r[1] & M32; c.setdefault('cmds', []).append(('call', struct.unpack(f'<{k}Q', n.hz.rd(r[2], 8 * k)) if k else ()))
++def _(n, r): k = r[1] & M32; rec(n, r, 'call', struct.unpack(f'<{k}Q', n.hz.rd(r[2], 8 * k)) if k else ())
+ IMPL['nvnCommandBufferCallCommands'] = IMPL['nvnCommandBufferCopyCommands']
+ def read_view(n, ptr):
+     """The texture view struct at ptr as a dict, or None"""
+@@ -590,16 +611,16 @@ def _(n, r):
+     k = r[1] & M32
+     ptrs = list(struct.unpack(f'<{k}Q', n.hz.rd(r[2], 8 * k))) if k else []
+     vptrs = list(struct.unpack(f'<{k}Q', n.hz.rd(r[3], 8 * k))) if k and r[3] else [0] * k
+-    n.get(r[0]).setdefault('cmds', []).append(('targets', ptrs, r[4], [read_view(n, v) for v in vptrs], read_view(n, r[5])))
++    rec(n, r, 'targets', ptrs, r[4], [read_view(n, v) for v in vptrs], read_view(n, r[5]))
+ @nvn('nvnCommandBufferClearColor')
+-def _(n, r): n.get(r[0]).setdefault('cmds', []).append(('clear', r[1] & M32, struct.unpack('<4f', n.hz.rd(r[2], 16)), r[3] & M32))
++def _(n, r): rec(n, r, 'clear', r[1] & M32, struct.unpack('<4f', n.hz.rd(r[2], 16)), r[3] & M32)
+ @nvn('nvnCommandBufferClearColori')
+ def _(n, r): rec(n, r, 'clear_raw', r[1] & M32, n.hz.rd(r[2], 16), r[3] & M32)
+ IMPL['nvnCommandBufferClearColorui'] = IMPL['nvnCommandBufferClearColori']
+ @nvn('nvnCommandBufferClearTexture')
+-def _(n, r): n.get(r[0]).setdefault('cmds', []).append(('cleartex', r[1], struct.unpack('<4f', n.hz.rd(r[4], 16)), r[5] & M32))
++def _(n, r): rec(n, r, 'cleartex', r[1], struct.unpack('<4f', n.hz.rd(r[4], 16)), r[5] & M32)
+ @nvn('nvnCommandBufferSignalEvent')
+-def _(n, r): n.get(r[0]).setdefault('cmds', []).append(('signal', r[1], r[2] & M32, r[5] & M32))
++def _(n, r): rec(n, r, 'signal', r[1], r[2] & M32, r[5] & M32)
+ @nvn('nvnCommandBufferFenceSync')
+ def _(n, r): n.get(r[1])['fenced'] = True
+ # ---- programs: the shaders a program is given are hashed (and dumped on request); the Maxwell code is what a SPIR-V translator will read ----
+@@ -688,7 +709,7 @@ def _(n, r): n.o.pop(r[0], None)
+ 
+ 
+ # ---- recorded state, bindings and draws: replayed in order at submit (Nvn.replay) ----
+-def rec(n, r, *cmd): n.get(r[0]).setdefault('cmds', []).append(cmd)
++def rec(n, r, *cmd): n.commands(r[0]).append(cmd)
+ 
+ 
+ def f32(r, i):
+@@ -896,4 +917,8 @@ def bootstrap_loader(hz, r):
+         if os.environ.get('NX2LINUX_GPU'):   # NX2LINUX_GPU=1: the draws are rendered on the host GPU (NX2LINUX_GPU=soft: on the CPU Vulkan device)
+             import nvn_gpu
+             hz.nvn.gpu = nvn_gpu.GpuBackend(hz.nvn, software=os.environ['NX2LINUX_GPU'] == 'soft'); hz.log(f'[nvn] drawing on {hz.nvn.gpu.gpu.name}')
++            if os.environ.get('NX2LINUX_NVN_NATIVE', '1') != '0' and hasattr(hz.aot, 'register_native'):   # the hot calls in C (nvn_rec.py); NX2LINUX_NVN_NATIVE=0: all in Python
++                import nvn_rec
++                try: hz.nvn.rec = nvn_rec.Recorder(hz.nvn.gpu.gpu.lib, ctypes.cast(hz.aot.lib.aot_guest_ptr, ctypes.c_void_p)); hz.log(f'[nvn] {len(hz.nvn.rec.names)} NVN calls recorded in C')
++                except (AttributeError, OSError) as e: hz.log(f'[nvn] recording in C not available: {e}')
+     r[0] = hz.nvn.lookup(hz.cstring(r[0]))
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index b5d1c6d..9496093 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -43,8 +43,8 @@ def main():
+     def report():
+         print('frames presented:', getattr(hz, 'frames_presented', 0), '| svc calls:', hz.stats, '| not translated functions called:', hz.aot.stat('unlifted_calls'))
+         if hasattr(hz, 'nvn'): print('nvn:', hz.nvn.stats, '| not implemented NVN calls:', sorted(hz.nvn.unimpl)[:60])
+-        if hasattr(hz, 'nvn'): print('NVN calls (most frequent):', sorted(hz.nvn.calls.items(), key=lambda kv: -kv[1])[:30])
+-        if hasattr(hz, 'nvn'): print('NVN queue/window/recording calls:', {k: v for k, v in hz.nvn.calls.items() if any(x in k for x in ('Queue', 'Window', 'Recording', 'Commands', 'Sync'))})
++        if hasattr(hz, 'nvn'): print('NVN calls (most frequent):', sorted(hz.nvn.all_calls().items(), key=lambda kv: -kv[1])[:30])
++        if hasattr(hz, 'nvn'): print('NVN queue/window/recording calls:', {k: v for k, v in hz.nvn.all_calls().items() if any(x in k for x in ('Queue', 'Window', 'Recording', 'Commands', 'Sync'))})
+         if hasattr(hz, 'nvn'): print('NVN functions the game looked up:', len(hz.nvn.addr), '| Submit looked up:', 'nvnQueueSubmitCommands' in hz.nvn.addr, '| command lists recorded:', len(hz.nvn.cmdlists))
+         if hasattr(hz, 'nvn'): print('clear colors (on a window texture?, rgba): count:', sorted(hz.nvn.clear_colors.items(), key=lambda kv: -kv[1])[:12])
+         print('stubbed overrides called:', sorted(hz.stub_calls)); print('where the guest threads are:\n' + hz.thread_report()); print(hz.ring_report(1)); print('threads that stopped:', hz.thread_faults, flush=True)
+diff --git a/dm/tools/nvn_rec.py b/dm/tools/nvn_rec.py
+new file mode 100644
+index 0000000..56ed68f
+--- /dev/null
++++ b/dm/tools/nvn_rec.py
+@@ -0,0 +1,141 @@
++"""NVN command recording in C (NX2Linux S7bis): the hot NVN calls (bindings, viewports, draws, the setters of state objects) are host functions written in C (linux/host/nvnrec.c, in libnx2linux_gpu.so) that
++the recompiled game calls without going through Python. A command buffer call appends a binary record to that buffer's stream; this module turns the stream into the tuples horizon_nvn.py records itself
++(Nvn.replay reads either), and defines the state setters in C from the layouts of nvn_state.py. NX2LINUX_NVN_NATIVE=0 turns it off. The record layouts below mirror nvnrec.c."""
++import ctypes as C
++import os
++import struct
++
++import nvn_state
++
++OP_UBO, OP_SSBO, OP_VBUF, OP_TEX, OP_VIEWPORT, OP_SCISSOR, OP_PROGRAM, OP_BIND_STATE, OP_VATTR, OP_VSTREAM, OP_DRAW, OP_TARGETS, OP_STENCIL = range(1, 14)
++STATE_KINDS = (nvn_state.BLEND, nvn_state.COLOR, nvn_state.CHMASK, nvn_state.MULTISAMPLE, nvn_state.POLYGON, nvn_state.DEPTH_STENCIL)   # the order of nvnrec.c r_bind_state
++STENCIL_KEYS = ('stencil_ref_', 'stencil_mask_', 'stencil_value_mask_')
++F_MASK, F_BOOL, F_ADV_MODE, F_NOT = range(4)
++SP_NONE, SP_BLEND_ENABLE, SP_CHMASK, SP_STENCIL_FUNC, SP_STENCIL_OP = range(5)
++
++
++class Fld(C.Structure): _fields_ = [('off', C.c_uint8), ('width', C.c_uint8), ('mode', C.c_uint8)]
++class SetDesc(C.Structure): _fields_ = [('size', C.c_uint32), ('special', C.c_uint32), ('nf', C.c_uint32), ('f', Fld * 8)]
++
++
++# (kind, setter) -> (special, [(field, mode)]): the setters of nvn_state.OBJECTS that run in C. The tests compare each against its Python version on the same arguments
++NATIVE_SETTERS = {
++    'BlendState': {'SetBlendTarget': (SP_NONE, [('target', F_MASK)]), 'SetBlendFunc': (SP_NONE, [('src_rgb', F_MASK), ('dst_rgb', F_MASK), ('src_a', F_MASK), ('dst_a', F_MASK)]),
++                   'SetBlendEquation': (SP_NONE, [('eq_rgb', F_MASK), ('eq_a', F_MASK)]), 'SetAdvancedMode': (SP_NONE, [('adv', F_ADV_MODE)]),
++                   'SetAdvancedPremultipliedSrc': (SP_NONE, [('adv_npm', F_NOT)]), 'SetAdvancedOverlap': (SP_NONE, [('adv_ovl', F_MASK)])},
++    'ColorState': {'SetBlendEnable': (SP_BLEND_ENABLE, [('blend_en', F_MASK)]), 'SetAlphaTest': (SP_NONE, [('alpha_func', F_MASK)]), 'SetLogicOp': (SP_NONE, [('logic_op', F_MASK)])},
++    'ChannelMaskState': {'SetChannelMask': (SP_CHMASK, [('mask', F_MASK)])},
++    'MultisampleState': {'SetMultisampleEnable': (SP_NONE, [('enable', F_BOOL)]), 'SetSamples': (SP_NONE, [('samples', F_MASK)]), 'SetAlphaToCoverageEnable': (SP_NONE, [('a2c', F_BOOL)]),
++                         'SetAlphaToCoverageDither': (SP_NONE, [('a2c_dither', F_BOOL)]), 'SetRasterSamples': (SP_NONE, [('raster_samples', F_MASK)]), 'SetCoverageModulationMode': (SP_NONE, [('cov_mod', F_MASK)]),
++                         'SetCoverageToColorEnable': (SP_NONE, [('cov2color_en', F_BOOL)]), 'SetCoverageToColorOutput': (SP_NONE, [('cov2color_out', F_MASK)]),
++                         'SetSampleLocationsEnable': (SP_NONE, [('sl_en', F_BOOL)]), 'SetSampleLocationsGridEnable': (SP_NONE, [('sl_grid', F_BOOL)])},
++    'PolygonState': {'SetCullFace': (SP_NONE, [('cull', F_MASK)]), 'SetFrontFace': (SP_NONE, [('front', F_MASK)]), 'SetPolygonMode': (SP_NONE, [('mode', F_MASK)]),
++                     'SetPolygonOffsetEnables': (SP_NONE, [('offset_en', F_MASK)])},
++    'DepthStencilState': {'SetDepthTestEnable': (SP_NONE, [('dt', F_BOOL)]), 'SetDepthWriteEnable': (SP_NONE, [('dw', F_BOOL)]), 'SetDepthFunc': (SP_NONE, [('df', F_MASK)]),
++                          'SetStencilTestEnable': (SP_NONE, [('st', F_BOOL)]), 'SetStencilFunc': (SP_STENCIL_FUNC, [('sf_f', F_MASK), ('sf_b', F_MASK)]),
++                          'SetStencilOp': (SP_STENCIL_OP, [(k, F_MASK) for k in ('fail_f', 'zfail_f', 'zpass_f', 'fail_b', 'zfail_b', 'zpass_b')])},
++    'VertexAttribState': {'SetFormat': (SP_NONE, [('fmt', F_MASK), ('offset', F_MASK)]), 'SetStreamIndex': (SP_NONE, [('stream', F_MASK)])},
++    'VertexStreamState': {'SetStride': (SP_NONE, [('stride', F_MASK)]), 'SetDivisor': (SP_NONE, [('divisor', F_MASK)])},
++}
++
++
++def descriptor(spec, special, fields):
++    offsets, off = {}, 0
++    for f, w in spec.fields: offsets[f] = (off, w); off += w
++    d = SetDesc(size=spec.size, special=special, nf=len(fields))
++    for i, (f, mode) in enumerate(fields): d.f[i] = Fld(offsets[f][0], offsets[f][1], mode)
++    return d
++
++
++class Recorder:
++    """The C recorder of one library: registers the native host functions and takes the streams of command buffers back as recorded tuples"""
++    def __init__(self, lib, guest_ptr):
++        self.lib = L = lib
++        L.nx2rec_init.argtypes = [C.c_void_p]
++        L.nx2rec_define_setter.argtypes = [C.c_char_p, C.POINTER(SetDesc)]
++        L.nx2rec_native.argtypes = [C.c_char_p, C.POINTER(C.c_void_p), C.POINTER(C.c_void_p)]
++        L.nx2rec_count.argtypes = [C.c_char_p]; L.nx2rec_count.restype = C.c_uint64
++        L.nx2rec_names.argtypes = [C.c_char_p, C.c_uint64]
++        L.nx2rec_len.argtypes = [C.c_uint64]; L.nx2rec_len.restype = C.c_uint32
++        L.nx2rec_take.argtypes = [C.c_uint64, C.c_char_p, C.c_uint32]; L.nx2rec_take.restype = C.c_uint32
++        L.nx2rec_reset.argtypes = [C.c_uint64]
++        L.nx2rec_init(guest_ptr)
++        self.defined = 0
++        for kind, setters in NATIVE_SETTERS.items():
++            spec = nvn_state.OBJECTS[kind][0]
++            for name, (special, fields) in setters.items():
++                if L.nx2rec_define_setter(f'nvn{kind}{name}'.encode(), C.byref(descriptor(spec, special, fields))): raise RuntimeError(f'too many natives at nvn{kind}{name}')
++                self.defined += 1
++        buf = C.create_string_buffer(1 << 14)
++        n = L.nx2rec_names(buf, len(buf))
++        self.names = set(buf.raw[:n].decode().split())
++        self.cache = {}   # (op, raw bytes) -> decoded state objects, shared: nothing changes them after they are recorded
++
++    def native(self, name):
++        """(function pointer, context pointer) of the C version of an NVN function, or None"""
++        if name not in self.names: return None
++        fn, ctx = C.c_void_p(), C.c_void_p()
++        if self.lib.nx2rec_native(name.encode(), C.byref(fn), C.byref(ctx)): return None
++        return fn.value, ctx.value
++
++    def counts(self): return {n: c for n in self.names if (c := self.lib.nx2rec_count(n.encode()))}
++
++    def reset(self, cb): self.lib.nx2rec_reset(cb)
++
++    def pending(self, cb): return self.lib.nx2rec_len(cb)
++
++    def take(self, cb):
++        """The commands recorded in C for the command buffer at cb since the last take, as the tuples horizon_nvn.rec makes"""
++        n = self.lib.nx2rec_len(cb)
++        if not n: return []
++        buf = C.create_string_buffer(n)
++        n = self.lib.nx2rec_take(cb, buf, n)
++        return self.decode(buf.raw[:n])
++
++    def decode(self, raw):
++        out, pos, end, cache = [], 0, len(raw), self.cache
++        while pos < end:
++            head = struct.unpack_from('<Q', raw, pos)[0]; op, nwords = head & 0xFFFFFFFF, head >> 32
++            body = pos + 8; pos += 8 * nwords
++            if op == OP_UBO or op == OP_SSBO:
++                stage, idx, addr, size = struct.unpack_from('<4Q', raw, body); out.append(('ubo' if op == OP_UBO else 'ssbo', {(stage, idx): (addr, size)}))
++            elif op == OP_VBUF:
++                idx, addr, size = struct.unpack_from('<3Q', raw, body); out.append(('vbuf', {idx: (addr, size)}))
++            elif op == OP_TEX:
++                stage, idx, h = struct.unpack_from('<3Q', raw, body); out.append(('tex', {(stage, idx): h}))
++            elif op == OP_VIEWPORT or op == OP_SCISSOR:
++                out.append(('viewports' if op == OP_VIEWPORT else 'scissors', {0: struct.unpack_from('<4q', raw, body)}))
++            elif op == OP_PROGRAM:
++                ptr, stages = struct.unpack_from('<2Q', raw, body); out.append(('program', ptr, stages))
++            elif op == OP_BIND_STATE:
++                kind = struct.unpack_from('<Q', raw, body)[0]; spec = STATE_KINDS[kind]; data = raw[body + 8:body + 8 + spec.size]
++                d = cache.get((op, kind, data))
++                if d is None: d = cache[(op, kind, data)] = spec.unpack(data)
++                out.append(('bind_state', spec.name, d))
++            elif op == OP_VATTR or op == OP_VSTREAM:
++                k = struct.unpack_from('<Q', raw, body)[0]; spec = nvn_state.VERTEX_ATTRIB if op == OP_VATTR else nvn_state.VERTEX_STREAM
++                data = raw[body + 8:body + 8 + k * spec.size]
++                d = cache.get((op, data))
++                if d is None: d = cache[(op, data)] = [spec.unpack(data[i * spec.size:(i + 1) * spec.size]) for i in range(k)]
++                out.append(('vattr' if op == OP_VATTR else 'vstream', d))
++            elif op == OP_DRAW:
++                el, prim, first, count, itype, ibuf, bv, bi, inst = struct.unpack_from('<2Q2q2Qq2q', raw, body)
++                if el: out.append(('draw', {'kind': 'elements', 'prim': prim, 'index_type': itype, 'count': count, 'index_buffer': ibuf, 'base_vertex': bv, 'base_instance': bi, 'instances': inst}))
++                else: out.append(('draw', {'kind': 'arrays', 'prim': prim, 'first': first, 'count': count, 'base_instance': bi, 'instances': inst}))
++            elif op == OP_TARGETS:
++                k, depth, has_dv = struct.unpack_from('<3Q', raw, body); dv_raw = raw[body + 24:body + 40]
++                ptrs, views = [], []
++                for i in range(k):
++                    ptr, has, = struct.unpack_from('<2Q', raw, body + 40 + 32 * i); vraw = raw[body + 56 + 32 * i:body + 72 + 32 * i]
++                    ptrs.append(ptr); views.append(self.view(vraw) if has else None)
++                out.append(('targets', ptrs, depth, views, self.view(dv_raw) if has_dv else None))
++            elif op == OP_STENCIL:
++                which, faces, value = struct.unpack_from('<3Q', raw, body); key = STENCIL_KEYS[which]
++                out.append(('misc', {f'{key}{f}': value for f in (1, 2) if faces & f}))
++            else: raise ValueError(f'unknown record {op} in the stream of a command buffer')
++        return out
++
++    def view(self, raw):
++        d = self.cache.get(('view', raw))
++        if d is None: d = self.cache[('view', raw)] = nvn_state.TEXTURE_VIEW.unpack(raw)
++        return d
+diff --git a/dm/tools/tests/test_nvn_rec.py b/dm/tools/tests/test_nvn_rec.py
+new file mode 100644
+index 0000000..006f520
+--- /dev/null
++++ b/dm/tools/tests/test_nvn_rec.py
+@@ -0,0 +1,113 @@
++"""nvn_rec.py / linux/host/nvnrec.c: the NVN calls recorded in C give the same commands, and change state objects to the same bytes, as the Python versions in horizon_nvn.py (random arguments, a fake guest memory)"""
++import ctypes as C
++import random, struct, sys, unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++import horizon_gpu
++import horizon_nvn as hn
++import nvn_rec
++import nvn_state
++
++LIB = horizon_gpu.library_path()
++CB, SIZE = 0x10000, 0x100000
++M64 = (1 << 64) - 1
++IMPORT = C.CFUNCTYPE(None, C.POINTER(C.c_uint64), C.c_void_p)
++
++
++class FakeHz:
++    def __init__(self, mem): self.mem, self.logs = mem, []
++    def rd(self, a, n):
++        assert 0 <= a and a + n <= len(self.mem), 'out of range'
++        return bytes(self.mem[a:a + n])
++    def wr(self, a, d): self.mem[a:a + len(d)] = d
++    def log(self, m): self.logs.append(m)
++    verbose_nvn = False
++
++
++@unittest.skipUnless(LIB, 'libnx2linux_gpu.so is not built')
++class Native(unittest.TestCase):
++    def setUp(self):
++        rnd = self.rnd = random.Random(7)
++        self.mem_py = bytearray(rnd.randbytes(SIZE)); self.mem_c = bytearray(self.mem_py)
++        self.buf = (C.c_char * SIZE).from_buffer(self.mem_c)
++        base = C.addressof(self.buf)
++        def guest(a, n): return base + a if a + n <= SIZE and n >= 0 else None
++        self.guest = C.CFUNCTYPE(C.c_void_p, C.c_uint64, C.c_uint64)(guest)
++        self.rec = nvn_rec.Recorder(C.CDLL(LIB), C.cast(self.guest, C.c_void_p))
++        self.py, self.c = hn.Nvn(FakeHz(self.mem_py)), hn.Nvn(FakeHz(self.mem_c)); self.c.rec = self.rec
++        for n in (self.py, self.c): n.get(CB)['cmds'] = []
++        self.rec.reset(CB)
++        # tables the calls read: target pointers, view pointers
++        for mem in (self.mem_py, self.mem_c):
++            struct.pack_into('<4Q', mem, 0x20000, 0x30000, 0x30100, 0x30200, 0x30300)
++            struct.pack_into('<4Q', mem, 0x21000, 0x22000, 0, 0x22040, 0x22080)
++
++    def native(self, name):
++        fn, ctx = self.rec.native(name)
++        return C.cast(fn, IMPORT), ctx
++
++    def call_c(self, name, args):
++        fn, ctx = self.native(name)
++        regs = (C.c_uint64 * 39)(*[a & M64 for a in args])
++        fn(regs, ctx)
++        return regs[0]
++
++    def call_py(self, name, args):
++        r = list(args) + [0] * (39 - len(args)); hn.IMPL[name](self.py, r); return r[0]
++
++    def both(self, name, args):
++        self.call_py(name, args); self.call_c(name, args)
++
++    def r64(self): return self.rnd.getrandbits(64)
++
++    def check(self):
++        self.assertEqual(self.c.commands(CB), self.py.commands(CB))
++
++    def test_bindings_viewports_and_programs(self):
++        for name in ('nvnCommandBufferBindUniformBuffer', 'nvnCommandBufferBindStorageBuffer', 'nvnCommandBufferBindVertexBuffer', 'nvnCommandBufferBindTexture', 'nvnCommandBufferSetViewport',
++                     'nvnCommandBufferSetScissor', 'nvnCommandBufferBindProgram', 'nvnCommandBufferSetStencilRef', 'nvnCommandBufferSetStencilMask', 'nvnCommandBufferSetStencilValueMask'):
++            for _ in range(20): self.both(name, [CB] + [self.r64() if self.rnd.random() < 0.5 else self.rnd.randrange(1 << 20) for _ in range(5)])
++        self.check()
++
++    def test_draws(self):
++        for name in ('nvnCommandBufferDrawArrays', 'nvnCommandBufferDrawArraysInstanced', 'nvnCommandBufferDrawElements', 'nvnCommandBufferDrawElementsBaseVertex', 'nvnCommandBufferDrawElementsInstanced'):
++            for _ in range(20): self.both(name, [CB] + [self.r64() if self.rnd.random() < 0.5 else self.rnd.randrange(1 << 20) for _ in range(7)])
++        self.check()
++
++    def test_state_objects_and_vertex_arrays(self):
++        for kind in ('Blend', 'Color', 'ChannelMask', 'Multisample', 'Polygon', 'DepthStencil'):
++            for _ in range(5): self.both(f'nvnCommandBufferBind{kind}State', [CB, 0x40000 + 64 * self.rnd.randrange(100)])
++        for name in ('nvnCommandBufferBindVertexAttribState', 'nvnCommandBufferBindVertexStreamState'):
++            for k in (0, 1, 3, 16, 17, 100): self.both(name, [CB, k, 0x50000 + 8 * self.rnd.randrange(100)])
++        self.check()
++
++    def test_render_targets(self):
++        for k, views, dview in ((0, 0, 0), (1, 0, 0), (2, 0x21000, 0x23000), (4, 0x21000, 0), (3, 0, 0x23040)):
++            self.both('nvnCommandBufferSetRenderTargets', [CB, k, 0x20000, views, self.r64(), dview])
++        self.check()
++
++    def test_the_order_of_commands_from_python_and_c_is_kept(self):
++        self.call_c('nvnCommandBufferSetViewport', [CB, 1, 2, 3, 4])
++        hn.rec(self.c, [CB], 'misc', {'x': 1})
++        self.call_c('nvnCommandBufferSetScissor', [CB, 5, 6, 7, 8])
++        self.assertEqual([c[0] for c in self.c.commands(CB)], ['viewports', 'misc', 'scissors'])
++
++    def test_every_setter_changes_the_struct_as_python_does(self):
++        for kind, setters in nvn_rec.NATIVE_SETTERS.items():
++            spec = nvn_state.OBJECTS[kind][0]
++            for name in setters:
++                for i in range(30):
++                    addr = 0x60000 + 32 * i
++                    args = [addr] + [self.rnd.choice((0, 1, 2, 3, 0xFF, 0x100, 0x1F, 0x20, self.r64())) for _ in range(5)]
++                    for mem in (self.mem_py, self.mem_c): mem[addr:addr + spec.size] = spec.pack(spec.default()) if i % 2 else bytes(spec.size)
++                    self.both(f'nvn{kind}{name}', args)
++                    self.assertEqual(self.mem_py[addr:addr + spec.size], self.mem_c[addr:addr + spec.size], f'{kind}{name} {args}')
++
++    def test_texture_handles_and_the_counts(self):
++        self.assertEqual(self.call_c('nvnDeviceGetTextureHandle', [0, 5, 7]), self.call_py('nvnDeviceGetTextureHandle', [0, 5, 7]))
++        self.assertEqual(self.call_c('nvnDeviceGetTexelFetchHandle', [0, 0x1_0000_0005]), self.call_py('nvnDeviceGetTexelFetchHandle', [0, 0x1_0000_0005]))
++        self.assertEqual(self.rec.counts()['nvnDeviceGetTextureHandle'], 1)
++
++
++if __name__ == '__main__': unittest.main()

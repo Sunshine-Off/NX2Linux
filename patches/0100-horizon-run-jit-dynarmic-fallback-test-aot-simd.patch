@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 00:03:06 +0100
+Subject: [PATCH] horizon_run: --jit (dynarmic fallback); test_aot_simd: faddp
+ joins the known flag differences
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux milestone A: the dynarmic fallback could not be switched on from the runner; the faddp flag difference (patch 0008) was not in the frozen list
+Issue: none yet (NX2Linux, branch Téo/jalon-a-reproductibilite)
+
+---
+ dm/tools/horizon_run.py         | 7 ++++---
+ dm/tools/tests/test_aot_simd.py | 2 +-
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 01d6d4b..c39729d 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ """Run a recompiled game on the Linux host (NX2Linux S7bis): load its modules, replace the SDK functions the host provides, start nn::init::Start's sequence and let the game run for a while.
+-Usage: horizon_run.py --modules <dir with <name>.manifest.json> --romfs <RomFS.img> --title <id> [--display|--hidden] [--seconds N] [--profile xc2] [--cache DIR]
+-Needs REMILL_BUILD (the lifter) for functions not in the cache. The window needs linux/host built (libnx2linux_display.so, see horizon_display.py)."""
++Usage: horizon_run.py [--jit] --modules <dir with <name>.manifest.json> --romfs <RomFS.img> --title <id> [--display|--hidden] [--seconds N] [--profile xc2] [--cache DIR]
++Needs REMILL_BUILD (the lifter) for functions not in the cache, and DYNARMIC_DIR with --jit (both: tools/setup_toolchain.sh writes an env.sh). The window needs linux/host built (libnx2linux_display.so, see horizon_display.py)."""
+ import argparse, os, sys, time
+ from pathlib import Path
+ 
+@@ -20,6 +20,7 @@ def main():
+     p.add_argument('--cache', default=str(Path.home() / '.cache/nx2linux/aot-cache'))
+     p.add_argument('--display', action='store_true', help='open a window when the game first presents a frame'); p.add_argument('--hidden', action='store_true', help='with --display: keep the window hidden')
+     p.add_argument('--seconds', type=float, default=60, help='stop after this long (the game runs on its own threads)')
++    p.add_argument('--jit', action='store_true', help='build the dynarmic fallback (needs DYNARMIC_DIR: tools/setup_toolchain.sh): a function that cannot be lifted runs in the JIT instead of stopping its thread. Turns the inline memory accesses off')
+     p.add_argument('--no-profile', action='store_true', help='do not apply the per-title workarounds'); p.add_argument('--verbose', action='store_true')
+     a = p.parse_args()
+     mods = [f'{a.modules}/{n}.manifest.json' for n in a.order.split(',')]
+@@ -30,7 +31,7 @@ def main():
+     if prof and not a.no_profile:
+         mod = __import__(prof); ovr.update(horizon_overrides.install_profile(hz, mod.PROFILE))
+     t = time.time()
+-    hz.aot = ms.build(jit=False, overrides=ovr, cache=a.cache)
++    hz.aot = ms.build(jit=a.jit, overrides=ovr, cache=a.cache)
+     print(f'built in {time.time() - t:.0f} s ({hz.aot.cache_hits} cached, {hz.aot.cache_misses} built, {len(hz.aot.unlifted)} not translated)', flush=True)
+     hz.attach()
+     if a.display:
+diff --git a/dm/tools/tests/test_aot_simd.py b/dm/tools/tests/test_aot_simd.py
+index 7521457..36e48c3 100644
+--- a/dm/tools/tests/test_aot_simd.py
++++ b/dm/tools/tests/test_aot_simd.py
+@@ -287,7 +287,7 @@ class Batch(unittest.TestCase):
+         for i, line in enumerate(h.lines):
+             if line in h.unlifted: continue
+             if h.compare(i, h.inputs(rng, 32, line not in NEON_INT))[2]: differ.add(line)
+-        self.assertLessEqual({l.split()[0] for l in differ}, {'fdiv', 'scvtf', 'fmul', 'fmla'}, sorted(differ))
++        self.assertLessEqual({l.split()[0] for l in differ}, {'fdiv', 'scvtf', 'fmul', 'fmla', 'faddp'}, sorted(differ))   # faddp (patch 0008): same class, the value agrees and only the flags differ
+         self.assertEqual({l for l in differ if l in NEON_INT}, set())
+ 
+     def test_structure_loads_and_stores(self): self.check('struct', STRUCT, cases=12, nan_free=False)

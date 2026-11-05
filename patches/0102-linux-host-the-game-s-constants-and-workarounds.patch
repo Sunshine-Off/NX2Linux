@@ -1,0 +1,483 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 18:46:42 +0100
+Subject: [PATCH] Linux host: the game's constants and workarounds come from
+ its profile (dm/games), plus a coverage survey
+
+horizon_game.py reads dm/games/<id>/game.tsv through game.py (program_id, modules, sys_resource) and an optional linux_profile.py; horizon_run.py has no title table any more; GetInfo reports the profile's program ID. survey.py counts how every function is handled (lifted, replaced by origin, JIT, not translated, with the reason).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux milestone C: no title is written in the runtime; the profile folder decides, and a survey says how each function of a game is handled
+Issue: none yet (NX2Linux, branch Téo/jalon-c-profils-survey)
+
+---
+ dm/games/0100E95004038000/linux_profile.py |  10 ++
+ dm/games/README.md                         |   2 +
+ dm/tools/horizon_game.py                   |  67 ++++++++++++
+ dm/tools/horizon_hle.py                    |   9 +-
+ dm/tools/horizon_overrides.py              |   6 +-
+ dm/tools/horizon_profile_xc2.py            |  11 --
+ dm/tools/horizon_run.py                    |  21 ++--
+ dm/tools/survey.py                         | 112 +++++++++++++++++++++
+ dm/tools/tests/test_horizon_game.py        |  99 ++++++++++++++++++
+ 9 files changed, 313 insertions(+), 24 deletions(-)
+ create mode 100644 dm/games/0100E95004038000/linux_profile.py
+ create mode 100644 dm/tools/horizon_game.py
+ delete mode 100644 dm/tools/horizon_profile_xc2.py
+ create mode 100644 dm/tools/survey.py
+ create mode 100644 dm/tools/tests/test_horizon_game.py
+
+diff --git a/dm/games/0100E95004038000/linux_profile.py b/dm/games/0100E95004038000/linux_profile.py
+new file mode 100644
+index 0000000..54bb4da
+--- /dev/null
++++ b/dm/games/0100E95004038000/linux_profile.py
+@@ -0,0 +1,10 @@
++"""Workarounds of Xenoblade Chronicles 2 for the Linux host (NX2Linux, dm/tools/horizon_game.py): each one replaces a function of the GAME (main), not of the SDK, and says what is missing in the host that makes it necessary.
++The file is loaded when the title runs; remove an entry when the host grows the feature it stands for. None is needed at present."""
++from horizon_overrides import hle
++
++PROFILE = {}
++
++
++def workaround(symbol, why):
++    def deco(fn): PROFILE[symbol] = (fn, why); return fn
++    return deco
+diff --git a/dm/games/README.md b/dm/games/README.md
+index 5d6d841..5e7295a 100644
+--- a/dm/games/README.md
++++ b/dm/games/README.md
+@@ -15,6 +15,7 @@ Each game the port knows has a folder `dm/games/<id>/`, named after the base gam
+ - **`geo_mesh.tsv`** (optional): vertex / geometry shader pairs drawn with a passthrough geometry shader; `dmsh_build.py` builds a mesh library for each (`dmsh_mesh.py`), and the host draws such a pair's triangle lists as mesh draws ([Passthrough geometry shaders drawn by the vertex shader](../../docs/reference/shaders.md#passthrough-geometry-shaders-drawn-by-the-vertex-shader)). A pair not listed takes the compute path.
+ - **`README.md`**: the game's notes: what its profile needs and why, what was found on it, how to reach a scene on the Mac, what is still open. Listed in [Games](#games).
+ - **`patches.py`** (optional): the rewriter's patches of the game's own builds (`main`), keyed by NSO build ID: `CUTS` (byte cuts, each original asserted), `OBS` (observation gates) and `FRAME_STEP` (frame-step stubs). `dm/tools/patch_nso.py` loads every profile's file and applies those of a module's build, wherever it comes from; a build claimed twice stops the rewrite. A provisional profile (in `DM_GAMES_DIR`) may have one too, which the rewriter and the NSP script's rewrite step take as well. Cuts of Nintendo's `sdk` modules, which several games ship, are in `dm/tools/sdk_patches.py`. Opt-in `MATCH_CUTS` can locate verified cuts in unregistered builds of the selected game by function fingerprints (a patch of several functions applies whole or not at all); see [Function-matched cuts](../../docs/reference/rewriter.md#function-matched-cuts-for-unregistered-builds) for enrollment, profile precedence and limits. A game without patches has no file, and a derived profile uses its repository profile's rules. `dm/tools/tests/test_patches.py` checks that a file names only its own profile's builds. `BINDING` (not read by the rewriter, required by `test_patches.py`) states each patch's binding now, the loosest it could have, its purpose and why ([Binding](../../docs/agents/game-patches.md#binding)); a bring-up that cannot yet judge a build-bound patch's goal says `'goal': 'unreviewed'` rather than guess; after changing a patch file, a build-keyed host table or a profile key, run `dm/tools/docs_patches.py` to update the [patch index](../../docs/agents/game-patches.md).
++- **`linux_profile.py`** (optional): the game's workarounds for the Linux host (NX2Linux): `PROFILE = {exported symbol: (fn(hz, regs), why)}`, each one replacing a function of the game and saying what the host lacks. `dm/tools/horizon_game.py` loads it when the title runs.
+ 
+ The chain version is not in the profile: one version serves every game (`dm/gfx/nvn/dmsh_chain.h`, written by `dmsh_chain.py --header`). Two more tables live in the profile folder but are not committed (git ignores them). A full `dmsh_build.py` run makes both from its Mac outputs, so each checkout makes its own, and stamps its libraries with the digest of the profile's inputs (`b-<V>/inputs.tsv`, `dmsh_chain.py --inputs`). The host takes a table only when its header names its library's chain version and that digest.
+ - **`c1_full.tsv`**: written by `c1_guard.py`. Without it every shader's c1 gets its own 64 KiB.
+@@ -26,6 +27,7 @@ Everything game-specific belongs here. Code reads the profile; it does not hard-
+ |---|---|---|
+ | Shader tools (`shader_split.py`, `dmsh_chain.py`, `dmsh_build.py`, `dmsh_facts.py`) | `DM_GAME=<id>` | tables, `shader_*` keys |
+ | Host (`make -C dm/host`, `dm/gfx/tests`) | `GAME=<id>` | `gen/<id>/game_profile.h`, generated from `game.tsv` by `game.py header` |
++| Linux host (`dm/tools/horizon_run.py`, `survey.py`, through `horizon_game.py`) | the title ID given with `--title` | `program_id`, `modules`, `app_pool`, `mem_used`, `sys_resource`, `linux_profile.py`. A title without a profile runs on generic defaults and is reported as such |
+ | `dm/ios/tools/build_ipa.sh` | `GAME=<id>` | app name, bundle ID, IPA name, modules, RomFS marker, tables |
+ | `scripts/build_ipa_from_nsp.py` | the NSPs' title ID | everything above. With no matching profile it writes a survey, then a provisional profile outside the repository and a best-effort IPA (`--survey-only` stops after the survey) |
+ 
+diff --git a/dm/tools/horizon_game.py b/dm/tools/horizon_game.py
+new file mode 100644
+index 0000000..e45f9a1
+--- /dev/null
++++ b/dm/tools/horizon_game.py
+@@ -0,0 +1,67 @@
++"""The game a run is for (NX2Linux S7bis, milestone C): everything specific to one title comes from its profile folder dm/games/<base game title ID>/, the same folder the Mac host and the shader tools read, through dm/games/game.py
++(DM_GAMES_DIR adds folders outside the repository, e.g. the provisional profile the NSP script writes). Nothing about a game is written in the runtime.
++Keys read from game.tsv: title_id, program_id (GetInfo ProgramId), modules (load order, `rtld` is the host's), sys_resource (GetInfo SystemResourceSizeTotal). app_pool and mem_used are Mac-host partition constants: the Linux host reports its own totals (see svc_GetInfo).
++An optional linux_profile.py beside it holds the game's workarounds for the Linux host: PROFILE = {exported symbol: (fn(hz, regs), why)}, applied as the Mach host's per-game patches are.
++A title without a profile runs with generic Horizon defaults and says so (`known` is False): the run is a survey of what the game needs, not a validated game."""
++import importlib.util, sys
++from pathlib import Path
++
++GAMES = Path(__file__).resolve().parents[1] / 'games'
++if str(GAMES) not in sys.path: sys.path.insert(0, str(GAMES))
++import game as games
++
++
++def parse_title(title_id):
++    """The title ID as an integer, from 16 hex digits with or without 0x"""
++    s = str(title_id).strip().lower()
++    return int(s[2:] if s.startswith('0x') else s, 16)
++
++
++class HorizonGame:
++    DEFAULT_ORDER = ('main', 'sdk', 'subsdk0')   # only for a title with no profile: the modules the Switch SDK builds have
++
++    def __init__(self, title_id, profile=None):
++        self.title = parse_title(title_id)
++        self.profile = profile if profile is not None else games.by_title(self.title)
++
++    @classmethod
++    def load(cls, title_id): return cls(title_id)
++
++    @property
++    def known(self): return self.profile is not None
++
++    @property
++    def id(self): return f'{self.title:016x}'
++
++    @property
++    def name(self): return self.profile.get('name', self.id) if self.known else f'{self.id} (no profile)'
++
++    def _int(self, key, default=None, base=0):
++        if not self.known: return default
++        v = self.profile.get(key, '')
++        return int(v, base) if v else default
++
++    @property
++    def program_id(self): return self._int('program_id', self.title, 16)   # an ID is hexadecimal without 0x in game.tsv
++    @property
++    def app_pool(self): return self._int('app_pool')
++    @property
++    def mem_used(self): return self._int('mem_used')
++    @property
++    def sys_resource(self): return self._int('sys_resource')
++
++    def modules(self, available=()):
++        """Load order: the profile's `modules` (without rtld); with no profile, the generic order restricted to what is in `available`"""
++        order = [m for m in self.profile.words('modules', '') if m != 'rtld'] if self.known else [m for m in self.DEFAULT_ORDER if not available or m in available]
++        return order
++
++    def workarounds(self):
++        """{symbol: (fn, why)} of the profile's linux_profile.py, {} when there is none"""
++        if not self.known: return {}
++        path = self.profile.dir / 'linux_profile.py'
++        if not path.exists(): return {}
++        spec = importlib.util.spec_from_file_location(f'linux_profile_{self.id}', path)
++        mod = importlib.util.module_from_spec(spec); sys.path.insert(0, str(Path(__file__).resolve().parent))
++        try: spec.loader.exec_module(mod)
++        finally: sys.path.pop(0)
++        return dict(mod.PROFILE)
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index c287dff..4a0ab9b 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -113,7 +113,9 @@ class Horizon:
+     FIRST_HANDLE = 0xD000
+     TLS_PER_THREAD = 0x200
+ 
+-    def __init__(self, ms, out=None, verbose=False, romfs=None, title_id='0000000000000000'):
++    def __init__(self, ms, out=None, verbose=False, romfs=None, title_id='0000000000000000', game=None):
++        import horizon_game
++        self.game = game or horizon_game.HorizonGame(title_id)   # the title's profile (dm/games/<id>); a title with none runs on generic defaults
+         self.ms, self.aot, self.out, self.verbose = ms, ms.aot, out or sys.stderr, verbose
+         self.handles, self._next_handle = {}, self.FIRST_HANDLE
+         self.heap_size = 0
+@@ -337,7 +339,10 @@ class Horizon:
+         kind, handle, sub = r[1], r[2], r[3]
+         # the address space layout, one region each: ASLR 0x08000000.., heap 0x2_0000_0000, alias 0x4_0000_0000, stack 0x6_0000_0000
+         v = {0: 0xF, 1: 0xFFFFFFFFFFFFFFFF >> 20, 2: 0x4_0000_0000, 3: 0x1_0000_0000, 4: self.HEAP_BASE, 5: 0x1_0000_0000, 6: 0x1_0000_0000, 7: 0x2000_0000, 8: 0, 9: 0,
+-             11: 0, 12: 0x0800_0000, 13: 0x7F_F800_0000, 14: 0x6_0000_0000, 15: 0x1_0000_0000, 16: 0, 17: 0, 18: 0x0100E95004038000, 19: self.heap_size, 20: 0x2000_0000, 21: 0, 22: 0}.get(kind)
++             11: 0, 12: 0x0800_0000, 13: 0x7F_F800_0000, 14: 0x6_0000_0000, 15: 0x1_0000_0000, 16: 0, 17: 0, 18: self.game.program_id, 19: self.heap_size, 20: 0x2000_0000, 21: 0, 22: 0}.get(kind)
++        # what the title's profile says (game.tsv): the program ID and the system resource size. The memory totals (6, 7) stay the host's own: the Linux host's heap is not the Mac host's partition (app_pool / mem_used made
++        # Xenoblade 2's mtl::MemManager assert in Region::addChild: measured), so the profile's pool is not reported until the host models it
++        if kind == 16 and self.game.sys_resource is not None: v = self.game.sys_resource
+         if kind == 11: v = 0xF
+         if v is None:
+             self.log(f'unhandled GetInfo type {kind} handle {handle:#x} sub {sub}'); r[0] = R_INVALID_ENUM; return
+diff --git a/dm/tools/horizon_overrides.py b/dm/tools/horizon_overrides.py
+index 5fd8a23..3f90bac 100644
+--- a/dm/tools/horizon_overrides.py
++++ b/dm/tools/horizon_overrides.py
+@@ -3,6 +3,7 @@ that function is not lifted and its calls run `fn(hz, regs)`, which reads x0.. a
+ 
+ OK = 0
+ TABLE = {}   # symbol -> (fn(hz, r), why)
++ORIGIN = {}  # symbol -> 'handwritten' | 'trivial' | 'stubbed': where the entry comes from (the survey counts them apart)
+ 
+ 
+ def hle(symbol, why):
+@@ -57,9 +58,10 @@ def install(horizon):
+     import horizon_trivial
+     for sym, value, why, src in horizon_trivial.TRIVIAL:   # generated from the Mach host: entries that do nothing or return a constant; a hand-written port of the same symbol wins
+         if sym in TABLE: continue
+-        TABLE[sym] = ((lambda hz, r: None) if value is None else (lambda hz, r, v=value: r.__setitem__(0, v)), why)
++        TABLE[sym] = ((lambda hz, r: None) if value is None else (lambda hz, r, v=value: r.__setitem__(0, v)), why); ORIGIN[sym] = 'trivial'
+     for sym, why, src in horizon_trivial.STUBBED:   # not ported yet: answers 0, and the first call of each is logged
+         if sym in TABLE: continue
+-        TABLE[sym] = (_stub(sym), f'not ported from {src}: answers 0 ({why})')
++        TABLE[sym] = (_stub(sym), f'not ported from {src}: answers 0 ({why})'); ORIGIN[sym] = 'stubbed'
+     exported = set().union(*(m.exports for m in horizon.ms.modules))
++    for sym in TABLE: ORIGIN.setdefault(sym, 'handwritten')
+     return {sym: (lambda r, f=fn: f(horizon, r)) for sym, (fn, _) in TABLE.items() if sym in exported}
+diff --git a/dm/tools/horizon_profile_xc2.py b/dm/tools/horizon_profile_xc2.py
+deleted file mode 100644
+index cd31a89..0000000
+--- a/dm/tools/horizon_profile_xc2.py
++++ /dev/null
+@@ -1,11 +0,0 @@
+-"""Per-title workarounds for Xenoblade Chronicles 2 (0100E95004038000), declared as such: each one replaces a function of the GAME (main), not of the SDK, and says what is missing in the host that makes it necessary.
+-They are applied only when NX2LINUX_PROFILE names the title (horizon_profile.apply). Remove an entry when the host grows the feature it stands for."""
+-from horizon_overrides import hle
+-
+-TITLE = '0100e95004038000'
+-PROFILE = {}
+-
+-
+-def workaround(symbol, why):
+-    def deco(fn): PROFILE[symbol] = (fn, why); return fn
+-    return deco
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index c39729d..7c45beb 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -1,6 +1,7 @@
+ #!/usr/bin/env python3
+ """Run a recompiled game on the Linux host (NX2Linux S7bis): load its modules, replace the SDK functions the host provides, start nn::init::Start's sequence and let the game run for a while.
+-Usage: horizon_run.py [--jit] --modules <dir with <name>.manifest.json> --romfs <RomFS.img> --title <id> [--display|--hidden] [--seconds N] [--profile xc2] [--cache DIR]
++Usage: horizon_run.py [--jit] --modules <dir with <name>.manifest.json> --romfs <RomFS.img> --title <id> [--display|--hidden] [--seconds N] [--order a,b,c] [--cache DIR]
++The game's constants and workarounds come from its profile folder (dm/games/<id>/, see horizon_game.py); a title with none runs on generic defaults and the run says so.
+ Needs REMILL_BUILD (the lifter) for functions not in the cache, and DYNARMIC_DIR with --jit (both: tools/setup_toolchain.sh writes an env.sh). The window needs linux/host built (libnx2linux_display.so, see horizon_display.py)."""
+ import argparse, os, sys, time
+ from pathlib import Path
+@@ -9,13 +10,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
+ import elf_module as em
+ import horizon_hle, horizon_overrides
+ 
+-PROFILES = {'0100e95004038000': 'horizon_profile_xc2'}
+-
+ 
+ def main():
+     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+     p.add_argument('--modules', required=True, help='folder holding <name>.manifest.json and <name>.elf')
+-    p.add_argument('--order', default='main,sdk,subsdk0', help='module names in load order')
++    p.add_argument('--order', default='', help='module names in load order (default: the profile\'s `modules`)')
+     p.add_argument('--romfs'); p.add_argument('--title', default='0000000000000000')
+     p.add_argument('--cache', default=str(Path.home() / '.cache/nx2linux/aot-cache'))
+     p.add_argument('--display', action='store_true', help='open a window when the game first presents a frame'); p.add_argument('--hidden', action='store_true', help='with --display: keep the window hidden')
+@@ -23,13 +22,17 @@ def main():
+     p.add_argument('--jit', action='store_true', help='build the dynarmic fallback (needs DYNARMIC_DIR: tools/setup_toolchain.sh): a function that cannot be lifted runs in the JIT instead of stopping its thread. Turns the inline memory accesses off')
+     p.add_argument('--no-profile', action='store_true', help='do not apply the per-title workarounds'); p.add_argument('--verbose', action='store_true')
+     a = p.parse_args()
+-    mods = [f'{a.modules}/{n}.manifest.json' for n in a.order.split(',')]
++    import horizon_game
++    game = horizon_game.HorizonGame(a.title)
++    have = sorted(p.name[:-len('.manifest.json')] for p in Path(a.modules).glob('*.manifest.json'))
++    order = a.order.split(',') if a.order else game.modules(have)
++    if not game.known: print(f'[profile] no profile dm/games/{game.id}: generic Horizon defaults, modules {",".join(order)} (set DM_GAMES_DIR for a profile outside the repository)', flush=True)
++    else: print(f'[profile] {game.name}: modules {",".join(order)}', flush=True)
++    mods = [f'{a.modules}/{n}.manifest.json' for n in order]
+     ms = em.ModuleSet(mods, {})
+-    hz = horizon_hle.Horizon(ms, verbose=a.verbose, romfs=a.romfs, title_id=a.title)
++    hz = horizon_hle.Horizon(ms, verbose=a.verbose, romfs=a.romfs, title_id=a.title, game=game)
+     ovr = horizon_overrides.install(hz)
+-    prof = PROFILES.get(a.title)
+-    if prof and not a.no_profile:
+-        mod = __import__(prof); ovr.update(horizon_overrides.install_profile(hz, mod.PROFILE))
++    if not a.no_profile: ovr.update(horizon_overrides.install_profile(hz, game.workarounds()))
+     t = time.time()
+     hz.aot = ms.build(jit=a.jit, overrides=ovr, cache=a.cache)
+     print(f'built in {time.time() - t:.0f} s ({hz.aot.cache_hits} cached, {hz.aot.cache_misses} built, {len(hz.aot.unlifted)} not translated)', flush=True)
+diff --git a/dm/tools/survey.py b/dm/tools/survey.py
+new file mode 100644
+index 0000000..3e340bf
+--- /dev/null
++++ b/dm/tools/survey.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++"""Coverage survey of a game's recompilation (NX2Linux S7bis, milestone C): for a title and its converted modules, how every function is handled and why, so that "compilable" is a count and not an impression.
++  lifted             translated to x86_64 by Remill
++  replaced           the host provides it (a hand-written port, a trivial one that does nothing or returns a constant, a "not ported" stub that answers 0, a workaround of the game's profile)
++  jit fallback       with --jit: the function Remill cannot lift (or lifts too large) runs in dynarmic
++  not translated     the rest, each with its reason: a call stops the thread with the address and the reason
++  without a reason   a function that is none of the above and has no reason recorded: this must be 0
++  unknown            the instruction classes (register numbers masked) of the modules that Remill does not lift (--census)
++Usage: survey.py --modules <dir with <name>.manifest.json> --title <id> [--romfs IMG] [--cache DIR] [--order a,b,c] [--jit] [--census] [--json OUT]
++Needs REMILL_BUILD (and DYNARMIC_DIR with --jit): the functions not in the cache are lifted. Prints addresses, counts and mnemonics only; nothing of the game's code or data."""
++import argparse, collections, json, re, sys, time
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++
++
++def namespace(sym):
++    """The namespace a mangled Itanium name lives in, as nn::fs: '_ZN2nn2fs4OpenE...' -> 'nn::fs' (the first two components, the last being the function when the name has only two); a name that is not nested -> '(c)'"""
++    if not sym.startswith('_ZN'): return '(c)'
++    rest, parts = sym[3:].lstrip('K'), []
++    while True:
++        n = re.match(r'(\d+)', rest)
++        if not n: break
++        k = int(n.group(1)); parts.append(rest[len(n.group(1)):len(n.group(1)) + k]); rest = rest[len(n.group(1)) + k:]
++    if len(parts) > 2: parts = parts[:2]
++    elif len(parts) == 2: parts = parts[:1]   # Class::method -> the class's namespace is just the first component
++    return '::'.join(parts) if parts else '(c)'
++
++
++def reason_class(why):
++    """(class, detail) of the reason Aot recorded for a function that is not lifted"""
++    if not why: return 'without a reason', ''
++    if why == 'replaced by a host function': return 'replaced', ''
++    if 'bytes are more than' in why: return 'too large for one lift', ''
++    m = re.search(r'0x[0-9a-f]+ \(([\w.]+)[ )]', why)
++    if m and 'no semantics' in why: return 'instruction without semantics', m.group(1)
++    if m and ('decode' in why or 'not decoded' in why or 'undefined' in why): return 'instruction not decoded', m.group(1)
++    if 'does not define' in why: return 'needs a symbol the runtime lacks', ', '.join(re.findall(r'needs ([^,]+?)(?:,|, which)', why))[:80]
++    return 'other', why[:100]
++
++
++def classify(unlifted, total, by_addr, jit):
++    """The report from Aot.unlifted ({address: reason}), the number of functions and by_addr ({address: (symbol, origin)} of the replaced ones)"""
++    replaced = collections.Counter(); ns = collections.defaultdict(collections.Counter)
++    left = collections.Counter(); detail = collections.defaultdict(collections.Counter)
++    for a, why in unlifted.items():
++        cls, det = reason_class(why)
++        if cls == 'replaced':
++            sym, origin = by_addr.get(a, ('?', 'unknown origin'))
++            replaced[origin] += 1; ns[origin][namespace(sym)] += 1
++        else:
++            left[cls] += 1
++            if det: detail[cls][det] += 1
++    nleft = sum(left.values()); nrep = sum(replaced.values())
++    return {
++        'functions': total, 'lifted': total - len(unlifted), 'replaced': nrep, 'replaced_by_origin': dict(replaced),
++        'replaced_namespaces': {o: dict(c.most_common(12)) for o, c in ns.items()},
++        'jit_fallback': nleft if jit else 0, 'not_translated': 0 if jit else nleft,
++        'not_translated_by_reason': {} if jit else dict(left), 'jit_fallback_by_reason': dict(left) if jit else {},
++        'instruction_details': {k: dict(v.most_common(30)) for k, v in detail.items()},
++        'without_reason': left.get('without a reason', 0),
++    }
++
++
++def text(report):
++    r = report; lines = [f"{r['game']}: {r['functions']} functions in {', '.join(f'{k} {v}' for k, v in r['modules'].items())}"]
++    lines.append(f"  lifted          {r['lifted']:>7}")
++    lines.append(f"  replaced        {r['replaced']:>7}  " + ', '.join(f'{k} {v}' for k, v in sorted(r['replaced_by_origin'].items())))
++    for o, c in r['replaced_namespaces'].items(): lines.append(f"      {o}: " + ', '.join(f'{k} {v}' for k, v in c.items()))
++    lines.append(f"  jit fallback    {r['jit_fallback']:>7}" + ('' if r['jit'] else '  (not asked: --jit)') + (('  ' + ', '.join(f'{k} {v}' for k, v in r['jit_fallback_by_reason'].items())) if r['jit_fallback'] else ''))
++    lines.append(f"  not translated  {r['not_translated']:>7}" + (('  ' + ', '.join(f'{k} {v}' for k, v in r['not_translated_by_reason'].items())) if r['not_translated'] else ''))
++    for k, v in r['instruction_details'].items(): lines.append(f"      {k}: " + ', '.join(f'{m} {n}' for m, n in v.items()))
++    lines.append(f"  without a reason{r['without_reason']:>6}   (must be 0)")
++    if 'build_seconds' in r: lines.append(f"  built in {r['build_seconds']:.0f} s ({r['cache_hits']} cached, {r['cache_misses']} lifted now)")
++    return '\n'.join(lines)
++
++
++def main(argv=None):
++    p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
++    p.add_argument('--modules', required=True); p.add_argument('--title', required=True); p.add_argument('--romfs')
++    p.add_argument('--order', default=''); p.add_argument('--cache', default=str(Path.home() / '.cache/nx2linux/aot-cache'))
++    p.add_argument('--jit', action='store_true'); p.add_argument('--census', action='store_true', help='also list every instruction class of the modules Remill does not lift (module_validate.py census)')
++    p.add_argument('--json', help='write the report here'); p.add_argument('--top', type=int, default=40)
++    a = p.parse_args(argv)
++    import elf_module as em, horizon_game, horizon_hle, horizon_overrides
++    game = horizon_game.HorizonGame(a.title)
++    have = sorted(q.name[:-len('.manifest.json')] for q in Path(a.modules).glob('*.manifest.json'))
++    order = a.order.split(',') if a.order else game.modules(have)
++    ms = em.ModuleSet([f'{a.modules}/{n}.manifest.json' for n in order], {})
++    hz = horizon_hle.Horizon(ms, romfs=a.romfs, title_id=a.title, game=game)
++    ovr = horizon_overrides.install(hz)
++    origin = {s: horizon_overrides.ORIGIN.get(s, 'handwritten') for s in ovr}
++    work = horizon_overrides.install_profile(hz, game.workarounds())
++    ovr.update(work); origin.update({s: 'game profile' for s in work})
++    t = time.time()
++    aot = ms.build(jit=a.jit, overrides=ovr, cache=a.cache)
++    names = {'handwritten': 'hand-written port', 'trivial': 'trivial (nothing or a constant)', 'stubbed': 'not ported (answers 0)', 'game profile': 'game profile'}
++    by_addr = {ms.exports[s]: (s, names.get(o, o)) for s, o in origin.items() if s in ms.exports}
++    total = sum(len(m.functions) + len(m.jump_targets) for m in ms.modules)
++    report = classify(aot.unlifted, total, by_addr, a.jit)
++    report.update(game=game.name, known_profile=game.known, jit=a.jit, modules={m.name: len(m.functions) for m in ms.modules},
++                  build_seconds=time.time() - t, cache_hits=aot.cache_hits, cache_misses=aot.cache_misses)
++    print(text(report))
++    if a.census:
++        import argparse as ap, module_validate as mv
++        mv.cmd_census(ap.Namespace(exefs='-', work=a.modules, module=','.join(order), top=a.top))
++    if a.json: Path(a.json).write_text(json.dumps(report, indent=1))
++    return 0
++
++
++if __name__ == '__main__': sys.exit(main())
+diff --git a/dm/tools/tests/test_horizon_game.py b/dm/tools/tests/test_horizon_game.py
+new file mode 100644
+index 0000000..5d14653
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_game.py
+@@ -0,0 +1,99 @@
++"""The game a run is for (horizon_game.py) and the coverage survey's bookkeeping (survey.py): a profile folder decides, a title without one runs on generic defaults and is flagged. No game data."""
++import io, os, sys, tempfile, types, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE.parent))
++
++
++def profile_folder(root, title, rows, workarounds=None):
++    d = Path(root) / title; d.mkdir()
++    (d / 'game.tsv').write_text(''.join(f'{k}\t{v}\n' for k, v in rows))
++    if workarounds: (d / 'linux_profile.py').write_text(workarounds)
++    return d
++
++
++class Profile(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory(); self.old = os.environ.get('DM_GAMES_DIR')
++        os.environ['DM_GAMES_DIR'] = self.tmp.name
++        import horizon_game; self.hg = horizon_game
++
++    def tearDown(self):
++        if self.old is None: os.environ.pop('DM_GAMES_DIR', None)
++        else: os.environ['DM_GAMES_DIR'] = self.old
++        self.tmp.cleanup()
++
++    def test_a_title_without_a_profile_is_flagged_and_gets_generic_defaults(self):
++        g = self.hg.HorizonGame('0123456789abcdef')
++        self.assertFalse(g.known)
++        self.assertEqual((g.program_id, g.app_pool, g.mem_used, g.sys_resource), (0x0123456789ABCDEF, None, None, None))
++        self.assertEqual(g.modules(['sdk', 'main', 'rtld']), ['main', 'sdk'])
++        self.assertEqual(g.workarounds(), {})
++
++    def test_a_profile_decides_the_constants_and_the_module_order(self):
++        profile_folder(self.tmp.name, '0ABCDEF000000000', [('title_id', '0ABCDEF000000000'), ('name', 'Test'), ('program_id', '0ABCDEF000000001'), ('modules', 'main subsdk0 sdk'), ('app_pool', '0xCD500000'), ('sys_resource', '0x0')])
++        g = self.hg.HorizonGame('0abcdef000000000')
++        self.assertTrue(g.known)
++        self.assertEqual((g.name, g.program_id, g.app_pool, g.sys_resource, g.mem_used), ('Test', 0x0ABCDEF000000001, 0xCD500000, 0, None))
++        self.assertEqual(g.modules(['sdk', 'main']), ['main', 'subsdk0', 'sdk'])
++
++    def test_rtld_is_the_hosts_and_never_loaded(self):
++        profile_folder(self.tmp.name, '0ABCDEF000000002', [('title_id', '0ABCDEF000000002'), ('modules', 'rtld main sdk')])
++        self.assertEqual(self.hg.HorizonGame('0abcdef000000002').modules(), ['main', 'sdk'])
++
++    def test_workarounds_come_from_the_profile_folder(self):
++        profile_folder(self.tmp.name, '0ABCDEF000000003', [('title_id', '0ABCDEF000000003')], "PROFILE = {'_Z3foov': (lambda hz, r: None, 'why')}\n")
++        w = self.hg.HorizonGame('0abcdef000000003').workarounds()
++        self.assertEqual(list(w), ['_Z3foov']); self.assertEqual(w['_Z3foov'][1], 'why')
++
++    def test_getinfo_reports_the_profile(self):
++        profile_folder(self.tmp.name, '0ABCDEF000000004', [('title_id', '0ABCDEF000000004'), ('program_id', '0ABCDEF000000004'), ('app_pool', '0x40000000'), ('mem_used', '0x4000000'), ('sys_resource', '0x100000')])
++        import horizon_hle as hh
++        from test_horizon_hle import make
++        hz, aot = make(); hz.game = self.hg.HorizonGame('0abcdef000000004')
++        got = {}
++        for kind in (6, 7, 16, 18):
++            r = [0, kind, 0, 0] + [0] * 27; hz.svc_GetInfo(r); got[kind] = r[1]
++        self.assertEqual(got, {6: 0x1_0000_0000, 7: 0x2000_0000, 16: 0x100000, 18: 0x0ABCDEF000000004})   # 6 and 7: the host's own totals, whatever the profile's pool
++
++    def test_getinfo_without_a_profile_keeps_the_generic_values(self):
++        from test_horizon_hle import make
++        hz, aot = make()
++        r = [0, 18, 0, 0] + [0] * 27; hz.svc_GetInfo(r)
++        self.assertEqual(r[1], 0)   # the title of the fake run is 0
++
++
++class Survey(unittest.TestCase):
++    def test_mangled_names_give_their_namespace(self):
++        import survey
++        self.assertEqual(survey.namespace('_ZN2nn2fs4OpenEPNS0_10FileHandleEPKci'), 'nn::fs')
++        self.assertEqual(survey.namespace('_ZN5movie7Decoder4InitEv'), 'movie::Decoder')
++        self.assertEqual(survey.namespace('_ZN2nn3hid6detail3FooEv'), 'nn::hid')
++        self.assertEqual(survey.namespace('nndiagStartup'), '(c)')
++
++    def test_reasons_are_classified(self):
++        import survey
++        c = survey.reason_class
++        self.assertEqual(c('replaced by a host function'), ('replaced', ''))
++        self.assertEqual(c('function 0x10: 0x14: 0x4e287821 (aesimc v1.16b, v1.16b): Remill has no semantics for this instruction (the lifted code calls __remill_error)'), ('instruction without semantics', 'aesimc'))
++        self.assertEqual(c('function 0x826fdf0: 81288 bytes are more than the 60000 remill-lift takes'), ('too large for one lift', ''))
++        self.assertEqual(c(''), ('without a reason', ''))
++        self.assertEqual(c('something odd')[0], 'other')
++
++    def test_the_report_counts_every_function_once(self):
++        import survey
++        unlifted = {0x100: 'replaced by a host function', 0x200: 'replaced by a host function', 0x300: 'replaced by a host function',
++                    0x400: 'function 0x400: 0x404: 0x4e287821 (aesimc v1.16b, v1.16b): Remill has no semantics for this instruction', 0x500: ''}
++        by_addr = {0x100: ('_ZN2nn2fs4OpenEv', 'hand-written port'), 0x200: ('_ZN2nn3hid3FooEv', 'not ported (answers 0)'), 0x300: ('_ZN2nn2fs5CloseEv', 'hand-written port')}
++        r = survey.classify(unlifted, 1000, by_addr, jit=False)
++        self.assertEqual((r['functions'], r['lifted'], r['replaced'], r['not_translated'], r['jit_fallback'], r['without_reason']), (1000, 995, 3, 2, 0, 1))
++        self.assertEqual(r['replaced_by_origin'], {'hand-written port': 2, 'not ported (answers 0)': 1})
++        self.assertEqual(r['replaced_namespaces']['hand-written port'], {'nn::fs': 2})
++        self.assertEqual(r['instruction_details']['instruction without semantics'], {'aesimc': 1})
++        j = survey.classify(unlifted, 1000, by_addr, jit=True)
++        self.assertEqual((j['jit_fallback'], j['not_translated']), (2, 0))
++        self.assertEqual(r['lifted'] + r['replaced'] + r['not_translated'], 1000)
++
++
++if __name__ == '__main__': unittest.main()

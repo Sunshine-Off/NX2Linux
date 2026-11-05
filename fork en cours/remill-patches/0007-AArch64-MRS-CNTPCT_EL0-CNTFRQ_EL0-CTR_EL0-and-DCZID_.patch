@@ -1,0 +1,89 @@
+From bd3b92ae7effdc232f70cb8debb1c22c6bbdfac2 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 13:27:56 +0100
+Subject: [PATCH] AArch64: MRS CNTPCT_EL0, CNTFRQ_EL0, CTR_EL0 and DCZID_EL0
+
+CNTPCT_EL0 calls out to __nx2_read_cntpct (the host owns the counter); the other three are the Switch's Cortex-A57 constants. Found lifting Xenoblade Chronicles 2: 19 sdk functions read the counter.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ lib/Arch/AArch64/Arch.cpp             |  8 ++++++++
+ lib/Arch/AArch64/Semantics/SYSTEM.cpp | 29 +++++++++++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/lib/Arch/AArch64/Arch.cpp b/lib/Arch/AArch64/Arch.cpp
+index 771e3f5..bfb5855 100644
+--- a/lib/Arch/AArch64/Arch.cpp
++++ b/lib/Arch/AArch64/Arch.cpp
+@@ -3263,6 +3263,10 @@ union SystemReg {
+     kFPSR = 0xDA21,
+     kTPIDR_EL0 = 0xDE82,
+     kTPIDRRO_EL0 = 0xDE83,
++    kCTR_EL0 = 0xD801,
++    kDCZID_EL0 = 0xD807,
++    kCNTFRQ_EL0 = 0xDF00,
++    kCNTPCT_EL0 = 0xDF01,
+   } name;
+   struct {
+     uint64_t op2 : 3;
+@@ -3287,6 +3291,10 @@ static bool AppendSysRegName(Instruction &inst, SystemReg bits) {
+     case SystemReg::kFPSR: ss << "FPSR"; break;
+     case SystemReg::kTPIDR_EL0: ss << "TPIDR_EL0"; break;
+     case SystemReg::kTPIDRRO_EL0: ss << "TPIDRRO_EL0"; break;
++    case SystemReg::kCTR_EL0: ss << "CTR_EL0"; break;
++    case SystemReg::kDCZID_EL0: ss << "DCZID_EL0"; break;
++    case SystemReg::kCNTFRQ_EL0: ss << "CNTFRQ_EL0"; break;
++    case SystemReg::kCNTPCT_EL0: ss << "CNTPCT_EL0"; break;
+     default:
+       LOG(ERROR) << "Unrecognized system register " << std::hex << bits.flat
+                  << " with op0=" << bits.op0 << ", op1=" << bits.op1
+diff --git a/lib/Arch/AArch64/Semantics/SYSTEM.cpp b/lib/Arch/AArch64/Semantics/SYSTEM.cpp
+index 5fa8b0a..8f2526c 100644
+--- a/lib/Arch/AArch64/Semantics/SYSTEM.cpp
++++ b/lib/Arch/AArch64/Semantics/SYSTEM.cpp
+@@ -86,6 +86,31 @@ DEF_SEM(DoMRS_RS_SYSTEM_TPIDRRO_EL0, R64W dest) {
+   return memory;
+ }
+ 
++// The counter the guest times itself with: the host owns it (a monotonic clock at CNTFRQ_EL0), so
++// reading it is a call out, not a field of State
++extern "C" uint64_t __nx2_read_cntpct(void);
++
++DEF_SEM(DoMRS_RS_SYSTEM_CNTPCT_EL0, R64W dest) {
++  WriteZExt(dest, __nx2_read_cntpct());
++  return memory;
++}
++
++// Constants of the Switch's Cortex-A57 cores: 19.2 MHz counter, 64-byte cache lines (CTR_EL0), 64-byte DC ZVA blocks
++DEF_SEM(DoMRS_RS_SYSTEM_CNTFRQ_EL0, R64W dest) {
++  WriteZExt(dest, uint64_t(19200000));
++  return memory;
++}
++
++DEF_SEM(DoMRS_RS_SYSTEM_CTR_EL0, R64W dest) {
++  WriteZExt(dest, uint64_t(0x8444C004));
++  return memory;
++}
++
++DEF_SEM(DoMRS_RS_SYSTEM_DCZID_EL0, R64W dest) {
++  WriteZExt(dest, uint64_t(4));
++  return memory;
++}
++
+ DEF_SEM(DoMSR_SR_SYSTEM_TPIDR_EL0, R64 src) {
+   WriteZExt(state.sr.tpidr_el0.qword, Read(src));
+   return memory;
+@@ -119,6 +144,10 @@ DEF_ISEL(MSR_SR_SYSTEM_FPCR) = DoMSR_SR_SYSTEM_FPCR;
+ DEF_ISEL(MRS_RS_SYSTEM_TPIDR_EL0) = DoMRS_RS_SYSTEM_TPIDR_EL0;
+ DEF_ISEL(MSR_SR_SYSTEM_TPIDR_EL0) = DoMSR_SR_SYSTEM_TPIDR_EL0;
+ DEF_ISEL(MRS_RS_SYSTEM_TPIDRRO_EL0) = DoMRS_RS_SYSTEM_TPIDRRO_EL0;
++DEF_ISEL(MRS_RS_SYSTEM_CNTPCT_EL0) = DoMRS_RS_SYSTEM_CNTPCT_EL0;
++DEF_ISEL(MRS_RS_SYSTEM_CNTFRQ_EL0) = DoMRS_RS_SYSTEM_CNTFRQ_EL0;
++DEF_ISEL(MRS_RS_SYSTEM_CTR_EL0) = DoMRS_RS_SYSTEM_CTR_EL0;
++DEF_ISEL(MRS_RS_SYSTEM_DCZID_EL0) = DoMRS_RS_SYSTEM_DCZID_EL0;
+ 
+ DEF_ISEL(DMB_BO_SYSTEM) = DataMemoryBarrier;
+ DEF_ISEL(ISB_BI_SYSTEM) = InstructionSynchronizationBarrier;
+-- 
+2.56.0
+

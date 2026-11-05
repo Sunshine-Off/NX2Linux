@@ -127,11 +127,7 @@ class Model(QObject):
             # LOCALAPPDATA is set on every normal Windows session, but a stripped environment
             # (a service, a scheduled task, this project's own test harness) may lack it: fall
             # back to the home directory rather than failing to start over a log file.
-            if pu.IS_WIN:
-                root = Path(os.environ.get('LOCALAPPDATA') or (Path.home() / 'AppData' / 'Local'))
-                base = root / 'NS Port Builder' / 'logs'
-            else:
-                base = Path.home() / 'Library' / 'Logs' / 'NS Port Builder'
+            base = pu.log_dir('nx2linux' if pu.IS_LINUX else 'NS Port Builder')
             base.mkdir(parents=True, exist_ok=True)
             self.log_path = base / 'last-run.log'
             self.log_path.write_text('', encoding='utf-8')
@@ -261,7 +257,10 @@ class Model(QObject):
             self.log(traceback.format_exc() + '\n')
             self.deps = []
             self.deps_checked = True
-            self.depsChanged.emit()
+            try:
+                self.depsChanged.emit()
+            except RuntimeError:
+                pass
 
     def _python_row(self, py: str, py_ok: bool, py_ver: str) -> Dep:
         """The interpreter row: fine, missing packages, missing interpreter, or too old.
@@ -369,7 +368,10 @@ class Model(QObject):
             self.python_path, self.python_ok, self.python_ver = py, py_ok, py_ver
             self.dotnet_path, self.dotnet_ok = dn, dn_ok
         self.deps_checked = True
-        self.depsChanged.emit()
+        try:
+            self.depsChanged.emit()
+        except RuntimeError:
+            pass
 
     @property
     def all_deps_ok(self) -> bool:
@@ -1110,6 +1112,14 @@ class Model(QObject):
         """Main-thread half of log(): see log() for why the hop exists."""
         self.logAppended.emit(s)
 
+    @staticmethod
+    def _safe_emit(signal: object, *args: object) -> None:
+        """Ignore a late worker emission after Qt has destroyed the receiving object."""
+        try:
+            signal.emit(*args)  # type: ignore[attr-defined]
+        except RuntimeError:
+            pass
+
     def log(self, s: str) -> None:
         """Append to the window's log and to the log file.
 
@@ -1123,11 +1133,22 @@ class Model(QObject):
         log file received everything. QMetaObject.invokeMethod with QueuedConnection hands the
         call to the main thread explicitly, which works regardless of how the slot is connected.
         """
-        if QThread.currentThread() is self.thread():
-            self.logAppended.emit(s)
-        else:
-            QMetaObject.invokeMethod(self, '_emit_log', Qt.QueuedConnection,
-                                     Q_ARG(str, s))
+        # Worker threads can finish just after a short-lived test window or the application has
+        # deleted the QObject. PySide raises instead of returning false when `self.thread()` is
+        # queried in that state. The file log is still useful, so drop only the UI signal.
+        try:
+            owner = self.thread()
+        except RuntimeError:
+            owner = None
+        if owner is not None:
+            if QThread.currentThread() is owner:
+                self._safe_emit(self.logAppended, s)
+            else:
+                try:
+                    QMetaObject.invokeMethod(self, '_emit_log', Qt.QueuedConnection,
+                                             Q_ARG(str, s))
+                except RuntimeError:
+                    pass
         if getattr(self, 'log_path', None):
             try:
                 with open(self.log_path, 'a', encoding='utf-8', errors='replace') as f:
@@ -1271,8 +1292,11 @@ class Model(QObject):
                                               text=True, errors='replace', bufsize=1, env=env,
                                               **pu.no_window_kwargs())
                 assert self._proc.stdout is not None
-                for line in self._proc.stdout:
-                    self._on_line(line.rstrip('\n'))
+                try:
+                    for line in self._proc.stdout:
+                        self._on_line(line.rstrip('\n'))
+                finally:
+                    self._proc.stdout.close()
                 self._proc.wait()
                 ok = self._proc.returncode == 0
             except OSError as e:
@@ -1281,16 +1305,20 @@ class Model(QObject):
                 self._proc = None
             self._flush_lines()
             self.running = False
-            self.runningChanged.emit(False)
+            try:
+                self.runningChanged.emit(False)
+            except RuntimeError:
+                pass
             if mac_app:
                 exists = bool(self.mac_app_path) and Path(self.mac_app_path).exists()
-                self.finished.emit(exists, self.t('target.macDone' if exists else 'target.missingApp'))
+                self._safe_emit(self.finished, exists,
+                                self.t('target.macDone' if exists else 'target.missingApp'))
             elif ok:
                 self.pack_archive()
             else:
                 if self.stages:
                     self.stages[-1].state = 'failed'
-                    self.stagesChanged.emit()
+                    self._safe_emit(self.stagesChanged)
                 # The last real line says more than the exit code: "Build failed (exit code 1)"
                 # on its own sent a reporter looking for a log that was not on screen (#52)
                 last = getattr(self, '_last_error', '')
@@ -1299,7 +1327,7 @@ class Model(QObject):
                 if known.kind != bf.UNKNOWN:   # a known early stop: the window explains it and offers the next step
                     self.failure = known
                     note = self.failure_what(known)
-                self.finished.emit(False, note)
+                self._safe_emit(self.finished, False, note)
 
         self._thread = threading.Thread(target=work, daemon=True)
         self._thread.start()
@@ -1381,7 +1409,7 @@ class Model(QObject):
                     if self.stages and self.stages[-1].state == 'running':
                         self.stages[-1].state = 'done'
                     self.stages.append(Stage(name=name, state='running'))
-                    self.stagesChanged.emit()
+                    self._safe_emit(self.stagesChanged)
         del low
 
     def _flush_lines(self) -> None:
@@ -1401,14 +1429,14 @@ class Model(QObject):
                     except ValueError:
                         pass
         if not versions:
-            self.finished.emit(True, self.t('msg.archiveSkipped', str(extract)))
+            self._safe_emit(self.finished, True, self.t('msg.archiveSkipped', str(extract)))
             return
         romfs = str(versions[-1][1] / 'RomFS')
         # games/<id>/ is the per-game layout main.m looks in first, and the file inside it is
         # romfs.img — one file, which copies to a phone at full speed where 300,000 did not
         dest = str(Path(self.out_dir or Path(self.base_path).parent, 'romfs'))
         self.stages.append(Stage(name=self.t('prog.archiveShort'), state='running'))
-        self.stagesChanged.emit()
+        self._safe_emit(self.stagesChanged)
 
         def work_() -> None:
             args = [self.python_path, str(Path(self.engine_path, 'dm', 'tools', 'romfs_image.py')),
@@ -1420,8 +1448,11 @@ class Model(QObject):
                                      text=True, errors='replace', env=env,
                                      **pu.no_window_kwargs())
                 assert p.stdout is not None
-                for line in p.stdout:
-                    self.log(line)
+                try:
+                    for line in p.stdout:
+                        self.log(line)
+                finally:
+                    p.stdout.close()
                 p.wait()
                 ok = p.returncode == 0
             except OSError as e:
@@ -1430,8 +1461,8 @@ class Model(QObject):
             if self.stages:
                 self.stages[-1].state = 'done' if ok else 'failed'
             self.archive_path = dest if ok else ''
-            self.stagesChanged.emit()
-            self.finished.emit(ok, '' if ok else self.t('msg.archiveFailed'))
+            self._safe_emit(self.stagesChanged)
+            self._safe_emit(self.finished, ok, '' if ok else self.t('msg.archiveFailed'))
 
         threading.Thread(target=work_, daemon=True).start()
 

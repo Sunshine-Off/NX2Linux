@@ -1,0 +1,2196 @@
+From f8e56d34e12250d2a18b5fb177579c99bfd02ecd Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 18:06:17 +0100
+Subject: [PATCH] AArch64: scalar floating point and the memory forms real code
+ uses; byte/halfword exclusives, CLREX, DSB, prefetches
+
+Stores of vector registers with pre/post index and register offset (B,H,S,D,Q), pair stores of S,D,Q registers
+(Q as two 128-bit stores), FCSEL, FCCMP/FCCMPE, FMIN/FMAX/FMINNM/FMAXNM, FNMUL, FMSUB/FNMADD/FNMSUB, FSQRT,
+FRINT{N,A,M,P,Z,X,I}, FCVT{N,A,M,P}{S,U}, FCVTZ{S,U} with ARM's saturation (x86 gives 0x80000000 for
+everything out of range) and fixed-point forms, SCVTF/UCVTF fixed-point and scalar SIMD forms. An invalid
+operation without a NaN operand gives ARM's positive default NaN, not x86's negative one. LDXRB/H, LDAXRB/H,
+STXRB/H, STLXRB/H, STLRB/H, CLREX, DSB, PRFM/PRFUM as no-ops.
+---
+ lib/Arch/AArch64/Arch.cpp               | 285 +++++++++++++++++-
+ lib/Arch/AArch64/Decode.cpp             | 378 ------------------------
+ lib/Arch/AArch64/Semantics/BINARY.cpp   | 152 ++++++++++
+ lib/Arch/AArch64/Semantics/COND.cpp     |  51 ++++
+ lib/Arch/AArch64/Semantics/CONVERT.cpp  | 147 ++++++++-
+ lib/Arch/AArch64/Semantics/DATAXFER.cpp | 133 +++++++++
+ lib/Arch/AArch64/Semantics/FLAGS.cpp    |  14 +-
+ lib/Arch/AArch64/Semantics/SYSTEM.cpp   |   2 +
+ 8 files changed, 773 insertions(+), 389 deletions(-)
+
+diff --git a/lib/Arch/AArch64/Arch.cpp b/lib/Arch/AArch64/Arch.cpp
+index a8d3c9b..4b71a61 100644
+--- a/lib/Arch/AArch64/Arch.cpp
++++ b/lib/Arch/AArch64/Arch.cpp
+@@ -1000,9 +1000,17 @@ bool TryDecodeSTP_S_LDSTPAIR_OFF(const InstData &data, Instruction &inst) {
+ bool TryDecodeSTP_D_LDSTPAIR_OFF(const InstData &data, Instruction &inst) {
+   return TryDecodeSTP_Vn_LDSTPAIR_OFF(data, inst, kRegD);
+ }
+-// STP  <Qt1>, <Qt2>, [<Xn|SP>{, #<imm>}]
++// STP  <Qt1>, <Qt2>, [<Xn|SP>{, #<imm>}]: two 128-bit memory operands, the second 16 bytes after the first (there is no 256-bit one)
+ bool TryDecodeSTP_Q_LDSTPAIR_OFF(const InstData &data, Instruction &inst) {
+-  return TryDecodeSTP_Vn_LDSTPAIR_OFF(data, inst, kRegQ);
++  if (data.opc == 0x3) {
++    return false;
++  }
++  uint64_t offset = static_cast<uint64_t>(data.imm7.simm7) << (2U + data.opc);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rt);
++  AddRegOperand(inst, kActionRead, kRegQ, kUseAsValue, data.Rt2);
++  AddBasePlusOffsetMemOp(inst, kActionWrite, 128, data.Rn, offset);
++  AddBasePlusOffsetMemOp(inst, kActionWrite, 128, data.Rn, offset + 16);
++  return true;
+ }
+ 
+ 
+@@ -3330,7 +3338,7 @@ bool TryDecodeSTR_Q_LDST_REGOFF(const InstData &data, Instruction &inst) {
+ static bool TryDecodeSTR_Vn_LDST_IMMPRE(const InstData &data, Instruction &inst,
+                                         RegClass val_class) {
+   uint64_t scale = DecodeScale(data);
+-  if (scale < 4) {
++  if (scale > 4) {
+     return false;
+   }
+   auto num_bits = ReadRegSize(val_class);
+@@ -3344,6 +3352,65 @@ bool TryDecodeSTR_Q_LDST_IMMPRE(const InstData &data, Instruction &inst) {
+   return TryDecodeSTR_Vn_LDST_IMMPRE(data, inst, kRegQ);
+ }
+ 
++// ---- NX2Linux: the stores of vector registers that had no decoder (pre/post index, register offset) and the pair stores of S, D and Q registers ----
++static bool TryDecodeSTR_Vn_LDST_IMMPOST(const InstData &data, Instruction &inst, RegClass val_class) {
++  uint64_t scale = DecodeScale(data);
++  if (scale > 4) {
++    return false;
++  }
++  auto num_bits = ReadRegSize(val_class);
++  AddRegOperand(inst, kActionRead, val_class, kUseAsValue, data.Rt);
++  uint64_t offset = static_cast<uint64_t>(data.imm9.simm9);
++  AddPostIndexMemOp(inst, kActionWrite, num_bits, data.Rn, offset);
++  return true;
++}
++bool TryDecodeSTR_B_LDST_IMMPOST(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_IMMPOST(data, inst, kRegB); }
++bool TryDecodeSTR_H_LDST_IMMPOST(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_IMMPOST(data, inst, kRegH); }
++bool TryDecodeSTR_S_LDST_IMMPOST(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_IMMPOST(data, inst, kRegS); }
++bool TryDecodeSTR_D_LDST_IMMPOST(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_IMMPOST(data, inst, kRegD); }
++bool TryDecodeSTR_Q_LDST_IMMPOST(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_IMMPOST(data, inst, kRegQ); }
++bool TryDecodeSTR_B_LDST_IMMPRE(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_IMMPRE(data, inst, kRegB); }
++bool TryDecodeSTR_H_LDST_IMMPRE(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_IMMPRE(data, inst, kRegH); }
++bool TryDecodeSTR_S_LDST_IMMPRE(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_IMMPRE(data, inst, kRegS); }
++bool TryDecodeSTR_D_LDST_IMMPRE(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_IMMPRE(data, inst, kRegD); }
++bool TryDecodeSTR_B_LDST_REGOFF(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_REGOFF(data, inst, kRegB); }
++bool TryDecodeSTR_BL_LDST_REGOFF(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_REGOFF(data, inst, kRegB); }
++bool TryDecodeSTR_H_LDST_REGOFF(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_REGOFF(data, inst, kRegH); }
++bool TryDecodeSTR_S_LDST_REGOFF(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_REGOFF(data, inst, kRegS); }
++bool TryDecodeSTR_D_LDST_REGOFF(const InstData &data, Instruction &inst) { return TryDecodeSTR_Vn_LDST_REGOFF(data, inst, kRegD); }
++
++// Pair stores. S and D keep one memory operand of twice the register size; Q cannot (a 256-bit memory operand does not exist), so a pair of Q registers has two 128-bit ones, the second 16 bytes on:
++// STP Qt1, Qt2: operands are Rt, Rt2, [Rn + off], [Rn + off + 16]; with writeback the first memory operand is followed by the base register and the new address, then the second memory operand
++static bool TryDecodeSTP_Vn_LDSTPAIR_UPDATE(const InstData &data, Instruction &inst, RegClass rclass, bool pre) {
++  if (data.opc == 0x3) {
++    return false;  // `if opc == '11' then UnallocatedEncoding();`.
++  }
++  auto size = ReadRegSize(rclass);
++  uint64_t offset = static_cast<uint64_t>(data.imm7.simm7) << (2U + data.opc);
++  AddRegOperand(inst, kActionRead, rclass, kUseAsValue, data.Rt);
++  AddRegOperand(inst, kActionRead, rclass, kUseAsValue, data.Rt2);
++  if (rclass != kRegQ) {
++    if (pre) AddPreIndexMemOp(inst, kActionWrite, size * 2, data.Rn, offset);
++    else AddPostIndexMemOp(inst, kActionWrite, size * 2, data.Rn, offset);
++    return true;
++  }
++  if (pre) {
++    AddPreIndexMemOp(inst, kActionWrite, 128, data.Rn, offset);
++    AddBasePlusOffsetMemOp(inst, kActionWrite, 128, data.Rn, offset + 16);
++  } else {
++    AddPostIndexMemOp(inst, kActionWrite, 128, data.Rn, offset);
++    AddBasePlusOffsetMemOp(inst, kActionWrite, 128, data.Rn, 16);
++  }
++  return true;
++}
++bool TryDecodeSTP_S_LDSTPAIR_PRE(const InstData &data, Instruction &inst) { return TryDecodeSTP_Vn_LDSTPAIR_UPDATE(data, inst, kRegS, true); }
++bool TryDecodeSTP_D_LDSTPAIR_PRE(const InstData &data, Instruction &inst) { return TryDecodeSTP_Vn_LDSTPAIR_UPDATE(data, inst, kRegD, true); }
++bool TryDecodeSTP_Q_LDSTPAIR_PRE(const InstData &data, Instruction &inst) { return TryDecodeSTP_Vn_LDSTPAIR_UPDATE(data, inst, kRegQ, true); }
++bool TryDecodeSTP_S_LDSTPAIR_POST(const InstData &data, Instruction &inst) { return TryDecodeSTP_Vn_LDSTPAIR_UPDATE(data, inst, kRegS, false); }
++bool TryDecodeSTP_D_LDSTPAIR_POST(const InstData &data, Instruction &inst) { return TryDecodeSTP_Vn_LDSTPAIR_UPDATE(data, inst, kRegD, false); }
++bool TryDecodeSTP_Q_LDSTPAIR_POST(const InstData &data, Instruction &inst) { return TryDecodeSTP_Vn_LDSTPAIR_UPDATE(data, inst, kRegQ, false); }
++
++
+ static bool TryDecodeLDR_Vn_LDST_POS(const InstData &data, Instruction &inst,
+                                      RegClass val_class) {
+   uint64_t scale = DecodeScale(data);
+@@ -3725,6 +3792,174 @@ bool TryDecodeCCMP_64_CONDCMP_REG(const InstData &data, Instruction &inst) {
+   return true;
+ }
+ 
++// ---- NX2Linux: scalar floating-point instructions that had no decoder ----
++static bool NxFcvtToInt(const InstData &data, Instruction &inst, RegClass ic, RegClass fc) {
++  if (IsUnallocatedFloatEncoding(data)) {
++    return false;
++  }
++  AddRegOperand(inst, kActionWrite, ic, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, fc, kUseAsValue, data.Rn);
++  return true;
++}
++// Fixed-point conversions: the number of fraction bits is 64 - scale; for a 32-bit register scale<5> must be set
++static bool NxFixed(const InstData &data, Instruction &inst, RegClass dst_class, RegClass src_class, bool int_is_src) {
++  if (IsUnallocatedFloatEncoding(data)) {
++    return false;
++  }
++  RegClass ic = int_is_src ? src_class : dst_class;
++  if (ic == kRegW && !(data.scale & 0x20)) {
++    return false;
++  }
++  AddRegOperand(inst, kActionWrite, dst_class, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, src_class, kUseAsValue, data.Rn);
++  AddImmOperand(inst, 64U - data.scale, kUnsigned, 32);
++  return true;
++}
++static bool NxFdW_Fn(const InstData &data, Instruction &inst, RegClass rclass) {
++  if (IsUnallocatedFloatEncoding(data)) {
++    return false;
++  }
++  AddRegOperand(inst, kActionWrite, rclass, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, rclass, kUseAsValue, data.Rn);
++  return true;
++}
++static bool NxFdW_Fn_Fm_Fa(const InstData &data, Instruction &inst, RegClass rclass) {
++  if (IsUnallocatedFloatEncoding(data)) {
++    return false;
++  }
++  AddRegOperand(inst, kActionWrite, rclass, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, rclass, kUseAsValue, data.Rn);
++  AddRegOperand(inst, kActionRead, rclass, kUseAsValue, data.Rm);
++  AddRegOperand(inst, kActionRead, rclass, kUseAsValue, data.Ra);
++  return true;
++}
++static bool NxFccmp(const InstData &data, Instruction &inst, RegClass rclass) {
++  if (IsUnallocatedFloatEncoding(data)) {
++    return false;
++  }
++  SetConditionalFunctionName(data, inst);
++  AddRegOperand(inst, kActionRead, rclass, kUseAsValue, data.Rn);
++  AddRegOperand(inst, kActionRead, rclass, kUseAsValue, data.Rm);
++  AddImmOperand(inst, data.nzcv);
++  return true;
++}
++// The scalar forms of SCVTF/UCVTF that read a SIMD&FP register as an integer: sz picks single or double, and becomes a suffix of the instruction's name since the operands differ in size
++static bool NxCvtfSimd(const InstData &data, Instruction &inst, uint32_t fbits) {
++  RegClass rc = data.sz ? kRegD : kRegS;
++  AddRegOperand(inst, kActionWrite, rc, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, rc, kUseAsValue, data.Rn);
++  AddImmOperand(inst, fbits, kUnsigned, 32);
++  inst.function += data.sz ? "_D" : "_S";
++  return true;
++}
++static bool NxCvtfSimdShift(const InstData &data, Instruction &inst) {
++  uint32_t immhb = (static_cast<uint32_t>(data.immh.uimm) << 3) | static_cast<uint32_t>(data.immb.uimm);
++  uint32_t fbits;
++  RegClass rc;
++  if (data.immh.uimm & 8) {
++    rc = kRegD; fbits = 128U - immhb; inst.function += "_D";
++  } else if ((data.immh.uimm & 0xC) == 4) {
++    rc = kRegS; fbits = 64U - immhb; inst.function += "_S";
++  } else {
++    return false;  // half precision, or unallocated
++  }
++  AddRegOperand(inst, kActionWrite, rc, kUseAsValue, data.Rd);
++  AddRegOperand(inst, kActionRead, rc, kUseAsValue, data.Rn);
++  AddImmOperand(inst, fbits, kUnsigned, 32);
++  return true;
++}
++bool TryDecodeFCVTNS_32S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegS); }
++bool TryDecodeFCVTNS_32D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegD); }
++bool TryDecodeFCVTNS_64S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegS); }
++bool TryDecodeFCVTNS_64D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegD); }
++bool TryDecodeFCVTNU_32S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegS); }
++bool TryDecodeFCVTNU_32D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegD); }
++bool TryDecodeFCVTNU_64S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegS); }
++bool TryDecodeFCVTNU_64D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegD); }
++bool TryDecodeFCVTAS_32S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegS); }
++bool TryDecodeFCVTAS_32D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegD); }
++bool TryDecodeFCVTAS_64S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegS); }
++bool TryDecodeFCVTAS_64D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegD); }
++bool TryDecodeFCVTAU_32S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegS); }
++bool TryDecodeFCVTAU_32D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegD); }
++bool TryDecodeFCVTAU_64S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegS); }
++bool TryDecodeFCVTAU_64D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegD); }
++bool TryDecodeFCVTMS_32S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegS); }
++bool TryDecodeFCVTMS_32D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegD); }
++bool TryDecodeFCVTMS_64S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegS); }
++bool TryDecodeFCVTMS_64D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegD); }
++bool TryDecodeFCVTMU_32S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegS); }
++bool TryDecodeFCVTMU_32D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegD); }
++bool TryDecodeFCVTMU_64S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegS); }
++bool TryDecodeFCVTMU_64D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegD); }
++bool TryDecodeFCVTPS_32S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegS); }
++bool TryDecodeFCVTPS_32D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegD); }
++bool TryDecodeFCVTPS_64S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegS); }
++bool TryDecodeFCVTPS_64D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegD); }
++bool TryDecodeFCVTPU_32S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegS); }
++bool TryDecodeFCVTPU_32D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegW, kRegD); }
++bool TryDecodeFCVTPU_64S_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegS); }
++bool TryDecodeFCVTPU_64D_FLOAT2INT(const InstData &data, Instruction &inst) { return NxFcvtToInt(data, inst, kRegX, kRegD); }
++bool TryDecodeFCVTZS_32S_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegW, kRegS, false); }
++bool TryDecodeFCVTZS_32D_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegW, kRegD, false); }
++bool TryDecodeFCVTZS_64S_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegX, kRegS, false); }
++bool TryDecodeFCVTZS_64D_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegX, kRegD, false); }
++bool TryDecodeFCVTZU_32S_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegW, kRegS, false); }
++bool TryDecodeFCVTZU_32D_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegW, kRegD, false); }
++bool TryDecodeFCVTZU_64S_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegX, kRegS, false); }
++bool TryDecodeFCVTZU_64D_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegX, kRegD, false); }
++bool TryDecodeSCVTF_S32_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegS, kRegW, true); }
++bool TryDecodeSCVTF_D32_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegD, kRegW, true); }
++bool TryDecodeSCVTF_S64_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegS, kRegX, true); }
++bool TryDecodeSCVTF_D64_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegD, kRegX, true); }
++bool TryDecodeSCVTF_ASISDMISC_R(const InstData &data, Instruction &inst) { return NxCvtfSimd(data, inst, 0); }
++bool TryDecodeSCVTF_ASISDSHF_C(const InstData &data, Instruction &inst) { return NxCvtfSimdShift(data, inst); }
++bool TryDecodeUCVTF_S32_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegS, kRegW, true); }
++bool TryDecodeUCVTF_D32_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegD, kRegW, true); }
++bool TryDecodeUCVTF_S64_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegS, kRegX, true); }
++bool TryDecodeUCVTF_D64_FLOAT2FIX(const InstData &data, Instruction &inst) { return NxFixed(data, inst, kRegD, kRegX, true); }
++bool TryDecodeUCVTF_ASISDMISC_R(const InstData &data, Instruction &inst) { return NxCvtfSimd(data, inst, 0); }
++bool TryDecodeUCVTF_ASISDSHF_C(const InstData &data, Instruction &inst) { return NxCvtfSimdShift(data, inst); }
++bool TryDecodeFCSEL_S_FLOATSEL(const InstData &data, Instruction &inst) { return DecodeConditionalRegSelect(data, inst, kRegS, 3); }
++bool TryDecodeFCCMP_S_FLOATCCMP(const InstData &data, Instruction &inst) { return NxFccmp(data, inst, kRegS); }
++bool TryDecodeFCCMPE_S_FLOATCCMP(const InstData &data, Instruction &inst) { return NxFccmp(data, inst, kRegS); }
++bool TryDecodeFMIN_S_FLOATDP2(const InstData &data, Instruction &inst) { return TryDecodeFdW_Fn_Fm(data, inst, kRegS); }
++bool TryDecodeFMAX_S_FLOATDP2(const InstData &data, Instruction &inst) { return TryDecodeFdW_Fn_Fm(data, inst, kRegS); }
++bool TryDecodeFMINNM_S_FLOATDP2(const InstData &data, Instruction &inst) { return TryDecodeFdW_Fn_Fm(data, inst, kRegS); }
++bool TryDecodeFMAXNM_S_FLOATDP2(const InstData &data, Instruction &inst) { return TryDecodeFdW_Fn_Fm(data, inst, kRegS); }
++bool TryDecodeFNMUL_S_FLOATDP2(const InstData &data, Instruction &inst) { return TryDecodeFdW_Fn_Fm(data, inst, kRegS); }
++bool TryDecodeFMSUB_S_FLOATDP3(const InstData &data, Instruction &inst) { return NxFdW_Fn_Fm_Fa(data, inst, kRegS); }
++bool TryDecodeFNMADD_S_FLOATDP3(const InstData &data, Instruction &inst) { return NxFdW_Fn_Fm_Fa(data, inst, kRegS); }
++bool TryDecodeFNMSUB_S_FLOATDP3(const InstData &data, Instruction &inst) { return NxFdW_Fn_Fm_Fa(data, inst, kRegS); }
++bool TryDecodeFSQRT_S_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegS); }
++bool TryDecodeFRINTM_S_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegS); }
++bool TryDecodeFRINTP_S_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegS); }
++bool TryDecodeFRINTZ_S_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegS); }
++bool TryDecodeFRINTA_S_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegS); }
++bool TryDecodeFRINTX_S_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegS); }
++bool TryDecodeFRINTI_S_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegS); }
++bool TryDecodeFRINTN_S_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegS); }
++bool TryDecodeFCSEL_D_FLOATSEL(const InstData &data, Instruction &inst) { return DecodeConditionalRegSelect(data, inst, kRegD, 3); }
++bool TryDecodeFCCMP_D_FLOATCCMP(const InstData &data, Instruction &inst) { return NxFccmp(data, inst, kRegD); }
++bool TryDecodeFCCMPE_D_FLOATCCMP(const InstData &data, Instruction &inst) { return NxFccmp(data, inst, kRegD); }
++bool TryDecodeFMIN_D_FLOATDP2(const InstData &data, Instruction &inst) { return TryDecodeFdW_Fn_Fm(data, inst, kRegD); }
++bool TryDecodeFMAX_D_FLOATDP2(const InstData &data, Instruction &inst) { return TryDecodeFdW_Fn_Fm(data, inst, kRegD); }
++bool TryDecodeFMINNM_D_FLOATDP2(const InstData &data, Instruction &inst) { return TryDecodeFdW_Fn_Fm(data, inst, kRegD); }
++bool TryDecodeFMAXNM_D_FLOATDP2(const InstData &data, Instruction &inst) { return TryDecodeFdW_Fn_Fm(data, inst, kRegD); }
++bool TryDecodeFNMUL_D_FLOATDP2(const InstData &data, Instruction &inst) { return TryDecodeFdW_Fn_Fm(data, inst, kRegD); }
++bool TryDecodeFMSUB_D_FLOATDP3(const InstData &data, Instruction &inst) { return NxFdW_Fn_Fm_Fa(data, inst, kRegD); }
++bool TryDecodeFNMADD_D_FLOATDP3(const InstData &data, Instruction &inst) { return NxFdW_Fn_Fm_Fa(data, inst, kRegD); }
++bool TryDecodeFNMSUB_D_FLOATDP3(const InstData &data, Instruction &inst) { return NxFdW_Fn_Fm_Fa(data, inst, kRegD); }
++bool TryDecodeFSQRT_D_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegD); }
++bool TryDecodeFRINTM_D_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegD); }
++bool TryDecodeFRINTP_D_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegD); }
++bool TryDecodeFRINTZ_D_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegD); }
++bool TryDecodeFRINTA_D_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegD); }
++bool TryDecodeFRINTX_D_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegD); }
++bool TryDecodeFRINTI_D_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegD); }
++bool TryDecodeFRINTN_D_FLOATDP1(const InstData &data, Instruction &inst) { return NxFdW_Fn(data, inst, kRegD); }
++
++
+ // CCMN  <Wn>, #<imm>, #<nzcv>, <cond>
+ bool TryDecodeCCMN_32_CONDCMP_IMM(const InstData &data, Instruction &inst) {
+   SetConditionalFunctionName(data, inst);
+@@ -4535,6 +4770,50 @@ bool TryDecodeSTLXR_SR64_LDSTEXCL(const InstData &data, Instruction &inst) {
+   return true;
+ }
+ 
++// ---- NX2Linux: byte and halfword exclusives and release stores, CLREX, DSB and the prefetches ----
++static bool NxLdxr(const InstData &data, Instruction &inst, unsigned bits) {
++  inst.is_atomic_read_modify_write = true;
++  AddRegOperand(inst, kActionWrite, kRegW, kUseAsValue, data.Rt);
++  AddBasePlusOffsetMemOp(inst, kActionRead, bits, data.Rn, 0);
++  AddMonitorOperand(inst);
++  return true;
++}
++static bool NxStxr(const InstData &data, Instruction &inst, unsigned bits) {
++  inst.is_atomic_read_modify_write = true;
++  AddRegOperand(inst, kActionWrite, kRegW, kUseAsValue, data.Rs);
++  AddRegOperand(inst, kActionRead, kRegW, kUseAsValue, data.Rt);
++  AddBasePlusOffsetMemOp(inst, kActionWrite, bits, data.Rn, 0);
++  AddMonitorOperand(inst);
++  return true;
++}
++bool TryDecodeLDXRB_LR32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxLdxr(data, inst, 8); }
++bool TryDecodeLDXRH_LR32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxLdxr(data, inst, 16); }
++bool TryDecodeLDAXRB_LR32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxLdxr(data, inst, 8); }
++bool TryDecodeLDAXRH_LR32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxLdxr(data, inst, 16); }
++bool TryDecodeSTXRB_SR32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxStxr(data, inst, 8); }
++bool TryDecodeSTXRH_SR32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxStxr(data, inst, 16); }
++bool TryDecodeSTLXRB_SR32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxStxr(data, inst, 8); }
++bool TryDecodeSTLXRH_SR32_LDSTEXCL(const InstData &data, Instruction &inst) { return NxStxr(data, inst, 16); }
++bool TryDecodeSTLRB_SL32_LDSTEXCL(const InstData &data, Instruction &inst) {
++  AddRegOperand(inst, kActionRead, kRegW, kUseAsValue, data.Rt);
++  AddBasePlusOffsetMemOp(inst, kActionWrite, 8, data.Rn, 0);
++  return true;
++}
++bool TryDecodeSTLRH_SL32_LDSTEXCL(const InstData &data, Instruction &inst) {
++  AddRegOperand(inst, kActionRead, kRegW, kUseAsValue, data.Rt);
++  AddBasePlusOffsetMemOp(inst, kActionWrite, 16, data.Rn, 0);
++  return true;
++}
++// CLREX forgets the exclusive monitor: the two MONITOR operands are written with 0
++bool TryDecodeCLREX_BN_SYSTEM(const InstData &, Instruction &inst) { AddMonitorOperand(inst); return true; }
++bool TryDecodeDSB_BO_SYSTEM(const InstData &, Instruction &) { return true; }
++// Prefetches are hints: no operands, no effect
++bool TryDecodePRFM_P_LDST_REGOFF(const InstData &, Instruction &) { return true; }
++bool TryDecodePRFM_P_LOADLIT(const InstData &, Instruction &) { return true; }
++bool TryDecodePRFM_P_LDST_POS(const InstData &, Instruction &) { return true; }
++bool TryDecodePRFUM_P_LDST_UNSCALED(const InstData &, Instruction &) { return true; }
++
++
+ static uint64_t ConcatABCDEFGHToU8(const InstData &data) {
+   uint64_t imm = data.a;
+   imm = (imm << 1) | data.b;
+diff --git a/lib/Arch/AArch64/Decode.cpp b/lib/Arch/AArch64/Decode.cpp
+index 60888ef..dc27874 100644
+--- a/lib/Arch/AArch64/Decode.cpp
++++ b/lib/Arch/AArch64/Decode.cpp
+@@ -562,9 +562,6 @@ bool TryDecodeFABS_ASIMDMISC_R(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SCVTF  <V><d>, <V><n>, #<fbits>
+-bool TryDecodeSCVTF_ASISDSHF_C(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SCVTF SCVTF_asimdshf_C:
+ //   0 x Rd       0
+@@ -1208,9 +1205,6 @@ bool TryDecodeFMIN_H_FLOATDP2(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FMIN  <Sd>, <Sn>, <Sm>
+-bool TryDecodeFMIN_S_FLOATDP2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMIN FMIN_D_floatdp2:
+ //   0 x Rd       0
+@@ -1246,9 +1240,6 @@ bool TryDecodeFMIN_S_FLOATDP2(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FMIN  <Dd>, <Dn>, <Dm>
+-bool TryDecodeFMIN_D_FLOATDP2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // UMLSL UMLSL_asimdelem_L:
+ //   0 x Rd       0
+@@ -1474,9 +1465,6 @@ bool TryDecodeFCVTPS_64H_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTPS  <Wd>, <Sn>
+-bool TryDecodeFCVTPS_32S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTPS FCVTPS_64S_float2int:
+ //   0 x Rd       0
+@@ -1512,9 +1500,6 @@ bool TryDecodeFCVTPS_32S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTPS  <Xd>, <Sn>
+-bool TryDecodeFCVTPS_64S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTPS FCVTPS_32D_float2int:
+ //   0 x Rd       0
+@@ -1550,9 +1535,6 @@ bool TryDecodeFCVTPS_64S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTPS  <Wd>, <Dn>
+-bool TryDecodeFCVTPS_32D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTPS FCVTPS_64D_float2int:
+ //   0 x Rd       0
+@@ -1588,9 +1570,6 @@ bool TryDecodeFCVTPS_32D_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTPS  <Xd>, <Dn>
+-bool TryDecodeFCVTPS_64D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMINNM FMINNM_H_floatdp2:
+ //   0 x Rd       0
+@@ -1664,9 +1643,6 @@ bool TryDecodeFMINNM_H_FLOATDP2(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FMINNM  <Sd>, <Sn>, <Sm>
+-bool TryDecodeFMINNM_S_FLOATDP2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMINNM FMINNM_D_floatdp2:
+ //   0 x Rd       0
+@@ -1702,9 +1678,6 @@ bool TryDecodeFMINNM_S_FLOATDP2(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FMINNM  <Dd>, <Dn>, <Dm>
+-bool TryDecodeFMINNM_D_FLOATDP2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDTRSW LDTRSW_64_ldst_unpriv:
+ //   0 x Rt       0
+@@ -1816,9 +1789,6 @@ bool TryDecodeFSQRT_H_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FSQRT  <Sd>, <Sn>
+-bool TryDecodeFSQRT_S_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FSQRT FSQRT_D_floatdp1:
+ //   0 x Rd       0
+@@ -1854,9 +1824,6 @@ bool TryDecodeFSQRT_S_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FSQRT  <Dd>, <Dn>
+-bool TryDecodeFSQRT_D_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDEORA LDEORA_32_memop:
+ //   0 x Rt       0
+@@ -2272,9 +2239,6 @@ bool TryDecodeFRINTM_H_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTM  <Sd>, <Sn>
+-bool TryDecodeFRINTM_S_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRINTM FRINTM_D_floatdp1:
+ //   0 x Rd       0
+@@ -2310,9 +2274,6 @@ bool TryDecodeFRINTM_S_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTM  <Dd>, <Dn>
+-bool TryDecodeFRINTM_D_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDUMINAB LDUMINAB_32_memop:
+ //   0 x Rt       0
+@@ -3374,9 +3335,6 @@ bool TryDecodeUCVTF_ASISDMISCFP16_R(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // UCVTF  <V><d>, <V><n>
+-bool TryDecodeUCVTF_ASISDMISC_R(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // UCVTF UCVTF_asimdmiscfp16_R:
+ //   0 x Rd       0
+@@ -4666,9 +4624,6 @@ bool TryDecodeFRINTX_H_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTX  <Sd>, <Sn>
+-bool TryDecodeFRINTX_S_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRINTX FRINTX_D_floatdp1:
+ //   0 x Rd       0
+@@ -4704,9 +4659,6 @@ bool TryDecodeFRINTX_S_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTX  <Dd>, <Dn>
+-bool TryDecodeFRINTX_D_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDUMAXAB LDUMAXAB_32_memop:
+ //   0 x Rt       0
+@@ -5190,9 +5142,6 @@ bool TryDecodeFCMEQ_ASIMDSAME_ONLY(const InstData &, Instruction &) {
+ //  30 1
+ //  31 1
+ // CLREX  {#<imm>}
+-bool TryDecodeCLREX_BN_SYSTEM(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FSUB FSUB_asimdsamefp16_only:
+ //   0 x Rd       0
+@@ -5837,9 +5786,6 @@ bool TryDecodeCMGE_ASISDMISC_Z(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // UCVTF  <V><d>, <V><n>, #<fbits>
+-bool TryDecodeUCVTF_ASISDSHF_C(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // UCVTF UCVTF_asimdshf_C:
+ //   0 x Rd       0
+@@ -7357,9 +7303,6 @@ bool TryDecodeFRINTZ_ASIMDMISC_R(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 0 size     1
+ // STXRH  <Ws>, <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTXRH_SR32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STEORH STEORH_32S_memop:
+ //   0 1 Rt       0
+@@ -9903,9 +9846,6 @@ bool TryDecodeFMAX_H_FLOATDP2(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FMAX  <Sd>, <Sn>, <Sm>
+-bool TryDecodeFMAX_S_FLOATDP2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMAX FMAX_D_floatdp2:
+ //   0 x Rd       0
+@@ -9941,9 +9881,6 @@ bool TryDecodeFMAX_S_FLOATDP2(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FMAX  <Dd>, <Dn>, <Dm>
+-bool TryDecodeFMAX_D_FLOATDP2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // AESD AESD_B_cryptoaes:
+ //   0 x Rd       0
+@@ -12754,9 +12691,6 @@ bool TryDecodeADDP_ASISDPAIR_ONLY(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 0 size     1
+ // STR  <Bt>, [<Xn|SP>], #<simm>
+-bool TryDecodeSTR_B_LDST_IMMPOST(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_H_ldst_immpost:
+ //   0 x Rt       0
+@@ -12792,9 +12726,6 @@ bool TryDecodeSTR_B_LDST_IMMPOST(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 0 size     1
+ // STR  <Ht>, [<Xn|SP>], #<simm>
+-bool TryDecodeSTR_H_LDST_IMMPOST(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_S_ldst_immpost:
+ //   0 x Rt       0
+@@ -12830,9 +12761,6 @@ bool TryDecodeSTR_H_LDST_IMMPOST(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 1 size     1
+ // STR  <St>, [<Xn|SP>], #<simm>
+-bool TryDecodeSTR_S_LDST_IMMPOST(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_D_ldst_immpost:
+ //   0 x Rt       0
+@@ -12868,9 +12796,6 @@ bool TryDecodeSTR_S_LDST_IMMPOST(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 1 size     1
+ // STR  <Dt>, [<Xn|SP>], #<simm>
+-bool TryDecodeSTR_D_LDST_IMMPOST(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_Q_ldst_immpost:
+ //   0 x Rt       0
+@@ -12906,9 +12831,6 @@ bool TryDecodeSTR_D_LDST_IMMPOST(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 0 size     1
+ // STR  <Qt>, [<Xn|SP>], #<simm>
+-bool TryDecodeSTR_Q_LDST_IMMPOST(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_B_ldst_immpre:
+ //   0 x Rt       0
+@@ -12944,9 +12866,6 @@ bool TryDecodeSTR_Q_LDST_IMMPOST(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 0 size     1
+ // STR  <Bt>, [<Xn|SP>, #<simm>]!
+-bool TryDecodeSTR_B_LDST_IMMPRE(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_H_ldst_immpre:
+ //   0 x Rt       0
+@@ -12982,9 +12901,6 @@ bool TryDecodeSTR_B_LDST_IMMPRE(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 0 size     1
+ // STR  <Ht>, [<Xn|SP>, #<simm>]!
+-bool TryDecodeSTR_H_LDST_IMMPRE(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_S_ldst_immpre:
+ //   0 x Rt       0
+@@ -13020,9 +12936,6 @@ bool TryDecodeSTR_H_LDST_IMMPRE(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 1 size     1
+ // STR  <St>, [<Xn|SP>, #<simm>]!
+-bool TryDecodeSTR_S_LDST_IMMPRE(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_D_ldst_immpre:
+ //   0 x Rt       0
+@@ -13058,9 +12971,6 @@ bool TryDecodeSTR_S_LDST_IMMPRE(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 1 size     1
+ // STR  <Dt>, [<Xn|SP>, #<simm>]!
+-bool TryDecodeSTR_D_LDST_IMMPRE(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDSETAB LDSETAB_32_memop:
+ //   0 x Rt       0
+@@ -13286,9 +13196,6 @@ bool TryDecodeFRINTP_H_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTP  <Sd>, <Sn>
+-bool TryDecodeFRINTP_S_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRINTP FRINTP_D_floatdp1:
+ //   0 x Rd       0
+@@ -13324,9 +13231,6 @@ bool TryDecodeFRINTP_S_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTP  <Dd>, <Dn>
+-bool TryDecodeFRINTP_D_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // CASA CASA_C32_ldstexcl:
+ //   0 x Rt       0
+@@ -14008,9 +13912,6 @@ bool TryDecodeLDUMINL_64_MEMOP(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 0 size     1
+ // STXRB  <Ws>, <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTXRB_SR32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STLXRH STLXRH_SR32_ldstexcl:
+ //   0 x Rt       0
+@@ -14046,9 +13947,6 @@ bool TryDecodeSTXRB_SR32_LDSTEXCL(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 0 size     1
+ // STLXRH  <Ws>, <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTLXRH_SR32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STLLRH STLLRH_SL32_ldstexcl:
+ //   0 x Rt       0
+@@ -15072,9 +14970,6 @@ bool TryDecodeFCVTZS_64H_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTZS  <Wd>, <Sn>, #<fbits>
+-bool TryDecodeFCVTZS_32S_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTZS FCVTZS_64S_float2fix:
+ //   0 x Rd       0
+@@ -15110,9 +15005,6 @@ bool TryDecodeFCVTZS_32S_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTZS  <Xd>, <Sn>, #<fbits>
+-bool TryDecodeFCVTZS_64S_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTZS FCVTZS_32D_float2fix:
+ //   0 x Rd       0
+@@ -15148,9 +15040,6 @@ bool TryDecodeFCVTZS_64S_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTZS  <Wd>, <Dn>, #<fbits>
+-bool TryDecodeFCVTZS_32D_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTZS FCVTZS_64D_float2fix:
+ //   0 x Rd       0
+@@ -15186,9 +15075,6 @@ bool TryDecodeFCVTZS_32D_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTZS  <Xd>, <Dn>, #<fbits>
+-bool TryDecodeFCVTZS_64D_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // UQADD UQADD_asisdsame_only:
+ //   0 x Rd       0
+@@ -15338,9 +15224,6 @@ bool TryDecodeFNMSUB_H_FLOATDP3(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FNMSUB  <Sd>, <Sn>, <Sm>, <Sa>
+-bool TryDecodeFNMSUB_S_FLOATDP3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FNMSUB FNMSUB_D_floatdp3:
+ //   0 x Rd       0
+@@ -15376,9 +15259,6 @@ bool TryDecodeFNMSUB_S_FLOATDP3(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FNMSUB  <Dd>, <Dn>, <Dm>, <Da>
+-bool TryDecodeFNMSUB_D_FLOATDP3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SHA1M SHA1M_QSV_cryptosha3:
+ //   0 x Rd       0
+@@ -15908,9 +15788,6 @@ bool TryDecodeFCVTZU_64H_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTZU  <Wd>, <Sn>, #<fbits>
+-bool TryDecodeFCVTZU_32S_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTZU FCVTZU_64S_float2fix:
+ //   0 x Rd       0
+@@ -15946,9 +15823,6 @@ bool TryDecodeFCVTZU_32S_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTZU  <Xd>, <Sn>, #<fbits>
+-bool TryDecodeFCVTZU_64S_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTZU FCVTZU_32D_float2fix:
+ //   0 x Rd       0
+@@ -15984,9 +15858,6 @@ bool TryDecodeFCVTZU_64S_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTZU  <Wd>, <Dn>, #<fbits>
+-bool TryDecodeFCVTZU_32D_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTZU FCVTZU_64D_float2fix:
+ //   0 x Rd       0
+@@ -16022,9 +15893,6 @@ bool TryDecodeFCVTZU_32D_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTZU  <Xd>, <Dn>, #<fbits>
+-bool TryDecodeFCVTZU_64D_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SHA1P SHA1P_QSV_cryptosha3:
+ //   0 x Rd       0
+@@ -16364,9 +16232,6 @@ bool TryDecodeFNMUL_H_FLOATDP2(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FNMUL  <Sd>, <Sn>, <Sm>
+-bool TryDecodeFNMUL_S_FLOATDP2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FNMUL FNMUL_D_floatdp2:
+ //   0 x Rd       0
+@@ -16402,9 +16267,6 @@ bool TryDecodeFNMUL_S_FLOATDP2(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FNMUL  <Dd>, <Dn>, <Dm>
+-bool TryDecodeFNMUL_D_FLOATDP2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SQSUB SQSUB_asisdsame_only:
+ //   0 x Rd       0
+@@ -16668,9 +16530,6 @@ bool TryDecodeREV64_REV_64_DP_1SRC(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 0 size     1
+ // STLXRB  <Ws>, <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTLXRB_SR32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STTRH STTRH_32_ldst_unpriv:
+ //   0 x Rt       0
+@@ -16820,9 +16679,6 @@ bool TryDecodeFMSUB_H_FLOATDP3(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FMSUB  <Sd>, <Sn>, <Sm>, <Sa>
+-bool TryDecodeFMSUB_S_FLOATDP3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMSUB FMSUB_D_floatdp3:
+ //   0 x Rd       0
+@@ -16858,9 +16714,6 @@ bool TryDecodeFMSUB_S_FLOATDP3(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FMSUB  <Dd>, <Dn>, <Dm>, <Da>
+-bool TryDecodeFMSUB_D_FLOATDP3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SBCS NGCS_SBCS_32_addsub_carry:
+ //   0 x Rd       0
+@@ -17352,9 +17205,6 @@ bool TryDecodeSCVTF_ASISDMISCFP16_R(const InstData &, Instruction &) {
+ //  30 1
+ //  31 0
+ // SCVTF  <V><d>, <V><n>
+-bool TryDecodeSCVTF_ASISDMISC_R(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SCVTF SCVTF_asimdmiscfp16_R:
+ //   0 x Rd       0
+@@ -17808,9 +17658,6 @@ bool TryDecodeZIP2_ASIMDPERM_ONLY(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 0 size     1
+ // LDAXRB  <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeLDAXRB_LR32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // MSUB MNEG_MSUB_32A_dp_3src:
+ //   0 x Rd       0
+@@ -19556,9 +19403,6 @@ bool TryDecodeFRINTI_H_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTI  <Sd>, <Sn>
+-bool TryDecodeFRINTI_S_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRINTI FRINTI_D_floatdp1:
+ //   0 x Rd       0
+@@ -19594,9 +19438,6 @@ bool TryDecodeFRINTI_S_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTI  <Dd>, <Dn>
+-bool TryDecodeFRINTI_D_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMADD FMADD_H_floatdp3:
+ //   0 x Rd       0
+@@ -20012,9 +19853,6 @@ bool TryDecodeDC_SYS_CR_SYSTEM(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 1 size     1
+ // PRFM  (<prfop>|#<imm5>), [<Xn|SP>, (<Wm>|<Xm>){, <extend> {<amount>}}]
+-bool TryDecodePRFM_P_LDST_REGOFF(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STUMINH STUMINH_32S_memop:
+ //   0 1 Rt       0
+@@ -20278,9 +20116,6 @@ bool TryDecodeFCVTAU_64H_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTAU  <Wd>, <Sn>
+-bool TryDecodeFCVTAU_32S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTAU FCVTAU_64S_float2int:
+ //   0 x Rd       0
+@@ -20316,9 +20151,6 @@ bool TryDecodeFCVTAU_32S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTAU  <Xd>, <Sn>
+-bool TryDecodeFCVTAU_64S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTAU FCVTAU_32D_float2int:
+ //   0 x Rd       0
+@@ -20354,9 +20186,6 @@ bool TryDecodeFCVTAU_64S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTAU  <Wd>, <Dn>
+-bool TryDecodeFCVTAU_32D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTAU FCVTAU_64D_float2int:
+ //   0 x Rd       0
+@@ -20392,9 +20221,6 @@ bool TryDecodeFCVTAU_32D_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTAU  <Xd>, <Dn>
+-bool TryDecodeFCVTAU_64D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SYS TLBI_SYS_CR_system:
+ //   0 x Rt       0
+@@ -20658,9 +20484,6 @@ bool TryDecodeFRINTN_H_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTN  <Sd>, <Sn>
+-bool TryDecodeFRINTN_S_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRINTN FRINTN_D_floatdp1:
+ //   0 x Rd       0
+@@ -20696,9 +20519,6 @@ bool TryDecodeFRINTN_S_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTN  <Dd>, <Dn>
+-bool TryDecodeFRINTN_D_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // ESB ESB_HI_system:
+ //   0 1 Rt       0
+@@ -21228,9 +21048,6 @@ bool TryDecodeDUP_ASIMDINS_DV_V(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 0 size     1
+ // STLRH  <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTLRH_SL32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDUMAXA LDUMAXA_32_memop:
+ //   0 x Rt       0
+@@ -21944,9 +21761,6 @@ bool TryDecodeFRINTZ_H_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTZ  <Sd>, <Sn>
+-bool TryDecodeFRINTZ_S_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRINTZ FRINTZ_D_floatdp1:
+ //   0 x Rd       0
+@@ -21982,9 +21796,6 @@ bool TryDecodeFRINTZ_S_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTZ  <Dd>, <Dn>
+-bool TryDecodeFRINTZ_D_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SCVTF SCVTF_H32_float2fix:
+ //   0 x Rd       0
+@@ -22058,9 +21869,6 @@ bool TryDecodeSCVTF_H32_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // SCVTF  <Sd>, <Wn>, #<fbits>
+-bool TryDecodeSCVTF_S32_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SCVTF SCVTF_D32_float2fix:
+ //   0 x Rd       0
+@@ -22096,9 +21904,6 @@ bool TryDecodeSCVTF_S32_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // SCVTF  <Dd>, <Wn>, #<fbits>
+-bool TryDecodeSCVTF_D32_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SCVTF SCVTF_H64_float2fix:
+ //   0 x Rd       0
+@@ -22172,9 +21977,6 @@ bool TryDecodeSCVTF_H64_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // SCVTF  <Sd>, <Xn>, #<fbits>
+-bool TryDecodeSCVTF_S64_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SCVTF SCVTF_D64_float2fix:
+ //   0 x Rd       0
+@@ -22210,9 +22012,6 @@ bool TryDecodeSCVTF_S64_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // SCVTF  <Dd>, <Xn>, #<fbits>
+-bool TryDecodeSCVTF_D64_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SQDMLAL SQDMLAL_asisdelem_L:
+ //   0 x Rd       0
+@@ -23046,9 +22845,6 @@ bool TryDecodeUCVTF_H32_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // UCVTF  <Sd>, <Wn>, #<fbits>
+-bool TryDecodeUCVTF_S32_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // UCVTF UCVTF_D32_float2fix:
+ //   0 x Rd       0
+@@ -23084,9 +22880,6 @@ bool TryDecodeUCVTF_S32_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // UCVTF  <Dd>, <Wn>, #<fbits>
+-bool TryDecodeUCVTF_D32_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // UCVTF UCVTF_H64_float2fix:
+ //   0 x Rd       0
+@@ -23160,9 +22953,6 @@ bool TryDecodeUCVTF_H64_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // UCVTF  <Sd>, <Xn>, #<fbits>
+-bool TryDecodeUCVTF_S64_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // UCVTF UCVTF_D64_float2fix:
+ //   0 x Rd       0
+@@ -23198,9 +22988,6 @@ bool TryDecodeUCVTF_S64_FLOAT2FIX(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // UCVTF  <Dd>, <Xn>, #<fbits>
+-bool TryDecodeUCVTF_D64_FLOAT2FIX(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SQRDMLAH SQRDMLAH_asisdelem_R:
+ //   0 x Rd       0
+@@ -23654,9 +23441,6 @@ bool TryDecodeSLI_ASIMDSHF_R(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 0 size     1
+ // LDAXRH  <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeLDAXRH_LR32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // BFM BFI_BFM_32M_bitfield:
+ //   0 x Rd       0
+@@ -27987,9 +27771,6 @@ bool TryDecodeLD3R_ASISDLSOP_RX3_R(const InstData &, Instruction &) {
+ //  30 1 opc      0
+ //  31 1 opc      1
+ // PRFM  (<prfop>|#<imm5>), <label>
+-bool TryDecodePRFM_P_LOADLIT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // CASAB CASAB_C32_ldstexcl:
+ //   0 x Rt       0
+@@ -28672,9 +28453,6 @@ bool TryDecodeFMAXNM_H_FLOATDP2(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FMAXNM  <Sd>, <Sn>, <Sm>
+-bool TryDecodeFMAXNM_S_FLOATDP2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMAXNM FMAXNM_D_floatdp2:
+ //   0 x Rd       0
+@@ -28710,9 +28488,6 @@ bool TryDecodeFMAXNM_S_FLOATDP2(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FMAXNM  <Dd>, <Dn>, <Dm>
+-bool TryDecodeFMAXNM_D_FLOATDP2(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // CNT CNT_asimdmisc_R:
+ //   0 x Rd       0
+@@ -29736,9 +29511,6 @@ bool TryDecodeFCCMPE_H_FLOATCCMP(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FCCMPE  <Sn>, <Sm>, #<nzcv>, <cond>
+-bool TryDecodeFCCMPE_S_FLOATCCMP(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCCMPE FCCMPE_D_floatccmp:
+ //   0 x nzcv     0
+@@ -29774,9 +29546,6 @@ bool TryDecodeFCCMPE_S_FLOATCCMP(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FCCMPE  <Dn>, <Dm>, #<nzcv>, <cond>
+-bool TryDecodeFCCMPE_D_FLOATCCMP(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FMAXP FMAXP_asimdsamefp16_only:
+ //   0 x Rd       0
+@@ -30306,9 +30075,6 @@ bool TryDecodeWFI_HI_SYSTEM(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 0 size     1
+ // LDXRH  <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeLDXRH_LR32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STLRB STLRB_SL32_ldstexcl:
+ //   0 x Rt       0
+@@ -30344,9 +30110,6 @@ bool TryDecodeLDXRH_LR32_LDSTEXCL(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 0 size     1
+ // STLRB  <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTLRB_SL32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // ST3 ST3_asisdlse_R3:
+ //   0 x Rt       0
+@@ -30990,9 +30753,6 @@ bool TryDecodeFCVTAS_64H_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTAS  <Wd>, <Sn>
+-bool TryDecodeFCVTAS_32S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTAS FCVTAS_64S_float2int:
+ //   0 x Rd       0
+@@ -31028,9 +30788,6 @@ bool TryDecodeFCVTAS_32S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTAS  <Xd>, <Sn>
+-bool TryDecodeFCVTAS_64S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTAS FCVTAS_32D_float2int:
+ //   0 x Rd       0
+@@ -31066,9 +30823,6 @@ bool TryDecodeFCVTAS_64S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTAS  <Wd>, <Dn>
+-bool TryDecodeFCVTAS_32D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTAS FCVTAS_64D_float2int:
+ //   0 x Rd       0
+@@ -31104,9 +30858,6 @@ bool TryDecodeFCVTAS_32D_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTAS  <Xd>, <Dn>
+-bool TryDecodeFCVTAS_64D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDURSH LDURSH_64_ldst_unscaled:
+ //   0 x Rt       0
+@@ -31826,9 +31577,6 @@ bool TryDecodeFCVTPU_64H_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTPU  <Wd>, <Sn>
+-bool TryDecodeFCVTPU_32S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTPU FCVTPU_64S_float2int:
+ //   0 x Rd       0
+@@ -31864,9 +31612,6 @@ bool TryDecodeFCVTPU_32S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTPU  <Xd>, <Sn>
+-bool TryDecodeFCVTPU_64S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTPU FCVTPU_32D_float2int:
+ //   0 x Rd       0
+@@ -31902,9 +31647,6 @@ bool TryDecodeFCVTPU_64S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTPU  <Wd>, <Dn>
+-bool TryDecodeFCVTPU_32D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTPU FCVTPU_64D_float2int:
+ //   0 x Rd       0
+@@ -31940,9 +31682,6 @@ bool TryDecodeFCVTPU_32D_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTPU  <Xd>, <Dn>
+-bool TryDecodeFCVTPU_64D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STSETH STSETH_32S_memop:
+ //   0 1 Rt       0
+@@ -32054,9 +31793,6 @@ bool TryDecodeSTSETLH_32S_MEMOP(const InstData &, Instruction &) {
+ //  30 1
+ //  31 1
+ // DSB  <option>|#<imm>
+-bool TryDecodeDSB_BO_SYSTEM(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTMS FCVTMS_32H_float2int:
+ //   0 x Rd       0
+@@ -32168,9 +31904,6 @@ bool TryDecodeFCVTMS_64H_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTMS  <Wd>, <Sn>
+-bool TryDecodeFCVTMS_32S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTMS FCVTMS_64S_float2int:
+ //   0 x Rd       0
+@@ -32206,9 +31939,6 @@ bool TryDecodeFCVTMS_32S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTMS  <Xd>, <Sn>
+-bool TryDecodeFCVTMS_64S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTMS FCVTMS_32D_float2int:
+ //   0 x Rd       0
+@@ -32244,9 +31974,6 @@ bool TryDecodeFCVTMS_64S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTMS  <Wd>, <Dn>
+-bool TryDecodeFCVTMS_32D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTMS FCVTMS_64D_float2int:
+ //   0 x Rd       0
+@@ -32282,9 +32009,6 @@ bool TryDecodeFCVTMS_32D_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTMS  <Xd>, <Dn>
+-bool TryDecodeFCVTMS_64D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STSMINH STSMINH_32S_memop:
+ //   0 1 Rt       0
+@@ -33270,9 +32994,6 @@ bool TryDecodeFRINTI_ASIMDMISC_R(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 0 size     1
+ // LDXRB  <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeLDXRB_LR32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STP STP_S_ldstpair_post:
+ //   0 x Rt       0
+@@ -33308,9 +33029,6 @@ bool TryDecodeLDXRB_LR32_LDSTEXCL(const InstData &, Instruction &) {
+ //  30 0 opc      0
+ //  31 0 opc      1
+ // STP  <St1>, <St2>, [<Xn|SP>], #<imm>
+-bool TryDecodeSTP_S_LDSTPAIR_POST(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STP STP_D_ldstpair_post:
+ //   0 x Rt       0
+@@ -33346,9 +33064,6 @@ bool TryDecodeSTP_S_LDSTPAIR_POST(const InstData &, Instruction &) {
+ //  30 1 opc      0
+ //  31 0 opc      1
+ // STP  <Dt1>, <Dt2>, [<Xn|SP>], #<imm>
+-bool TryDecodeSTP_D_LDSTPAIR_POST(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STP STP_Q_ldstpair_post:
+ //   0 x Rt       0
+@@ -33384,9 +33099,6 @@ bool TryDecodeSTP_D_LDSTPAIR_POST(const InstData &, Instruction &) {
+ //  30 0 opc      0
+ //  31 1 opc      1
+ // STP  <Qt1>, <Qt2>, [<Xn|SP>], #<imm>
+-bool TryDecodeSTP_Q_LDSTPAIR_POST(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STP STP_S_ldstpair_pre:
+ //   0 x Rt       0
+@@ -33422,9 +33134,6 @@ bool TryDecodeSTP_Q_LDSTPAIR_POST(const InstData &, Instruction &) {
+ //  30 0 opc      0
+ //  31 0 opc      1
+ // STP  <St1>, <St2>, [<Xn|SP>, #<imm>]!
+-bool TryDecodeSTP_S_LDSTPAIR_PRE(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STP STP_D_ldstpair_pre:
+ //   0 x Rt       0
+@@ -33460,9 +33169,6 @@ bool TryDecodeSTP_S_LDSTPAIR_PRE(const InstData &, Instruction &) {
+ //  30 1 opc      0
+ //  31 0 opc      1
+ // STP  <Dt1>, <Dt2>, [<Xn|SP>, #<imm>]!
+-bool TryDecodeSTP_D_LDSTPAIR_PRE(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STP STP_Q_ldstpair_pre:
+ //   0 x Rt       0
+@@ -33498,9 +33204,6 @@ bool TryDecodeSTP_D_LDSTPAIR_PRE(const InstData &, Instruction &) {
+ //  30 0 opc      0
+ //  31 1 opc      1
+ // STP  <Qt1>, <Qt2>, [<Xn|SP>, #<imm>]!
+-bool TryDecodeSTP_Q_LDSTPAIR_PRE(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDSMINAB LDSMINAB_32_memop:
+ //   0 x Rt       0
+@@ -34372,9 +34075,6 @@ bool TryDecodeURSHR_ASIMDSHF_R(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 1 size     1
+ // PRFM  (<prfop>|#<imm5>), [<Xn|SP>{, #<pimm>}]
+-bool TryDecodePRFM_P_LDST_POS(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SYSL SYSL_RC_system:
+ //   0 x Rt       0
+@@ -35702,9 +35402,6 @@ bool TryDecodeFCVTMU_64H_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTMU  <Wd>, <Sn>
+-bool TryDecodeFCVTMU_32S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTMU FCVTMU_64S_float2int:
+ //   0 x Rd       0
+@@ -35740,9 +35437,6 @@ bool TryDecodeFCVTMU_32S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTMU  <Xd>, <Sn>
+-bool TryDecodeFCVTMU_64S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTMU FCVTMU_32D_float2int:
+ //   0 x Rd       0
+@@ -35778,9 +35472,6 @@ bool TryDecodeFCVTMU_64S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTMU  <Wd>, <Dn>
+-bool TryDecodeFCVTMU_32D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTMU FCVTMU_64D_float2int:
+ //   0 x Rd       0
+@@ -35816,9 +35507,6 @@ bool TryDecodeFCVTMU_32D_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTMU  <Xd>, <Dn>
+-bool TryDecodeFCVTMU_64D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTZU FCVTZU_64H_float2int:
+ //   0 x Rd       0
+@@ -37553,9 +37241,6 @@ bool TryDecodeFRINTA_H_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTA  <Sd>, <Sn>
+-bool TryDecodeFRINTA_S_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FRINTA FRINTA_D_floatdp1:
+ //   0 x Rd       0
+@@ -37591,9 +37276,6 @@ bool TryDecodeFRINTA_S_FLOATDP1(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FRINTA  <Dd>, <Dn>
+-bool TryDecodeFRINTA_D_FLOATDP1(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCSEL FCSEL_H_floatsel:
+ //   0 x Rd       0
+@@ -37667,9 +37349,6 @@ bool TryDecodeFCSEL_H_FLOATSEL(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FCSEL  <Sd>, <Sn>, <Sm>, <cond>
+-bool TryDecodeFCSEL_S_FLOATSEL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCSEL FCSEL_D_floatsel:
+ //   0 x Rd       0
+@@ -37705,9 +37384,6 @@ bool TryDecodeFCSEL_S_FLOATSEL(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FCSEL  <Dd>, <Dn>, <Dm>, <cond>
+-bool TryDecodeFCSEL_D_FLOATSEL(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SUBHN SUBHN_asimddiff_N:
+ //   0 x Rd       0
+@@ -39487,9 +39163,6 @@ bool TryDecodeFCVTNS_64H_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTNS  <Wd>, <Sn>
+-bool TryDecodeFCVTNS_32S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTNS FCVTNS_64S_float2int:
+ //   0 x Rd       0
+@@ -39525,9 +39198,6 @@ bool TryDecodeFCVTNS_32S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTNS  <Xd>, <Sn>
+-bool TryDecodeFCVTNS_64S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTNS FCVTNS_32D_float2int:
+ //   0 x Rd       0
+@@ -39563,9 +39233,6 @@ bool TryDecodeFCVTNS_64S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTNS  <Wd>, <Dn>
+-bool TryDecodeFCVTNS_32D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTNS FCVTNS_64D_float2int:
+ //   0 x Rd       0
+@@ -39601,9 +39268,6 @@ bool TryDecodeFCVTNS_32D_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTNS  <Xd>, <Dn>
+-bool TryDecodeFCVTNS_64D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // SQSHRN SQSHRN_asisdshf_N:
+ //   0 x Rd       0
+@@ -40741,9 +40405,6 @@ bool TryDecodeSQDMLSL_ASIMDDIFF_L(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 1 size     1
+ // PRFUM (<prfop>|#<imm5>), [<Xn|SP>{, #<simm>}]
+-bool TryDecodePRFUM_P_LDST_UNSCALED(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDSMAXAB LDSMAXAB_32_memop:
+ //   0 x Rt       0
+@@ -41159,9 +40820,6 @@ bool TryDecodeFCVTNU_64H_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTNU  <Wd>, <Sn>
+-bool TryDecodeFCVTNU_32S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTNU FCVTNU_64S_float2int:
+ //   0 x Rd       0
+@@ -41197,9 +40855,6 @@ bool TryDecodeFCVTNU_32S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTNU  <Xd>, <Sn>
+-bool TryDecodeFCVTNU_64S_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTNU FCVTNU_32D_float2int:
+ //   0 x Rd       0
+@@ -41235,9 +40890,6 @@ bool TryDecodeFCVTNU_64S_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 sf       0
+ // FCVTNU  <Wd>, <Dn>
+-bool TryDecodeFCVTNU_32D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCVTNU FCVTNU_64D_float2int:
+ //   0 x Rd       0
+@@ -41273,9 +40925,6 @@ bool TryDecodeFCVTNU_32D_FLOAT2INT(const InstData &, Instruction &) {
+ //  30 0
+ //  31 1 sf       0
+ // FCVTNU  <Xd>, <Dn>
+-bool TryDecodeFCVTNU_64D_FLOAT2INT(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // MUL MUL_asimdsame_only:
+ //   0 x Rd       0
+@@ -41653,9 +41302,6 @@ bool TryDecodeFNMADD_H_FLOATDP3(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FNMADD  <Sd>, <Sn>, <Sm>, <Sa>
+-bool TryDecodeFNMADD_S_FLOATDP3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FNMADD FNMADD_D_floatdp3:
+ //   0 x Rd       0
+@@ -41691,9 +41337,6 @@ bool TryDecodeFNMADD_S_FLOATDP3(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FNMADD  <Dd>, <Dn>, <Dm>, <Da>
+-bool TryDecodeFNMADD_D_FLOATDP3(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCCMP FCCMP_H_floatccmp:
+ //   0 x nzcv     0
+@@ -41767,9 +41410,6 @@ bool TryDecodeFCCMP_H_FLOATCCMP(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FCCMP  <Sn>, <Sm>, #<nzcv>, <cond>
+-bool TryDecodeFCCMP_S_FLOATCCMP(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // FCCMP FCCMP_D_floatccmp:
+ //   0 x nzcv     0
+@@ -41805,9 +41445,6 @@ bool TryDecodeFCCMP_S_FLOATCCMP(const InstData &, Instruction &) {
+ //  30 0
+ //  31 0 M        0
+ // FCCMP  <Dn>, <Dm>, #<nzcv>, <cond>
+-bool TryDecodeFCCMP_D_FLOATCCMP(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LD3 LD3_asisdlso_B3_3b:
+ //   0 x Rt       0
+@@ -42375,9 +42012,6 @@ bool TryDecodeFRINTN_ASIMDMISC_R(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 0 size     1
+ // STR  <Bt>, [<Xn|SP>, (<Wm>|<Xm>), <extend> {<amount>}]
+-bool TryDecodeSTR_B_LDST_REGOFF(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_BL_ldst_regoff:
+ //   0 x Rt       0
+@@ -42413,9 +42047,6 @@ bool TryDecodeSTR_B_LDST_REGOFF(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 0 size     1
+ // STR  <Bt>, [<Xn|SP>, <Xm>{, LSL <amount>}]
+-bool TryDecodeSTR_BL_LDST_REGOFF(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_H_ldst_regoff:
+ //   0 x Rt       0
+@@ -42451,9 +42082,6 @@ bool TryDecodeSTR_BL_LDST_REGOFF(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 0 size     1
+ // STR  <Ht>, [<Xn|SP>, (<Wm>|<Xm>){, <extend> {<amount>}}]
+-bool TryDecodeSTR_H_LDST_REGOFF(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_S_ldst_regoff:
+ //   0 x Rt       0
+@@ -42489,9 +42117,6 @@ bool TryDecodeSTR_H_LDST_REGOFF(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 1 size     1
+ // STR  <St>, [<Xn|SP>, (<Wm>|<Xm>){, <extend> {<amount>}}]
+-bool TryDecodeSTR_S_LDST_REGOFF(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // STR STR_D_ldst_regoff:
+ //   0 x Rt       0
+@@ -42527,9 +42152,6 @@ bool TryDecodeSTR_S_LDST_REGOFF(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 1 size     1
+ // STR  <Dt>, [<Xn|SP>, (<Wm>|<Xm>){, <extend> {<amount>}}]
+-bool TryDecodeSTR_D_LDST_REGOFF(const InstData &, Instruction &) {
+-  return false;
+-}
+ 
+ // LDCLRAB LDCLRAB_32_memop:
+ //   0 x Rt       0
+diff --git a/lib/Arch/AArch64/Semantics/BINARY.cpp b/lib/Arch/AArch64/Semantics/BINARY.cpp
+index f7d3b11..bc370de 100644
+--- a/lib/Arch/AArch64/Semantics/BINARY.cpp
++++ b/lib/Arch/AArch64/Semantics/BINARY.cpp
+@@ -301,6 +301,7 @@ DEF_SEM(FMADD_S, V128W dst, V32 src1, V32 src2, V32 src3) {
+   auto new_except = __remill_fpu_exception_test(kFPUExceptionAll);
+   BarrierReorder();
+   SetFPSRStatusFlags(state, new_except);
++  res = ArmNaN(res, factor1, factor2, add);
+ 
+   // Sets underflow for 0x3fffffff, 0x1 but native doesn't.
+   if (state.sr.ufc && !old_underflow) {
+@@ -326,6 +327,7 @@ DEF_SEM(FMADD_D, V128W dst, V64 src1, V64 src2, V64 src3) {
+   BarrierReorder();
+   auto except_new = __remill_fpu_exception_test(kFPUExceptionAll);
+   SetFPSRStatusFlags(state, except_new);
++  res = ArmNaN(res, factor1, factor2, add);
+ 
+   // Sets underflow for test case (0x3fffffffffffffff, 0x1) but native doesn't.
+   if (state.sr.ufc && !old_underflow) {
+@@ -507,3 +509,153 @@ DEF_ISEL(FCMPE_D_FLOATCMP) = FCMPE_D;
+ DEF_ISEL(FCMPE_DZ_FLOATCMP) = FCMPE_DZ;
+ DEF_ISEL(FCMP_D_FLOATCMP) = FCMP_D;
+ DEF_ISEL(FCMP_DZ_FLOATCMP) = FCMP_DZ;
++
++namespace {
++
++// Fused multiply-add family. ARM: FMSUB = a - n*m, FNMADD = -a - n*m, FNMSUB = -a + n*m, each with a single rounding
++#define NX_FMA(NAME, BITS, T, NEG_N, NEG_A) \
++  DEF_SEM(NAME##_##BITS, V128W dst, V##BITS src1, V##BITS src2, V##BITS src3) { \
++    T n = FExtractV##BITS(FReadV##BITS(src1), 0); \
++    T m = FExtractV##BITS(FReadV##BITS(src2), 0); \
++    T a = FExtractV##BITS(FReadV##BITS(src3), 0); \
++    T nn = NEG_N ? -n : n; \
++    T aa = NEG_A ? -a : a; \
++    __remill_fpu_exception_clear(kFPUExceptionAll); \
++    BarrierReorder(); \
++    T res = std::fma(nn, m, aa); \
++    BarrierReorder(); \
++    SetFPSRStatusFlags(state, __remill_fpu_exception_test(kFPUExceptionAll)); \
++    res = ArmNaN(res, n, m, a); \
++    FWriteV##BITS(dst, res); \
++    return memory; \
++  }
++NX_FMA(FMSUB, 32, float32_t, true, false)
++NX_FMA(FMSUB, 64, float64_t, true, false)
++NX_FMA(FNMADD, 32, float32_t, true, true)
++NX_FMA(FNMADD, 64, float64_t, true, true)
++NX_FMA(FNMSUB, 32, float32_t, false, true)
++NX_FMA(FNMSUB, 64, float64_t, false, true)
++
++DEF_SEM(FNMUL_32, V128W dst, V32 src1, V32 src2) {
++  auto prod = CheckedFloatBinOp(state, FMul32, FExtractV32(FReadV32(src1), 0), FExtractV32(FReadV32(src2), 0));
++  FWriteV32(dst, -prod);
++  return memory;
++}
++DEF_SEM(FNMUL_64, V128W dst, V64 src1, V64 src2) {
++  auto prod = CheckedFloatBinOp(state, FMul64, FExtractV64(FReadV64(src1), 0), FExtractV64(FReadV64(src2), 0));
++  FWriteV64(dst, -prod);
++  return memory;
++}
++
++// FMAX/FMIN: a NaN operand gives that NaN (quietened by an addition); equal operands of opposite sign (+0, -0) pick the positive for max and the negative for min.
++// FMAXNM/FMINNM: a quiet NaN against a number gives the number.
++template <typename T> ALWAYS_INLINE static T NxMax(T a, T b) {
++  if (std::isnan(a)) return a + a;
++  if (std::isnan(b)) return b + b;
++  if (a == b) return std::signbit(a) ? b : a;
++  return a > b ? a : b;
++}
++template <typename T> ALWAYS_INLINE static T NxMin(T a, T b) {
++  if (std::isnan(a)) return a + a;
++  if (std::isnan(b)) return b + b;
++  if (a == b) return std::signbit(a) ? a : b;
++  return a < b ? a : b;
++}
++template <typename T> ALWAYS_INLINE static T NxMaxNum(T a, T b) {
++  if (std::isnan(a) && !std::isnan(b)) return b;
++  if (std::isnan(b) && !std::isnan(a)) return a;
++  return NxMax(a, b);
++}
++template <typename T> ALWAYS_INLINE static T NxMinNum(T a, T b) {
++  if (std::isnan(a) && !std::isnan(b)) return b;
++  if (std::isnan(b) && !std::isnan(a)) return a;
++  return NxMin(a, b);
++}
++#define NX_MINMAX(NAME, FN, BITS) \
++  DEF_SEM(NAME##_##BITS, V128W dst, V##BITS src1, V##BITS src2) { \
++    __remill_fpu_exception_clear(kFPUExceptionAll); \
++    BarrierReorder(); \
++    auto res = FN(FExtractV##BITS(FReadV##BITS(src1), 0), FExtractV##BITS(FReadV##BITS(src2), 0)); \
++    BarrierReorder(); \
++    SetFPSRStatusFlags(state, __remill_fpu_exception_test(kFPUExceptionAll)); \
++    FWriteV##BITS(dst, res); \
++    return memory; \
++  }
++NX_MINMAX(FMAX, NxMax, 32) NX_MINMAX(FMAX, NxMax, 64)
++NX_MINMAX(FMIN, NxMin, 32) NX_MINMAX(FMIN, NxMin, 64)
++NX_MINMAX(FMAXNM, NxMaxNum, 32) NX_MINMAX(FMAXNM, NxMaxNum, 64)
++NX_MINMAX(FMINNM, NxMinNum, 32) NX_MINMAX(FMINNM, NxMinNum, 64)
++
++#define NX_SQRT(BITS, T) \
++  DEF_SEM(FSQRT_##BITS, V128W dst, V##BITS src) { \
++    T v = FExtractV##BITS(FReadV##BITS(src), 0); \
++    T res = CheckedFloatUnaryOp(state, [](T x) { return sizeof(T) == 4 ? static_cast<T>(__builtin_sqrtf(static_cast<float>(x))) : static_cast<T>(__builtin_sqrt(static_cast<double>(x))); }, v); \
++    FWriteV##BITS(dst, ArmNaN(res, v)); \
++    return memory; \
++  }
++NX_SQRT(32, float32_t) NX_SQRT(64, float64_t)
++
++// Round to an integral value in floating point. The mode is the instruction's (N nearest even, A nearest away, M down, P up, Z toward zero); X and I use the current mode (nearest even here),
++// and X raises Inexact when the value changed. -0 stays -0 (the C functions keep the sign).
++enum : int { kNxRN, kNxRA, kNxRM, kNxRP, kNxRZ };
++ALWAYS_INLINE static double NxRound(double x, int mode) {
++  switch (mode) {
++    case kNxRN: return __builtin_nearbyint(x);
++    case kNxRA: return __builtin_round(x);
++    case kNxRM: return __builtin_floor(x);
++    case kNxRP: return __builtin_ceil(x);
++    default: return __builtin_trunc(x);
++  }
++}
++template <int MODE, bool kInexact>
++DEF_SEM(FRINT_32, V128W dst, V32 src) {
++  float32_t v = FExtractV32(FReadV32(src), 0);
++  float32_t res = static_cast<float32_t>(NxRound(static_cast<double>(v), MODE));
++  if (kInexact && res != v) state.sr.ixc = 1;
++  FWriteV32(dst, res);
++  return memory;
++}
++template <int MODE, bool kInexact>
++DEF_SEM(FRINT_64, V128W dst, V64 src) {
++  float64_t v = FExtractV64(FReadV64(src), 0);
++  float64_t res = NxRound(v, MODE);
++  if (kInexact && res != v) state.sr.ixc = 1;
++  FWriteV64(dst, res);
++  return memory;
++}
++
++}  // namespace
++
++DEF_ISEL(FMSUB_S_FLOATDP3) = FMSUB_32;
++DEF_ISEL(FMSUB_D_FLOATDP3) = FMSUB_64;
++DEF_ISEL(FNMADD_S_FLOATDP3) = FNMADD_32;
++DEF_ISEL(FNMADD_D_FLOATDP3) = FNMADD_64;
++DEF_ISEL(FNMSUB_S_FLOATDP3) = FNMSUB_32;
++DEF_ISEL(FNMSUB_D_FLOATDP3) = FNMSUB_64;
++DEF_ISEL(FNMUL_S_FLOATDP2) = FNMUL_32;
++DEF_ISEL(FNMUL_D_FLOATDP2) = FNMUL_64;
++DEF_ISEL(FMAX_S_FLOATDP2) = FMAX_32;
++DEF_ISEL(FMAX_D_FLOATDP2) = FMAX_64;
++DEF_ISEL(FMIN_S_FLOATDP2) = FMIN_32;
++DEF_ISEL(FMIN_D_FLOATDP2) = FMIN_64;
++DEF_ISEL(FMAXNM_S_FLOATDP2) = FMAXNM_32;
++DEF_ISEL(FMAXNM_D_FLOATDP2) = FMAXNM_64;
++DEF_ISEL(FMINNM_S_FLOATDP2) = FMINNM_32;
++DEF_ISEL(FMINNM_D_FLOATDP2) = FMINNM_64;
++DEF_ISEL(FSQRT_S_FLOATDP1) = FSQRT_32;
++DEF_ISEL(FSQRT_D_FLOATDP1) = FSQRT_64;
++DEF_ISEL(FRINTN_S_FLOATDP1) = FRINT_32<kNxRN, false>;
++DEF_ISEL(FRINTN_D_FLOATDP1) = FRINT_64<kNxRN, false>;
++DEF_ISEL(FRINTA_S_FLOATDP1) = FRINT_32<kNxRA, false>;
++DEF_ISEL(FRINTA_D_FLOATDP1) = FRINT_64<kNxRA, false>;
++DEF_ISEL(FRINTM_S_FLOATDP1) = FRINT_32<kNxRM, false>;
++DEF_ISEL(FRINTM_D_FLOATDP1) = FRINT_64<kNxRM, false>;
++DEF_ISEL(FRINTP_S_FLOATDP1) = FRINT_32<kNxRP, false>;
++DEF_ISEL(FRINTP_D_FLOATDP1) = FRINT_64<kNxRP, false>;
++DEF_ISEL(FRINTZ_S_FLOATDP1) = FRINT_32<kNxRZ, false>;
++DEF_ISEL(FRINTZ_D_FLOATDP1) = FRINT_64<kNxRZ, false>;
++DEF_ISEL(FRINTX_S_FLOATDP1) = FRINT_32<kNxRN, true>;
++DEF_ISEL(FRINTX_D_FLOATDP1) = FRINT_64<kNxRN, true>;
++DEF_ISEL(FRINTI_S_FLOATDP1) = FRINT_32<kNxRN, false>;
++DEF_ISEL(FRINTI_D_FLOATDP1) = FRINT_64<kNxRN, false>;
++
+diff --git a/lib/Arch/AArch64/Semantics/COND.cpp b/lib/Arch/AArch64/Semantics/COND.cpp
+index 995dc6f..1b7d6d3 100644
+--- a/lib/Arch/AArch64/Semantics/COND.cpp
++++ b/lib/Arch/AArch64/Semantics/COND.cpp
+@@ -129,3 +129,54 @@ DEF_COND_ISEL(CCMP_64_CONDCMP_REG, CCMP, R64, R64)
+ 
+ DEF_COND_ISEL(CCMN_32_CONDCMP_IMM, CCMN, R32, I32)
+ DEF_COND_ISEL(CCMN_64_CONDCMP_IMM, CCMN, R64, I64)
++
++namespace {
++
++template <bool (*check_cond)(const State &), int kUnused>
++DEF_SEM(FCSEL_32, V128W dst, V32 src1, V32 src2) {
++  float32_t v = check_cond(state) ? FExtractV32(FReadV32(src1), 0) : FExtractV32(FReadV32(src2), 0);
++  FWriteV32(dst, v);
++  return memory;
++}
++template <bool (*check_cond)(const State &), int kUnused>
++DEF_SEM(FCSEL_64, V128W dst, V64 src1, V64 src2) {
++  float64_t v = check_cond(state) ? FExtractV64(FReadV64(src1), 0) : FExtractV64(FReadV64(src2), 0);
++  FWriteV64(dst, v);
++  return memory;
++}
++// FCCMP: when the condition holds the flags are those of FCMP; else the immediate. FCCMPE signals Invalid for any NaN, FCCMP only for a signalling one
++template <bool (*check_cond)(const State &), bool kSignal>
++DEF_SEM(FCCMP_32, V32 src1, V32 src2, I32 nzcv) {
++  if (check_cond(state)) {
++    FCompare(state, FExtractV32(FReadV32(src1), 0), FExtractV32(FReadV32(src2), 0), kSignal);
++  } else {
++    auto nzcv_val = Read(nzcv);
++    FLAG_V = UCmpNeq(UAnd(nzcv_val, 1_u32), 0_u32);
++    FLAG_C = UCmpNeq(UAnd(nzcv_val, 2_u32), 0_u32);
++    FLAG_Z = UCmpNeq(UAnd(nzcv_val, 4_u32), 0_u32);
++    FLAG_N = UCmpNeq(UAnd(nzcv_val, 8_u32), 0_u32);
++  }
++  return memory;
++}
++template <bool (*check_cond)(const State &), bool kSignal>
++DEF_SEM(FCCMP_64, V64 src1, V64 src2, I32 nzcv) {
++  if (check_cond(state)) {
++    FCompare(state, FExtractV64(FReadV64(src1), 0), FExtractV64(FReadV64(src2), 0), kSignal);
++  } else {
++    auto nzcv_val = Read(nzcv);
++    FLAG_V = UCmpNeq(UAnd(nzcv_val, 1_u32), 0_u32);
++    FLAG_C = UCmpNeq(UAnd(nzcv_val, 2_u32), 0_u32);
++    FLAG_Z = UCmpNeq(UAnd(nzcv_val, 4_u32), 0_u32);
++    FLAG_N = UCmpNeq(UAnd(nzcv_val, 8_u32), 0_u32);
++  }
++  return memory;
++}
++
++}  // namespace
++
++DEF_COND_ISEL(FCSEL_S_FLOATSEL, FCSEL_32, 0)
++DEF_COND_ISEL(FCSEL_D_FLOATSEL, FCSEL_64, 0)
++DEF_COND_ISEL(FCCMP_S_FLOATCCMP, FCCMP_32, false)
++DEF_COND_ISEL(FCCMP_D_FLOATCCMP, FCCMP_64, false)
++DEF_COND_ISEL(FCCMPE_S_FLOATCCMP, FCCMP_32, true)
++DEF_COND_ISEL(FCCMPE_D_FLOATCCMP, FCCMP_64, true)
+diff --git a/lib/Arch/AArch64/Semantics/CONVERT.cpp b/lib/Arch/AArch64/Semantics/CONVERT.cpp
+index 6d60f6e..8987767 100644
+--- a/lib/Arch/AArch64/Semantics/CONVERT.cpp
++++ b/lib/Arch/AArch64/Semantics/CONVERT.cpp
+@@ -119,16 +119,9 @@ DEF_ISEL(UCVTF_D32_FLOAT2INT) = UCVTF_UInt32ToFloat64;
+ DEF_ISEL(UCVTF_S64_FLOAT2INT) = UCVTF_UInt64ToFloat32;
+ DEF_ISEL(UCVTF_D64_FLOAT2INT) = UCVTF_UInt64ToFloat64;
+ 
+-DEF_ISEL(FCVTZU_64S_FLOAT2INT) = FCVTZU_Float32ToUInt64;
+-DEF_ISEL(FCVTZU_32S_FLOAT2INT) = FCVTZU_Float32ToUInt32;
+ 
+-DEF_ISEL(FCVTZU_32D_FLOAT2INT) = FCVTZU_Float64ToUInt32;
+-DEF_ISEL(FCVTZU_64D_FLOAT2INT) = FCVTZU_Float64ToUInt64;
+ 
+-DEF_ISEL(FCVTZS_32S_FLOAT2INT) = FCVTZS_Float32ToSInt32;
+ 
+-DEF_ISEL(FCVTZS_32D_FLOAT2INT) = FCVTZS_Float64ToSInt32;
+-DEF_ISEL(FCVTZS_64D_FLOAT2INT) = FCVTZS_Float64ToSInt64;
+ 
+ DEF_ISEL(FCVT_DS_FLOATDP1) = FCVT_Float32ToFloat64;
+ DEF_ISEL(FCVT_SD_FLOATDP1) = FCVT_Float64ToFloat32;
+@@ -168,3 +161,143 @@ DEF_ISEL(SCVTF_S32_FLOAT2INT) = SCVTF_Int32ToFloat32;
+ DEF_ISEL(SCVTF_D32_FLOAT2INT) = SCVTF_Int32ToFloat64;
+ DEF_ISEL(SCVTF_S64_FLOAT2INT) = SCVTF_Int64ToFloat32;
+ DEF_ISEL(SCVTF_D64_FLOAT2INT) = SCVTF_Int64ToFloat64;
++
++namespace {
++
++// Float to integer with a rounding mode, saturating as ARM does (NaN -> 0, out of range -> the limit, both raising Invalid), optionally scaled by 2^fbits; Inexact when the rounding changed the value.
++// Where x86's own conversion gives 0x80000000 for everything out of range, ARM gives INT_MAX, INT_MIN, 0 or UINT_MAX.
++template <typename I>
++ALWAYS_INLINE static I NxFloatToInt(State &state, double x, int mode, uint32_t fbits) {
++  constexpr bool kSigned = std::is_signed<I>::value;
++  constexpr int kBits = sizeof(I) * 8;
++  if (std::isnan(x)) { state.sr.ioc = 1; return 0; }
++  double scaled = fbits ? __builtin_ldexp(x, static_cast<int>(fbits)) : x;
++  double r = NxRound(scaled, mode);
++  const double lo = kSigned ? -__builtin_ldexp(1.0, kBits - 1) : 0.0;
++  const double hi = kSigned ? __builtin_ldexp(1.0, kBits - 1) : __builtin_ldexp(1.0, kBits);   // one past the largest
++  const I imin = kSigned ? static_cast<I>(static_cast<uint64_t>(1) << (kBits - 1)) : static_cast<I>(0);
++  const I imax = static_cast<I>(~imin);
++  if (r < lo) { state.sr.ioc = 1; return imin; }
++  if (r >= hi) { state.sr.ioc = 1; return imax; }
++  if (r != scaled) state.sr.ixc = 1;
++  return static_cast<I>(r);
++}
++template <int MODE, typename I, typename D>
++DEF_SEM(FCVT_F32, D dst, V32 src) {
++  WriteZExt(dst, NxFloatToInt<I>(state, static_cast<double>(FExtractV32(FReadV32(src), 0)), MODE, 0));
++  return memory;
++}
++template <int MODE, typename I, typename D>
++DEF_SEM(FCVT_F64, D dst, V64 src) {
++  WriteZExt(dst, NxFloatToInt<I>(state, FExtractV64(FReadV64(src), 0), MODE, 0));
++  return memory;
++}
++template <typename I, typename D>
++DEF_SEM(FCVTZ_FIX_F32, D dst, V32 src, I32 fbits) {
++  WriteZExt(dst, NxFloatToInt<I>(state, static_cast<double>(FExtractV32(FReadV32(src), 0)), kNxRZ, Read(fbits)));
++  return memory;
++}
++template <typename I, typename D>
++DEF_SEM(FCVTZ_FIX_F64, D dst, V64 src, I32 fbits) {
++  WriteZExt(dst, NxFloatToInt<I>(state, FExtractV64(FReadV64(src), 0), kNxRZ, Read(fbits)));
++  return memory;
++}
++
++// Integer to float, optionally divided by 2^fbits (a power of two: exact after the single rounding of the conversion)
++template <typename I, typename Src>
++DEF_SEM(CVTF_F32, V128W dst, Src src, I32 fbits) {
++  float32_t r = CheckedFloatUnaryOp(state, [](I v) { return static_cast<float32_t>(v); }, static_cast<I>(Read(src)));
++  if (Read(fbits)) r = (sizeof(r) == 4) ? static_cast<decltype(r)>(__builtin_ldexpf(static_cast<float>(r), -static_cast<int>(Read(fbits)))) : static_cast<decltype(r)>(__builtin_ldexp(static_cast<double>(r), -static_cast<int>(Read(fbits))));
++  FWriteV32(dst, r);
++  return memory;
++}
++template <typename I, typename Src>
++DEF_SEM(CVTF_F64, V128W dst, Src src, I32 fbits) {
++  float64_t r = CheckedFloatUnaryOp(state, [](I v) { return static_cast<float64_t>(v); }, static_cast<I>(Read(src)));
++  if (Read(fbits)) r = (sizeof(r) == 4) ? static_cast<decltype(r)>(__builtin_ldexpf(static_cast<float>(r), -static_cast<int>(Read(fbits)))) : static_cast<decltype(r)>(__builtin_ldexp(static_cast<double>(r), -static_cast<int>(Read(fbits))));
++  FWriteV64(dst, r);
++  return memory;
++}
++// ... from a SIMD&FP register read as an integer
++template <typename I>
++DEF_SEM(CVTF_SIMD_F32, V128W dst, V32 src, I32 fbits) {
++  float32_t r = CheckedFloatUnaryOp(state, [](I v) { return static_cast<float32_t>(v); }, static_cast<I>(UExtractV32(UReadV32(src), 0)));
++  if (Read(fbits)) r = (sizeof(r) == 4) ? static_cast<decltype(r)>(__builtin_ldexpf(static_cast<float>(r), -static_cast<int>(Read(fbits)))) : static_cast<decltype(r)>(__builtin_ldexp(static_cast<double>(r), -static_cast<int>(Read(fbits))));
++  FWriteV32(dst, r);
++  return memory;
++}
++template <typename I>
++DEF_SEM(CVTF_SIMD_F64, V128W dst, V64 src, I32 fbits) {
++  float64_t r = CheckedFloatUnaryOp(state, [](I v) { return static_cast<float64_t>(v); }, static_cast<I>(UExtractV64(UReadV64(src), 0)));
++  if (Read(fbits)) r = (sizeof(r) == 4) ? static_cast<decltype(r)>(__builtin_ldexpf(static_cast<float>(r), -static_cast<int>(Read(fbits)))) : static_cast<decltype(r)>(__builtin_ldexp(static_cast<double>(r), -static_cast<int>(Read(fbits))));
++  FWriteV64(dst, r);
++  return memory;
++}
++
++}  // namespace
++
++DEF_ISEL(FCVTNS_32S_FLOAT2INT) = FCVT_F32<kNxRN, int32_t, R32W>;
++DEF_ISEL(FCVTNS_64S_FLOAT2INT) = FCVT_F32<kNxRN, int64_t, R64W>;
++DEF_ISEL(FCVTNS_32D_FLOAT2INT) = FCVT_F64<kNxRN, int32_t, R32W>;
++DEF_ISEL(FCVTNS_64D_FLOAT2INT) = FCVT_F64<kNxRN, int64_t, R64W>;
++DEF_ISEL(FCVTNU_32S_FLOAT2INT) = FCVT_F32<kNxRN, uint32_t, R32W>;
++DEF_ISEL(FCVTNU_64S_FLOAT2INT) = FCVT_F32<kNxRN, uint64_t, R64W>;
++DEF_ISEL(FCVTNU_32D_FLOAT2INT) = FCVT_F64<kNxRN, uint32_t, R32W>;
++DEF_ISEL(FCVTNU_64D_FLOAT2INT) = FCVT_F64<kNxRN, uint64_t, R64W>;
++DEF_ISEL(FCVTAS_32S_FLOAT2INT) = FCVT_F32<kNxRA, int32_t, R32W>;
++DEF_ISEL(FCVTAS_64S_FLOAT2INT) = FCVT_F32<kNxRA, int64_t, R64W>;
++DEF_ISEL(FCVTAS_32D_FLOAT2INT) = FCVT_F64<kNxRA, int32_t, R32W>;
++DEF_ISEL(FCVTAS_64D_FLOAT2INT) = FCVT_F64<kNxRA, int64_t, R64W>;
++DEF_ISEL(FCVTAU_32S_FLOAT2INT) = FCVT_F32<kNxRA, uint32_t, R32W>;
++DEF_ISEL(FCVTAU_64S_FLOAT2INT) = FCVT_F32<kNxRA, uint64_t, R64W>;
++DEF_ISEL(FCVTAU_32D_FLOAT2INT) = FCVT_F64<kNxRA, uint32_t, R32W>;
++DEF_ISEL(FCVTAU_64D_FLOAT2INT) = FCVT_F64<kNxRA, uint64_t, R64W>;
++DEF_ISEL(FCVTMS_32S_FLOAT2INT) = FCVT_F32<kNxRM, int32_t, R32W>;
++DEF_ISEL(FCVTMS_64S_FLOAT2INT) = FCVT_F32<kNxRM, int64_t, R64W>;
++DEF_ISEL(FCVTMS_32D_FLOAT2INT) = FCVT_F64<kNxRM, int32_t, R32W>;
++DEF_ISEL(FCVTMS_64D_FLOAT2INT) = FCVT_F64<kNxRM, int64_t, R64W>;
++DEF_ISEL(FCVTMU_32S_FLOAT2INT) = FCVT_F32<kNxRM, uint32_t, R32W>;
++DEF_ISEL(FCVTMU_64S_FLOAT2INT) = FCVT_F32<kNxRM, uint64_t, R64W>;
++DEF_ISEL(FCVTMU_32D_FLOAT2INT) = FCVT_F64<kNxRM, uint32_t, R32W>;
++DEF_ISEL(FCVTMU_64D_FLOAT2INT) = FCVT_F64<kNxRM, uint64_t, R64W>;
++DEF_ISEL(FCVTPS_32S_FLOAT2INT) = FCVT_F32<kNxRP, int32_t, R32W>;
++DEF_ISEL(FCVTPS_64S_FLOAT2INT) = FCVT_F32<kNxRP, int64_t, R64W>;
++DEF_ISEL(FCVTPS_32D_FLOAT2INT) = FCVT_F64<kNxRP, int32_t, R32W>;
++DEF_ISEL(FCVTPS_64D_FLOAT2INT) = FCVT_F64<kNxRP, int64_t, R64W>;
++DEF_ISEL(FCVTPU_32S_FLOAT2INT) = FCVT_F32<kNxRP, uint32_t, R32W>;
++DEF_ISEL(FCVTPU_64S_FLOAT2INT) = FCVT_F32<kNxRP, uint64_t, R64W>;
++DEF_ISEL(FCVTPU_32D_FLOAT2INT) = FCVT_F64<kNxRP, uint32_t, R32W>;
++DEF_ISEL(FCVTPU_64D_FLOAT2INT) = FCVT_F64<kNxRP, uint64_t, R64W>;
++DEF_ISEL(FCVTZS_32S_FLOAT2INT) = FCVT_F32<kNxRZ, int32_t, R32W>;
++DEF_ISEL(FCVTZS_64S_FLOAT2INT) = FCVT_F32<kNxRZ, int64_t, R64W>;
++DEF_ISEL(FCVTZS_32D_FLOAT2INT) = FCVT_F64<kNxRZ, int32_t, R32W>;
++DEF_ISEL(FCVTZS_64D_FLOAT2INT) = FCVT_F64<kNxRZ, int64_t, R64W>;
++DEF_ISEL(FCVTZU_32S_FLOAT2INT) = FCVT_F32<kNxRZ, uint32_t, R32W>;
++DEF_ISEL(FCVTZU_64S_FLOAT2INT) = FCVT_F32<kNxRZ, uint64_t, R64W>;
++DEF_ISEL(FCVTZU_32D_FLOAT2INT) = FCVT_F64<kNxRZ, uint32_t, R32W>;
++DEF_ISEL(FCVTZU_64D_FLOAT2INT) = FCVT_F64<kNxRZ, uint64_t, R64W>;
++DEF_ISEL(FCVTZS_32S_FLOAT2FIX) = FCVTZ_FIX_F32<int32_t, R32W>;
++DEF_ISEL(FCVTZS_64S_FLOAT2FIX) = FCVTZ_FIX_F32<int64_t, R64W>;
++DEF_ISEL(FCVTZS_32D_FLOAT2FIX) = FCVTZ_FIX_F64<int32_t, R32W>;
++DEF_ISEL(FCVTZS_64D_FLOAT2FIX) = FCVTZ_FIX_F64<int64_t, R64W>;
++DEF_ISEL(FCVTZU_32S_FLOAT2FIX) = FCVTZ_FIX_F32<uint32_t, R32W>;
++DEF_ISEL(FCVTZU_64S_FLOAT2FIX) = FCVTZ_FIX_F32<uint64_t, R64W>;
++DEF_ISEL(FCVTZU_32D_FLOAT2FIX) = FCVTZ_FIX_F64<uint32_t, R32W>;
++DEF_ISEL(FCVTZU_64D_FLOAT2FIX) = FCVTZ_FIX_F64<uint64_t, R64W>;
++DEF_ISEL(SCVTF_S32_FLOAT2FIX) = CVTF_F32<int32_t, R32>;
++DEF_ISEL(SCVTF_S64_FLOAT2FIX) = CVTF_F32<int64_t, R64>;
++DEF_ISEL(SCVTF_D32_FLOAT2FIX) = CVTF_F64<int32_t, R32>;
++DEF_ISEL(SCVTF_D64_FLOAT2FIX) = CVTF_F64<int64_t, R64>;
++DEF_ISEL(SCVTF_ASISDMISC_R_S) = CVTF_SIMD_F32<int32_t>;
++DEF_ISEL(SCVTF_ASISDMISC_R_D) = CVTF_SIMD_F64<int64_t>;
++DEF_ISEL(SCVTF_ASISDSHF_C_S) = CVTF_SIMD_F32<int32_t>;
++DEF_ISEL(SCVTF_ASISDSHF_C_D) = CVTF_SIMD_F64<int64_t>;
++DEF_ISEL(UCVTF_S32_FLOAT2FIX) = CVTF_F32<uint32_t, R32>;
++DEF_ISEL(UCVTF_S64_FLOAT2FIX) = CVTF_F32<uint64_t, R64>;
++DEF_ISEL(UCVTF_D32_FLOAT2FIX) = CVTF_F64<uint32_t, R32>;
++DEF_ISEL(UCVTF_D64_FLOAT2FIX) = CVTF_F64<uint64_t, R64>;
++DEF_ISEL(UCVTF_ASISDMISC_R_S) = CVTF_SIMD_F32<uint32_t>;
++DEF_ISEL(UCVTF_ASISDMISC_R_D) = CVTF_SIMD_F64<uint64_t>;
++DEF_ISEL(UCVTF_ASISDSHF_C_S) = CVTF_SIMD_F32<uint32_t>;
++DEF_ISEL(UCVTF_ASISDSHF_C_D) = CVTF_SIMD_F64<uint64_t>;
++
+diff --git a/lib/Arch/AArch64/Semantics/DATAXFER.cpp b/lib/Arch/AArch64/Semantics/DATAXFER.cpp
+index 5d992de..6cdf5da 100644
+--- a/lib/Arch/AArch64/Semantics/DATAXFER.cpp
++++ b/lib/Arch/AArch64/Semantics/DATAXFER.cpp
+@@ -1400,3 +1400,136 @@ DEF_ISEL(MVNI_ASIMDIMM_L_SL_2S) = MOVI_L_SL<uint32v2_t>;
+ DEF_ISEL(MVNI_ASIMDIMM_L_SL_4S) = MOVI_L_SL<uint32v4_t>;
+ DEF_ISEL(MVNI_ASIMDIMM_M_SM_2S) = MOVI_L_SL<uint32v2_t>;
+ DEF_ISEL(MVNI_ASIMDIMM_M_SM_4S) = MOVI_L_SL<uint32v4_t>;
++
++namespace {
++
++DEF_SEM(STP_S_Update, V32 src1, V32 src2, MV64W dst, R64W dst_reg, ADDR next_addr) {
++  auto src1_vec = FReadV32(src1);
++  auto src2_vec = FReadV32(src2);
++  float32v2_t tmp_vec = {};
++  tmp_vec = FInsertV32(tmp_vec, 0, FExtractV32(src1_vec, 0));
++  tmp_vec = FInsertV32(tmp_vec, 1, FExtractV32(src2_vec, 0));
++  FWriteV32(dst, tmp_vec);
++  Write(dst_reg, Read(next_addr));
++  return memory;
++}
++DEF_SEM(STP_D_Update, V64 src1, V64 src2, MV128W dst, R64W dst_reg, ADDR next_addr) {
++  auto src1_vec = FReadV64(src1);
++  auto src2_vec = FReadV64(src2);
++  float64v2_t tmp_vec = {};
++  tmp_vec = FInsertV64(tmp_vec, 0, FExtractV64(src1_vec, 0));
++  tmp_vec = FInsertV64(tmp_vec, 1, FExtractV64(src2_vec, 0));
++  FWriteV64(dst, tmp_vec);
++  Write(dst_reg, Read(next_addr));
++  return memory;
++}
++// A pair of Q registers is two 128-bit stores (see the decoder)
++DEF_SEM(STP_Q_Off, V128 src1, V128 src2, MV128W dst1, MV128W dst2) {
++  UWriteV128(dst1, UReadV128(src1));
++  UWriteV128(dst2, UReadV128(src2));
++  return memory;
++}
++DEF_SEM(STP_Q_Update, V128 src1, V128 src2, MV128W dst1, R64W dst_reg, ADDR next_addr, MV128W dst2) {
++  UWriteV128(dst1, UReadV128(src1));
++  UWriteV128(dst2, UReadV128(src2));
++  Write(dst_reg, Read(next_addr));
++  return memory;
++}
++DEF_SEM(STR_B_UpdateIndex, V8 src, MV8W dst, R64W dst_reg, ADDR next_addr) { UWriteV8(dst, UReadV8(src)); Write(dst_reg, Read(next_addr)); return memory; }
++DEF_SEM(STR_H_UpdateIndex, V16 src, MV16W dst, R64W dst_reg, ADDR next_addr) { UWriteV16(dst, UReadV16(src)); Write(dst_reg, Read(next_addr)); return memory; }
++DEF_SEM(STR_S_UpdateIndex, V32 src, MV32W dst, R64W dst_reg, ADDR next_addr) { FWriteV32(dst, FReadV32(src)); Write(dst_reg, Read(next_addr)); return memory; }
++DEF_SEM(STR_D_UpdateIndex, V64 src, MV64W dst, R64W dst_reg, ADDR next_addr) { FWriteV64(dst, FReadV64(src)); Write(dst_reg, Read(next_addr)); return memory; }
++DEF_SEM(STR_B_FromOffset, V8 src, MV8W dst, ADDR offset) { UWriteV8(DisplaceAddress(dst, Read(offset)), UReadV8(src)); return memory; }
++DEF_SEM(STR_H_FromOffset, V16 src, MV16W dst, ADDR offset) { UWriteV16(DisplaceAddress(dst, Read(offset)), UReadV16(src)); return memory; }
++DEF_SEM(STR_S_FromOffset, V32 src, MV32W dst, ADDR offset) { FWriteV32(DisplaceAddress(dst, Read(offset)), FReadV32(src)); return memory; }
++DEF_SEM(STR_D_FromOffset, V64 src, MV64W dst, ADDR offset) { FWriteV64(DisplaceAddress(dst, Read(offset)), FReadV64(src)); return memory; }
++
++}  // namespace
++
++DEF_ISEL(STP_S_LDSTPAIR_PRE) = STP_S_Update;
++DEF_ISEL(STP_S_LDSTPAIR_POST) = STP_S_Update;
++DEF_ISEL(STP_D_LDSTPAIR_PRE) = STP_D_Update;
++DEF_ISEL(STP_D_LDSTPAIR_POST) = STP_D_Update;
++DEF_ISEL(STP_Q_LDSTPAIR_OFF) = STP_Q_Off;
++DEF_ISEL(STP_Q_LDSTPAIR_PRE) = STP_Q_Update;
++DEF_ISEL(STP_Q_LDSTPAIR_POST) = STP_Q_Update;
++DEF_ISEL(STR_B_LDST_IMMPRE) = STR_B_UpdateIndex;
++DEF_ISEL(STR_B_LDST_IMMPOST) = STR_B_UpdateIndex;
++DEF_ISEL(STR_H_LDST_IMMPRE) = STR_H_UpdateIndex;
++DEF_ISEL(STR_H_LDST_IMMPOST) = STR_H_UpdateIndex;
++DEF_ISEL(STR_S_LDST_IMMPRE) = STR_S_UpdateIndex;
++DEF_ISEL(STR_S_LDST_IMMPOST) = STR_S_UpdateIndex;
++DEF_ISEL(STR_D_LDST_IMMPRE) = STR_D_UpdateIndex;
++DEF_ISEL(STR_D_LDST_IMMPOST) = STR_D_UpdateIndex;
++DEF_ISEL(STR_Q_LDST_IMMPOST) = STR_Q_UpdateIndex;
++DEF_ISEL(STR_B_LDST_REGOFF) = STR_B_FromOffset;
++DEF_ISEL(STR_BL_LDST_REGOFF) = STR_B_FromOffset;
++DEF_ISEL(STR_H_LDST_REGOFF) = STR_H_FromOffset;
++DEF_ISEL(STR_S_LDST_REGOFF) = STR_S_FromOffset;
++DEF_ISEL(STR_D_LDST_REGOFF) = STR_D_FromOffset;
++
++namespace {
++
++template <typename D, typename S>
++DEF_SEM(LDXR_Sub, D dst, S src, R64W monitor, R64W monitor_value) {
++  auto val = Read(src);
++  WriteZExt(dst, val);
++  Write(monitor, AddressOf(src));
++  Write(monitor_value, ZExtTo<uint64_t>(val));
++  return memory;
++}
++template <typename D, typename S>
++DEF_SEM(LDAXR_Sub, D dst, S src, R64W monitor, R64W monitor_value) {
++  auto val = Read(src);
++  WriteZExt(dst, val);
++  Write(monitor, AddressOf(src));
++  Write(monitor_value, ZExtTo<uint64_t>(val));
++  memory = __remill_barrier_load_load(memory);
++  memory = __remill_barrier_load_store(memory);
++  return memory;
++}
++// The exclusive store of a byte or halfword: T is the width of the location, the register is a 32-bit one
++template <typename T, typename D, bool kRelease>
++DEF_SEM(STXR_Sub, R32W status, R32 src, D dst, R64W monitor, R64W monitor_value) {
++  auto addr = AddressOf(dst);
++  if (kRelease) {
++    memory = __remill_barrier_load_store(memory);
++    memory = __remill_barrier_store_store(memory);
++  }
++  if (Read(monitor) == addr) {
++    T expected = TruncTo<T>(Read(monitor_value));
++    if (UCmpXchg(dst, expected, TruncTo<T>(Read(src)))) {
++      WriteZExt(status, 0_u32);
++    } else {
++      WriteZExt(status, 1_u32);
++    }
++  } else {
++    WriteZExt(status, 1_u32);
++  }
++  Write(monitor, 0_u64);
++  return memory;
++}
++DEF_SEM(CLREX_Monitor, R64W monitor, R64W monitor_value) {
++  Write(monitor, 0_u64);
++  Write(monitor_value, 0_u64);
++  return memory;
++}
++DEF_SEM(NxPrefetch) { return memory; }
++
++}  // namespace
++
++DEF_ISEL(LDXRB_LR32_LDSTEXCL) = LDXR_Sub<R32W, M8>;
++DEF_ISEL(LDXRH_LR32_LDSTEXCL) = LDXR_Sub<R32W, M16>;
++DEF_ISEL(LDAXRB_LR32_LDSTEXCL) = LDAXR_Sub<R32W, M8>;
++DEF_ISEL(LDAXRH_LR32_LDSTEXCL) = LDAXR_Sub<R32W, M16>;
++DEF_ISEL(STXRB_SR32_LDSTEXCL) = STXR_Sub<uint8_t, M8W, false>;
++DEF_ISEL(STXRH_SR32_LDSTEXCL) = STXR_Sub<uint16_t, M16W, false>;
++DEF_ISEL(STLXRB_SR32_LDSTEXCL) = STXR_Sub<uint8_t, M8W, true>;
++DEF_ISEL(STLXRH_SR32_LDSTEXCL) = STXR_Sub<uint16_t, M16W, true>;
++DEF_ISEL(STLRB_SL32_LDSTEXCL) = StoreRelease<R32, M8W>;
++DEF_ISEL(STLRH_SL32_LDSTEXCL) = StoreRelease<R32, M16W>;
++DEF_ISEL(CLREX_BN_SYSTEM) = CLREX_Monitor;
++DEF_ISEL(PRFM_P_LDST_REGOFF) = NxPrefetch;
++DEF_ISEL(PRFM_P_LOADLIT) = NxPrefetch;
++DEF_ISEL(PRFM_P_LDST_POS) = NxPrefetch;
++DEF_ISEL(PRFUM_P_LDST_UNSCALED) = NxPrefetch;
+diff --git a/lib/Arch/AArch64/Semantics/FLAGS.cpp b/lib/Arch/AArch64/Semantics/FLAGS.cpp
+index 5fabc9f..cfbf6da 100644
+--- a/lib/Arch/AArch64/Semantics/FLAGS.cpp
++++ b/lib/Arch/AArch64/Semantics/FLAGS.cpp
+@@ -167,6 +167,14 @@ ALWAYS_INLINE static void SetFPSRStatusFlags(State &state, int mask) {
+   state.sr.idc |= static_cast<uint8_t>(0 != (mask & kFPUExceptionDenormal));
+ }
+ 
++// ARM's default NaN (positive quiet NaN) is what an invalid operation without a NaN operand produces; x86's is negative. Operations whose inputs hold a NaN keep the host's NaN handling
++template <typename T> ALWAYS_INLINE static T DefaultNaN();
++template <> ALWAYS_INLINE float DefaultNaN<float>() { return __builtin_bit_cast(float, 0x7FC00000u); }
++template <> ALWAYS_INLINE double DefaultNaN<double>() { return __builtin_bit_cast(double, 0x7FF8000000000000ull); }
++template <typename T> ALWAYS_INLINE static T ArmNaN(T res, T a) { return (std::isnan(res) && !std::isnan(a)) ? DefaultNaN<T>() : res; }
++template <typename T> ALWAYS_INLINE static T ArmNaN(T res, T a, T b) { return (std::isnan(res) && !std::isnan(a) && !std::isnan(b)) ? DefaultNaN<T>() : res; }
++template <typename T> ALWAYS_INLINE static T ArmNaN(T res, T a, T b, T c) { return (std::isnan(res) && !std::isnan(a) && !std::isnan(b) && !std::isnan(c)) ? DefaultNaN<T>() : res; }
++
+ template <typename F, typename T>
+ ALWAYS_INLINE static auto CheckedFloatUnaryOp(State &state, F func, T arg1)
+     -> decltype(func(arg1)) {
+@@ -195,7 +203,11 @@ ALWAYS_INLINE static auto CheckedFloatBinOp(State &state, F func, T arg1,
+   BarrierReorder();
+   auto new_except = __remill_fpu_exception_test(kFPUExceptionAll);
+   SetFPSRStatusFlags(state, new_except);
+-  return res;
++  if constexpr (std::is_floating_point<decltype(res)>::value) {
++    return ArmNaN(res, arg1, arg2);
++  } else {
++    return res;
++  }
+ }
+ 
+ }  // namespace
+diff --git a/lib/Arch/AArch64/Semantics/SYSTEM.cpp b/lib/Arch/AArch64/Semantics/SYSTEM.cpp
+index c4c5e23..5fa8b0a 100644
+--- a/lib/Arch/AArch64/Semantics/SYSTEM.cpp
++++ b/lib/Arch/AArch64/Semantics/SYSTEM.cpp
+@@ -122,3 +122,5 @@ DEF_ISEL(MRS_RS_SYSTEM_TPIDRRO_EL0) = DoMRS_RS_SYSTEM_TPIDRRO_EL0;
+ 
+ DEF_ISEL(DMB_BO_SYSTEM) = DataMemoryBarrier;
+ DEF_ISEL(ISB_BI_SYSTEM) = InstructionSynchronizationBarrier;
++
++DEF_ISEL(DSB_BO_SYSTEM) = DataMemoryBarrier;   // DSB: at least as strong as the full barrier DMB is here
+-- 
+2.56.0
+

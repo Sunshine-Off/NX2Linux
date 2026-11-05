@@ -1,4 +1,66 @@
-# NS Port Builder — Qt front end (Windows and macOS)
+# NS Port Builder / NX2Linux — Qt front end
+
+## Linux host interface (S6)
+
+On Linux, the entry point opens a separate NX2Linux host interface. It calls
+`linux/cli/nx2linux.py` asynchronously and does not invoke the Apple build pipeline.
+The Windows and macOS interfaces retain their existing behavior.
+
+From the repository root, with Python 3.10+ and PySide6 6.7+ installed:
+
+```sh
+python3 frontend-qt/run_gui.py
+```
+
+Select the checkout and a build directory, then use **Diagnose**, **Build host**,
+**Verify with Vulkan** and **Run Vulkan demo**. Build requires CMake, a C compiler,
+pkg-config, SDL3 development files, Vulkan development files and glslc. Verification
+requires CTest 3.21+ for its JUnit report. A usable Vulkan driver and a desktop
+session are needed for the visible demo. Choose `wayland` or `x11` to override SDL
+display selection, or leave `auto` to inherit the environment.
+
+Output streams into the window and a separate log for each operation. Progress is
+indeterminate, not an estimated compilation percentage. Only one operation runs at
+a time. Stop and window close terminate the CLI process group, including its build
+or demo children, with a forced stop after a grace period when necessary.
+
+Settings live at `$XDG_CONFIG_HOME/nx2linux/frontend.ini` and logs at
+`$XDG_STATE_HOME/nx2linux/logs/`. Defaults are `~/.config` and `~/.local/state`.
+Relative XDG overrides are ignored. Logs are ordinary text files that can be shared
+after reviewing their contents. No automatic log deletion is performed.
+
+This interface validates the **synthetic host demo only**, not game recompilation
+or Switch graphics. AOT/JIT progress, game artifacts, the guest runtime and NVN
+translation remain integration work with Téo. No fictitious game-build stages are
+shown. Debug/Release applies to **Build host**. Run and Verify use the selected
+build directory, and the CLI automatically builds Debug if the demo is absent.
+Use Build host explicitly after changing sources or configuration.
+
+Tests from the repository root:
+
+```sh
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s frontend-qt/tests -p test_linux_frontend.py -v
+python3 -m unittest discover -s linux/cli/tests -v
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s frontend-qt/tests
+```
+
+The first suite uses real subprocesses in disposable checkouts to test live output,
+errors, cancellation, child cleanup and closing the window. It does not require a
+GPU. A desktop acceptance check must also exercise all four actions against the
+real checkout, including a visible Vulkan demo. Verify rejects skipped Vulkan
+tests, missing expected tests and malformed or missing CTest reports.
+
+On a Wayland desktop, this opt-in acceptance check drives the real GUI controls
+through all four operations and leaves logs in the selected build directory:
+
+```sh
+QT_QPA_PLATFORM=offscreen python3 frontend-qt/tests/check_linux_workflow.py --backend wayland
+```
+
+Use `--backend x11` for an X11 session. This is not a substitute for visually
+checking the demo and interacting with the window.
+
+## Windows and macOS interface
 
 The SwiftUI app in `../frontend/` is the macOS-native one. This is the **cross-platform**
 counterpart: same job, same strings, built with PySide6 so Windows users get a native window.
@@ -285,4 +347,3 @@ build on Windows plus a device run can settle:
 
 `nspb_qt/win/doctor.py` is the fastest way to narrow a failure: it separates "a tool is missing"
 from "the tool exists but cannot do the job".
-

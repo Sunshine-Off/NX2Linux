@@ -1,6 +1,6 @@
 """Per-OS paths, tool discovery and process launching.
 
-Everything the UI needs that differs between Windows and macOS lives here, so the model and
+Everything the UI needs that differs between Windows, Linux and macOS lives here, so the model and
 the window never branch on sys.platform themselves.
 """
 from __future__ import annotations
@@ -14,6 +14,7 @@ from pathlib import Path
 
 IS_WIN = sys.platform.startswith('win')
 IS_MAC = sys.platform == 'darwin'
+IS_LINUX = sys.platform.startswith('linux')
 
 #: The build script's own floor: `build_ipa_from_nsp.py` raises below 3.12 for a direct RomFS
 #: image build, and its f-strings do not parse on 3.9. `/usr/bin/python3` is 3.9 on a stock Mac,
@@ -33,6 +34,34 @@ def _which(name: str, extra: list[str] | None = None) -> str | None:
         if c and Path(c).is_file() and os.access(c, os.X_OK):
             return c
     return None
+
+
+def xdg_dir(kind: str, app: str = 'nx2linux') -> Path:
+    """Return a Linux XDG directory without creating it."""
+    if kind not in ('config', 'cache', 'state', 'data'):
+        raise ValueError(f'unknown XDG directory kind: {kind}')
+    if IS_LINUX:
+        env = os.environ.get(f'XDG_{kind.upper()}_HOME')
+        if env and Path(env).is_absolute():
+            return Path(env) / app
+        home = Path.home()
+        defaults = {
+            'config': home / '.config',
+            'cache': home / '.cache',
+            'state': home / '.local' / 'state',
+            'data': home / '.local' / 'share',
+        }
+        return defaults[kind] / app
+    return Path.home() / app
+
+
+def log_dir(app: str = 'nx2linux') -> Path:
+    """Directory for persistent logs on the current platform."""
+    if IS_WIN:
+        return Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local') / app / 'logs'
+    if IS_MAC:
+        return Path.home() / 'Library' / 'Logs' / app
+    return xdg_dir('state', app) / 'logs'
 
 
 def uv_pythons() -> list[str]:
@@ -121,6 +150,8 @@ def python_candidates(extra_candidates: list[str] | None = None) -> list[str]:
             for v in sorted(os.listdir(fw), reverse=True):
                 cands.append(f'{fw}/{v}/bin/python3')
         cands += ['/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3']
+        if IS_LINUX:
+            cands += [str(Path.home() / '.local' / 'bin' / 'python3')]
         cands += uv_pythons()
         cands += version_manager_pythons()
     if w := _which('python3' if not IS_WIN else 'python'):
@@ -221,9 +252,11 @@ def _runs(exe: str, args: list[str]) -> bool:
 def venv_dir() -> Path:
     if IS_WIN:
         base = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
+    elif IS_LINUX:
+        base = xdg_dir('data')
     else:
         base = Path.home() / 'Library' / 'Application Support'
-    return base / 'NS Port Builder' / 'venv'
+    return base / ('NX2Linux' if IS_LINUX else 'NS Port Builder') / 'venv'
 
 
 def venv_python() -> str:
@@ -242,6 +275,8 @@ def find_dotnet() -> tuple[str, bool]:
         cands += [str(Path.home() / '.dotnet' / 'dotnet'),
                   '/usr/local/share/dotnet/dotnet',
                   '/opt/homebrew/bin/dotnet']
+        if IS_LINUX:
+            cands += ['/usr/share/dotnet/dotnet', '/usr/bin/dotnet']
     path = _which('dotnet', cands) or ('dotnet.exe' if IS_WIN else 'dotnet')
     ok = _runs(path, ['--list-sdks'])
     return (path, ok)
@@ -283,7 +318,10 @@ def find_tool(name: str) -> str | None:
         extra = [rf'C:\Program Files\{name}\{name}.exe',
                  rf'C:\ProgramData\chocolatey\bin\{name}.exe']
         return _which(name + '.exe', extra)
-    return _which(name, [f'/opt/homebrew/bin/{name}', f'/usr/local/bin/{name}'])
+    extra = [f'/opt/homebrew/bin/{name}', f'/usr/local/bin/{name}']
+    if IS_LINUX:
+        extra += [f'/usr/bin/{name}', f'{Path.home()}/.local/bin/{name}']
+    return _which(name, extra)
 
 
 def metal_toolchain_ok() -> bool:

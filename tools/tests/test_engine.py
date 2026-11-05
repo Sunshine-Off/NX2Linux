@@ -324,7 +324,8 @@ class Relink(Fixture):
 
 
 class Search(unittest.TestCase):
-    def test_the_repository_ignores_engine_for_git_but_not_for_ripgrep(self):
+    def test_engine_is_ignored_by_git_and_never_hidden_from_ripgrep(self):
+        # engine/ is a build product (tools/engine.py sync, issue #214): git ignores it and it is not tracked. A search from the root must still find its files, which the root .ignore guarantees.
         self.assertIn('/engine/', (REPO / '.gitignore').read_text().splitlines())
         self.assertIn('!/engine/', (REPO / '.ignore').read_text().splitlines())
 

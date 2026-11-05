@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Tue, 3 Nov 2026 22:09:56 +0100
+Subject: [PATCH] horizon on linux: an 8 MiB main stack, and a ccmp alone as
+ the guard of a jump table
+
+The main thread's stack was 64 KiB: the field Xenoblade 2 builds when the opening is skipped keeps a TColiCheckResult<256> on it (fw::ColiCheck::testLineChara) and overflowed it, a fault in nnMain at once. It is 8 MiB now.
+
+A switch guarded by `fcmp ; and ; ccmp w8, #9, #2, lt ; b.hi` took the bound of an older, unrelated `cmp w0, #0` a few dozen instructions earlier: a two-entry table instead of ten, and an indirect jump into the function that stopped the thread (btl::EnemyParameter::HateProc, in the first battle). The nearest cmp or ccmp is the guard, with the larger immediate of the compares around it. The manifests of a game must be made again for the new targets (172 more in Xenoblade 2).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: skipping the opening of Xenoblade 2 stopped the main thread
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+---
+ dm/tools/elf_module.py             |  2 +-
+ dm/tools/jump_tables.py            | 13 ++++++-------
+ dm/tools/tests/test_jump_tables.py |  9 +++++++++
+ 3 files changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/dm/tools/elf_module.py b/dm/tools/elf_module.py
+index 826a951..0e83fe5 100644
+--- a/dm/tools/elf_module.py
++++ b/dm/tools/elf_module.py
+@@ -213,7 +213,7 @@ class Loaded:
+ class ModuleSet:
+     BASE = 0x08000000
+     GAP = 0   # modules are contiguous, each starting where the previous one's bss ends (page aligned), as Horizon's rtld lays them out: a direct bl from main into sdk is encoded for that distance and lands in the wrong place with a gap
+-    STACK, STACK_SIZE = 0x01000000, 0x10000
++    STACK, STACK_SIZE = 0x01000000, 0x00800000   # the main thread's stack: 8 MiB (a game's main thread keeps arrays of hundreds of entries on it; 64 KiB overflowed in the first field it builds)
+     TLS, TLS_SIZE = 0x00100000, 0x10000   # the harness thread's thread-local region: tpidrro_el0 points at its start (Horizon's 0x200-byte region, then the thread object), tpidr_el0 a user TLS block after both
+     IMPORT_BASE = 0x70000000
+     STOP = STOP   # the x30 a thread the harness starts returns to
+diff --git a/dm/tools/jump_tables.py b/dm/tools/jump_tables.py
+index 770b08f..259ee79 100644
+--- a/dm/tools/jump_tables.py
++++ b/dm/tools/jump_tables.py
+@@ -89,17 +89,16 @@ def _resolve(img, ins, i, start, end):
+     j = regs.get(_reg(ins[i].op_str))
+     if not j or j[0] != 'j': return None
+     _, base, (_, taddr, width, signed, ishift), kind, shift = j
+-    # the entry count: the nearest `cmp reg, #k` before the br (the guard of the switch), one more for slack; else scan while the targets are inside the function
++    # the entry count: the nearest `cmp reg, #k` or `ccmp reg, #k, ...` before the br (the guard of the switch), one more for slack; else scan while the targets are inside the function
+     n = None
+     for k in range(i - 1, max(0, i - 120) - 1, -1):
+         x = ins[k]
+-        if x.mnemonic == 'cmp' and re.fullmatch(r'[xw]\d+, #\w+', x.op_str):
+-            n = _imm(x.op_str.split(', ')[1])
+-            # a compound guard (`cmp w4, #0 ; ccmp w8, #3, #2, ne ; b.hi default`, LLVM's `a != 0 && b <= 3`): the bound is the largest immediate of the compares right around it
++        if (x.mnemonic == 'cmp' and re.fullmatch(r'[xw]\d+, #\w+', x.op_str)) or (x.mnemonic == 'ccmp' and re.fullmatch(r'[xw]\d+, #\w+, #\w+, \w+', x.op_str)):
++            # a compound guard (`cmp w4, #0 ; ccmp w8, #3, #2, ne ; b.hi default`, LLVM's `a != 0 && b <= 3`, or `fcmp s0, s8 ; ccmp w8, #9, #2, lt`, where the ccmp alone is the guard): the bound is the largest immediate of the compares right around it
++            n = 0
+             for y in ins[max(0, k - 3):k + 4]:
+-                if y.mnemonic == 'ccmp':
+-                    mm = re.fullmatch(r'[xw]\d+, #(\w+), #\w+, \w+', y.op_str)
+-                    if mm: n = max(n, _imm(mm.group(1)))
++                mm = re.fullmatch(r'[xw]\d+, #(\w+)(?:, #\w+, \w+)?', y.op_str) if y.mnemonic in ('cmp', 'ccmp') else None
++                if mm: n = max(n, _imm(mm.group(1)))
+             n = min(n + 2, CAP); break
+     targets, k = set(), 0
+     while k < (n or CAP):
+diff --git a/dm/tools/tests/test_jump_tables.py b/dm/tools/tests/test_jump_tables.py
+index 6dea154..4ea48f1 100644
+--- a/dm/tools/tests/test_jump_tables.py
++++ b/dm/tools/tests/test_jump_tables.py
+@@ -110,5 +110,14 @@ class Tables(unittest.TestCase):
+         (t,) = self.find(words, struct.pack('<4i', *entries))
+         self.assertEqual(t.targets, tuple(base + 8 * k for k in range(4)))
+ 
++    def test_a_ccmp_alone_after_a_float_compare_is_the_guard_not_an_older_cmp(self):
++        # Xenoblade 2's btl::EnemyParameter::HateProc: an unrelated cmp w0, #0 a few dozen instructions earlier, then fcmp ; and ; ccmp w8, #3, #2, ne ; b.hi default ; ... br. The older cmp gave a two-entry table
++        words = [0x7100001F] + [NOP] * 5 + [0x7A431902, BHI(F + 28, F + 4 * 17), ADRP(9, F + 32, TABLE), ADDI(9, 9, TABLE & 0xFFF), LDRSW(11, 9, 0), ADD(10, 11, 9), BR(10)]
++        words += [NOP, RET] * 5
++        base = F + 4 * 13
++        entries = [base + 8 * k - TABLE for k in range(4)]
++        (t,) = self.find(words, struct.pack('<4i', *entries))
++        self.assertEqual(t.targets, tuple(base + 8 * k for k in range(4)))
++
+ 
+ if __name__ == '__main__': unittest.main()

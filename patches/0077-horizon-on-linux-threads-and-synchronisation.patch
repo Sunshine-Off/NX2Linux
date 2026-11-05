@@ -1,0 +1,2388 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 15:04:25 +0100
+Subject: [PATCH] Horizon on Linux: threads and synchronisation,
+ nn::fs/account/oe/vi, the NVN device, generated trivial overrides
+
+Guest threads are Python threads running the recompiled code; a Horizon mutex word and condition variable (ArbitrateLock/Unlock, WaitProcessWideKeyAtomic/Signal), events and waits with timeouts. nn::fs over the RomFS image and host directories, nn::account, nn::oe, nn::vi and nv::, ported from engine/dm/host/hle_*.c; 259 trivial HLE_FORCE entries generated from the C sources (gen_trivial_overrides.py). The NVN device (horizon_nvn.py, nvn_layout.py): Tegra X1 limits, pools, buffers, texture storage sizes, queues, command buffers replayed at submit (render targets, clears), the window presented through horizon_display. Found booting Xenoblade Chronicles 2.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: S7bis Linux Horizon layer and AOT support found booting Xenoblade Chronicles 2; tests use synthetic code and fake guest memory, no game data
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/gen_trivial_overrides.py       |  58 ++++
+ dm/tools/horizon_account.py             |  82 +++++
+ dm/tools/horizon_fs.py                  | 301 ++++++++++++++++
+ dm/tools/horizon_hle.py                 | 258 +++++++++++---
+ dm/tools/horizon_nvn.py                 | 434 ++++++++++++++++++++++++
+ dm/tools/horizon_oe.py                  | 115 +++++++
+ dm/tools/horizon_overrides.py           |  43 +++
+ dm/tools/horizon_services.py            |   2 +-
+ dm/tools/horizon_trivial.py             | 263 ++++++++++++++
+ dm/tools/horizon_vi.py                  |  99 ++++++
+ dm/tools/nvn_layout.py                  | 172 ++++++++++
+ dm/tools/tests/test_horizon_hle.py      |  70 +++-
+ dm/tools/tests/test_horizon_services.py | 243 +++++++++++++
+ 13 files changed, 2082 insertions(+), 58 deletions(-)
+ create mode 100644 dm/tools/gen_trivial_overrides.py
+ create mode 100644 dm/tools/horizon_account.py
+ create mode 100644 dm/tools/horizon_fs.py
+ create mode 100644 dm/tools/horizon_nvn.py
+ create mode 100644 dm/tools/horizon_oe.py
+ create mode 100644 dm/tools/horizon_overrides.py
+ create mode 100644 dm/tools/horizon_trivial.py
+ create mode 100644 dm/tools/horizon_vi.py
+ create mode 100644 dm/tools/nvn_layout.py
+ create mode 100644 dm/tools/tests/test_horizon_services.py
+
+diff --git a/dm/tools/gen_trivial_overrides.py b/dm/tools/gen_trivial_overrides.py
+new file mode 100644
+index 0000000..78f4bd0
+--- /dev/null
++++ b/dm/tools/gen_trivial_overrides.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""Generate horizon_trivial.py from the Mach host's HLE_FORCE table (engine/dm/host/hle_*.c): the entries whose body does nothing or returns a constant, with their reason strings.
++Anything with logic is left to a hand-written port (horizon_fs.py, horizon_account.py ...). Usage: gen_trivial_overrides.py > horizon_trivial.py"""
++import re, sys
++from pathlib import Path
++
++HOST = Path(__file__).resolve().parent.parent / 'host'
++CONSTS = {'RES_OK': 0, 'RES_FAIL': 0x2A2, 'true': 1, 'false': 0, 'NULL': 0}
++INT_TYPES = {'Result', 'int', 'unsigned', 'uint32_t', 'int32_t', 'uint8_t', 'bool', 'unsigned int', 'uint16_t', 'int8_t', 'uint64_t', 'int64_t', 'size_t', 'long', 'unsigned long', 'long long', 'unsigned long long'}
++HEAD = re.compile(r'^HLE_FORCE(?:_BIG)?\(\s*"([^"]+)"\s*,\s*((?:"(?:[^"\\]|\\.)*"\s*)+),\s*([^,]+?)\s*,\s*(\w+)\s*,([^{]*?)\)\s*\{', re.M | re.S)
++
++
++def strings(blob):
++    return ''.join(re.findall(r'"((?:[^"\\]|\\.)*)"', blob)).replace('\\"', '"').replace('\\n', ' ')
++
++
++def body_of(text, start):
++    depth, i = 1, start
++    while i < len(text) and depth:
++        c = text[i]
++        if c == '{': depth += 1
++        elif c == '}': depth -= 1
++        i += 1
++    return text[start:i - 1]
++
++
++def trivial(ret, body):
++    b = re.sub(r'//[^\n]*|/\*.*?\*/', '', body, flags=re.S).strip()
++    b = re.sub(r'\(void\)\s*\w+\s*;', '', b).strip()
++    b = re.sub(r'\bDM_APPLET\([^)]*\)\s*;?', '', b).strip()
++    if b == '': return ('void' if ret.strip() == 'void' else None, None)
++    m = re.fullmatch(r'return\s+(\w+)\s*;', b)
++    if m and ret.strip() in INT_TYPES:
++        v = m.group(1)
++        if v in CONSTS: return ('value', CONSTS[v])
++        if re.fullmatch(r'-?\d+|0x[0-9a-fA-F]+', v): return ('value', int(v, 0))
++    return (None, None)
++
++
++def main():
++    seen, out = set(), []
++    for f in sorted(HOST.glob('hle_*.c')):
++        text = f.read_text(errors='replace')
++        for m in HEAD.finditer(text):
++            sym, why, ret, cname, args = m.group(1), strings(m.group(2)), m.group(3), m.group(4), m.group(5)
++            kind, val = trivial(ret, body_of(text, m.end()))
++            if kind is None or sym in seen: continue
++            seen.add(sym)
++            out.append((sym, kind, val, why, f.name))
++    print('"""Generated by gen_trivial_overrides.py from the Mach host\'s HLE_FORCE entries that do nothing or return a constant (engine/dm/host/hle_*.c): %d of them. Do not edit; port entries with logic by hand."""' % len(out))
++    print('# (symbol, value or None for a void function, reason, source file)')
++    print('TRIVIAL = [')
++    for sym, kind, val, why, src in out:
++        print(f'    ({sym!r}, {val if kind == "value" else None!r}, {why!r}, {src!r}),')
++    print(']')
++
++
++if __name__ == '__main__': main()
+diff --git a/dm/tools/horizon_account.py b/dm/tools/horizon_account.py
+new file mode 100644
+index 0000000..3ba664f
+--- /dev/null
++++ b/dm/tools/horizon_account.py
+@@ -0,0 +1,82 @@
++"""nn::account on the Linux host (NX2Linux S7bis): the Python side of engine/dm/host/hle_account.c. One fixed local user; online accounts are out of scope and answer RES_FAIL.
++Uid is 16 bytes, UserHandle 24 bytes (the Uid and a magic word); the nickname comes from NX2LINUX_NICK (default Player)."""
++import os, struct
++
++from horizon_overrides import hle, noop, returns
++
++RES_OK, RES_FAIL = 0, 0x2A2
++UID = struct.pack('<QQ', 0x78626c0000000001, 0x53574e4154495645)
++HANDLE_MAGIC = 0x55534552484e444c
++
++
++def handle_bytes(uid=UID): return uid + struct.pack('<Q', HANDLE_MAGIC)
++
++
++noop('_ZN2nn7account10InitializeEv', 'connects to the acc:u0 account service; the host has one fixed local user')
++noop('_ZN2nn7account13PushOpenUsersEv', 'hand the open users to the next program: the host runs only this one')
++noop('_ZN2nn7account9CloseUserERKNS0_10UserHandleE', 'close user; the handle holds no session')
++
++
++def _list(hz, r):   # (int *n, Uid *out, int max)
++    n, out, cap = r[0], r[1], r[2] & 0xFFFFFFFF
++    count = 1 if cap > 0 else 0
++    if count: hz.wr(out, UID)
++    hz.wr32(n, count); r[0] = RES_OK
++
++
++for _s in ('_ZN2nn7account13ListOpenUsersEPiPNS0_3UidEi', '_ZN2nn7account12ListAllUsersEPiPNS0_3UidEi', '_ZN2nn7account18ListQualifiedUsersEPiPNS0_3UidEi'):
++    hle(_s, 'list of users; always the one local user')(_list)
++
++
++@hle('_ZN2nn7account12PopOpenUsersEPiPNS0_10UserHandleEi', 'users opened by the system: none (the game falls back to the preselected user)')
++def pop_open(hz, r): hz.wr32(r[0], 0)
++
++
++@hle('_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE', 'user preselected at launch; always the local user (returns bool)')
++def try_open_pre(hz, r): hz.wr(r[0], handle_bytes()); r[0] = 1
++
++
++@hle('_ZN2nn7account19OpenPreselectedUserEPNS0_10UserHandleE', 'user preselected at launch (a Result in SDK 6); always the local user')
++def open_pre(hz, r): hz.wr(r[0], handle_bytes()); r[0] = RES_OK
++
++
++@hle('_ZN2nn7account17GetLastOpenedUserEPNS0_3UidE', 'last opened user; always the local user')
++def last_opened(hz, r): hz.wr(r[0], UID); r[0] = RES_OK
++
++
++@hle('_ZN2nn7account8OpenUserEPNS0_10UserHandleERKNS0_3UidE', 'open user; the handle holds the Uid itself')
++def open_user(hz, r): hz.wr(r[0], handle_bytes(hz.rd(r[1], 16))); r[0] = RES_OK
++
++
++@hle('_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE', 'gets the Uid from the handle')
++def get_user_id(hz, r):
++    h = hz.rd(r[1], 24)
++    if struct.unpack_from('<Q', h, 16)[0] != HANDLE_MAGIC: raise RuntimeError('account::GetUserId: the handle was not issued by the host')
++    hz.wr(r[0], h[:16]); r[0] = RES_OK
++
++
++@hle('_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE', 'user nickname; taken from NX2LINUX_NICK')
++def get_nickname(hz, r): hz.wr(r[0], os.environ.get('NX2LINUX_NICK', 'Player').encode()[:32].ljust(33, b'\0')); r[0] = RES_OK
++
++
++@hle('_ZN2nn7account12GetUserCountEPi', 'user count; always the one local user')
++def user_count(hz, r): hz.wr32(r[0], 1); r[0] = RES_OK
++
++
++@hle('_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE', 'whether a user exists; true for the local user')
++def user_exists(hz, r): hz.wr(r[0], bytes([hz.rd(r[1], 16) == UID])); r[0] = RES_OK
++
++
++@hle('_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE', 'network service account, out of scope; always unavailable')
++def nsa_available(hz, r): hz.wr(r[0], b'\0'); r[0] = RES_OK
++
++
++for _s in ('_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE', '_ZN2nn7account40ShowLicenseRequirementsForNetworkServiceERKNS0_10UserHandleE'):
++    returns(_s, 'network service account, out of scope; cut', RES_FAIL)
++
++
++@hle('_ZN2nn7account27StoreSaveDataThumbnailImageERKNS0_3UidEPKvm', "save-data thumbnail for the system's data management screen; the host keeps none")
++def store_thumb(hz, r): r[0] = RES_OK
++
++
++returns('_ZN2nn7account28DeleteSaveDataThumbnailImageERKNS0_3UidE', 'save-data thumbnail; the host keeps none')
+diff --git a/dm/tools/horizon_fs.py b/dm/tools/horizon_fs.py
+new file mode 100644
+index 0000000..94e3e77
+--- /dev/null
++++ b/dm/tools/horizon_fs.py
+@@ -0,0 +1,301 @@
++"""nn::fs on the Linux host (NX2Linux S7bis): the Python side of engine/dm/host/hle_fs.c. On a Switch every call goes through the fsp-srv service; here the SDK's functions are replaced (horizon_overrides.py)
++and read the host's files. Mount name -> backend:
++  rom   the RomFS image romfs_image.py packs (read-only, one descriptor, pread)
++  save  a folder under $XDG_DATA_HOME/nx2linux/saves/<title id> (writable)
++  temp  a folder under $XDG_CACHE_HOME/nx2linux/temp/<title id> (writable)
++Paths are "name:/dir/file". A FileHandle / DirectoryHandle is 8 bytes the guest passes by value: here a number shifted left by 4, so the low bits are clear as a heap pointer's are (a game may mask them).
++Results follow Horizon: 0 is success, 0x202 path not found, 0x402 path already exists."""
++import os, shutil, struct
++from pathlib import Path
++
++import romfs_image
++from horizon_overrides import hle, noop, returns
++
++RES_OK, RES_NOT_FOUND, RES_EXISTS, RES_INVALID_PATH, RES_READ_ONLY = 0, 0x202, 0x402, 0x2EE02, 0x2F202
++ENT_DIR, ENT_FILE = 0, 1
++DIRMODE_DIR, DIRMODE_FILE = 1, 2
++MODE_READ, MODE_WRITE, MODE_APPEND = 1, 2, 4
++DIRENT = 0x310
++
++
++def xdg(var, fallback):
++    return Path(os.environ.get(var) or Path.home() / fallback)
++
++
++class RomImage:
++    def __init__(self, path):
++        self.path = path
++        self.index = romfs_image.read_index(path)
++        self.fd = os.open(path, os.O_RDONLY)
++        self.kids = {}
++        for p in sorted(self.index):
++            self.kids.setdefault(p.rpartition('/')[0], []).append(p)
++
++    def stat(self, p):
++        p = p.strip('/')
++        if p == '': return ENT_DIR, 0, 0
++        e = self.index.get(p)
++        return None if e is None else (ENT_DIR if e[0] else ENT_FILE, e[1], e[2])
++
++    def read(self, p, off, n):
++        t = self.stat(p)
++        base, size = t[1], t[2]
++        n = max(0, min(n, size - off))
++        return os.pread(self.fd, n, base + off) if n else b''
++
++    def listing(self, p):
++        p = p.strip('/')
++        return [(c.rpartition('/')[2], self.index[c]) for c in self.kids.get(p, [])]
++
++
++class HostDir:
++    def __init__(self, root):
++        self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True)
++
++    def _p(self, p): return self.root / p.strip('/')
++
++    def stat(self, p):
++        h = self._p(p)
++        if h.is_dir(): return ENT_DIR, 0, 0
++        if h.is_file(): return ENT_FILE, 0, h.stat().st_size
++        return None
++
++    def read(self, p, off, n):
++        with open(self._p(p), 'rb') as f: f.seek(off); return f.read(n)
++
++    def listing(self, p):
++        h = self._p(p)
++        return [(c.name, (c.is_dir(), 0, 0 if c.is_dir() else c.stat().st_size)) for c in sorted(h.iterdir())] if h.is_dir() else []
++
++
++class FileSystem:
++    def __init__(self, hz, romfs_img, title_id):
++        self.hz, self.mounts, self.files, self.dirs, self._next = hz, {}, {}, {}, 1
++        self.romfs_img = romfs_img
++        self.save_root = xdg('XDG_DATA_HOME', '.local/share') / 'nx2linux/saves' / title_id
++        self.temp_root = xdg('XDG_CACHE_HOME', '.cache') / 'nx2linux/temp' / title_id
++
++    def split(self, path):
++        name, sep, rest = path.partition(':')
++        return (name, rest) if sep else (None, path)
++
++    def resolve(self, path):
++        name, rest = self.split(path)
++        m = self.mounts.get(name)
++        return (m, rest, name) if m else (None, rest, name)
++
++    def mount_rom(self, name):
++        if self.romfs_img is None: return RES_NOT_FOUND
++        self.mounts[name] = RomImage(self.romfs_img) if not hasattr(self, '_rom') else self._rom
++        self._rom = self.mounts[name]
++        return RES_OK
++
++    def handle(self, table, obj):
++        h = self._next; self._next += 1; table[h] = obj
++        return h << 4
++
++
++def fs(hz): return hz.fs
++
++
++def cstr(hz, a): return hz.cstring(a, 0x300)
++
++
++@hle('_ZN2nn2fs8MountRomEPKcPvm', 'fsp-srv; rom: the RomFS image on the host')
++def mount_rom(hz, r): r[0] = hz.fs.mount_rom(cstr(hz, r[0]))
++
++
++@hle('_ZN2nn2fs8MountRomEPKc', 'fsp-srv; rom: the RomFS image on the host (overload without the cache arguments)')
++def mount_rom1(hz, r): r[0] = hz.fs.mount_rom(cstr(hz, r[0]))
++
++
++@hle('_ZN2nn2fs22QueryMountRomCacheSizeEPm', 'fsp-srv; rom reads the host image directly, the cache only has to exist')
++def rom_cache_size(hz, r): hz.wr64(r[0], 0x10000); r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs7UnmountEPKc', 'fsp-srv; the mount table is permanent, unmounting is a no-op')
++def unmount(hz, r): pass
++
++
++@hle('_ZN2nn2fs9IsMountedEPKc', 'fsp-srv; looks up the host mount table')
++def is_mounted(hz, r): r[0] = int(cstr(hz, r[0]) in hz.fs.mounts)
++
++
++@hle('_ZN2nn2fs13IsPathMountedEPKc', 'fsp-srv; looks up the host mount table')
++def is_path_mounted(hz, r): r[0] = int(hz.fs.split(cstr(hz, r[0]))[0] in hz.fs.mounts)
++
++
++@hle('_ZN2nn2fs21MountTemporaryStorageEPKc', 'fsp-srv; temporary storage is a host directory')
++def mount_temp(hz, r):
++    hz.fs.mounts[cstr(hz, r[0])] = HostDir(hz.fs.temp_root); r[0] = RES_OK
++
++
++def _mount_save(hz, name):
++    hz.fs.mounts[name] = HostDir(hz.fs.save_root)
++    return RES_OK
++
++
++@hle('_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE', 'fsp-srv; save data is a host directory (single user)')
++def mount_save(hz, r): r[0] = _mount_save(hz, cstr(hz, r[0]))
++
++
++@hle('_ZN2nn2fs19MountDeviceSaveDataEPKc', 'fsp-srv; device save data is the same host directory (one player)')
++def mount_device_save(hz, r): r[0] = _mount_save(hz, cstr(hz, r[0]))
++
++
++returns('_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE', 'fsp-srv; the save directory is created at mount time')
++returns('_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE', 'fsp-srv; save data always exists', 1)
++returns('_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE', 'fsp-srv; save data always exists', 1)
++returns('_ZN2nn2fs6detail18IsEnabledAccessLogEj', 'fsp-srv; access log always off')
++returns('_ZN2nn2fs6detail18IsEnabledAccessLogEv', 'fsp-srv; access log always off')
++noop('_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE', 'fsp-srv; file read priority is ignored by the host')
++noop('_ZN2nn2fs25EnableGlobalFileDataCacheEPvm', 'fsp-srv global read cache; unused by the host')
++noop('_ZN2nn2fs26DisableGlobalFileDataCacheEv', 'fsp-srv global read cache; unused by the host')
++returns('_ZN2nn2fs6CommitEPKc', 'fsp-srv; the host directory is written in place')
++returns('_ZN2nn2fs14CommitSaveDataEPKc', 'fsp-srv; same as Commit')
++
++
++def _sizes(hz, r):   # (int64 *size, int64 *journal, ...): 256 MB of data and 256 MB of journal, the host directory has no limit
++    hz.wr64(r[0], 256 << 20); hz.wr64(r[1], 256 << 20); r[0] = RES_OK
++
++
++for _sym in ('_ZN2nn2fs15GetSaveDataSizeEPlS1_RKNS_7account3UidE', '_ZN2nn2fs18GetSaveDataSizeMaxEPlS1_', '_ZN2nn2fs21GetDeviceSaveDataSizeEPlS1_'):
++    hle(_sym, 'fsp-srv; save data size: 256 MB data + 256 MB journal')(_sizes)
++
++
++@hle('_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci', 'fsp-srv -> open')
++def open_file(hz, r):
++    out, path, mode = r[0], cstr(hz, r[1]), r[2] & 0xFFFFFFFF
++    m, rest, _ = hz.fs.resolve(path)
++    if m is None: r[0] = RES_NOT_FOUND; return
++    st = m.stat(rest)
++    if mode & (MODE_WRITE | MODE_APPEND):
++        if isinstance(m, RomImage): r[0] = RES_READ_ONLY; return
++        if st is None: r[0] = RES_NOT_FOUND; return
++    elif st is None or st[0] != ENT_FILE: r[0] = RES_NOT_FOUND; return
++    hz.wr64(out, hz.fs.handle(hz.fs.files, (m, rest, mode))); r[0] = RES_OK
++
++
++def _read(hz, out, h, off, buf, size):
++    ent = hz.fs.files.get(h >> 4)
++    if ent is None: return RES_INVALID_PATH
++    m, rest, _ = ent
++    data = m.read(rest, off, size)
++    if data: hz.wr(buf, data)
++    if out: hz.wr64(out, len(data))
++    return RES_OK if out or len(data) == size else 0x2EE02 + 0   # without an out count a short read is an error
++
++
++@hle('_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm', 'fsp-srv -> pread')
++def read_file(hz, r): r[0] = _read(hz, r[0], r[1], r[2], r[3], r[4])
++
++
++@hle('_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE', 'fsp-srv -> pread (overload with read options)')
++def read_file_opt(hz, r): r[0] = _read(hz, r[0], r[1], r[2], r[3], r[4])
++
++
++@hle('_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm', 'fsp-srv -> pread, must read in full')
++def read_file_full(hz, r): r[0] = _read(hz, 0, r[0], r[1], r[2], r[3])
++
++
++@hle('_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE', 'fsp-srv -> fstat')
++def get_file_size(hz, r):
++    ent = hz.fs.files.get(r[1] >> 4)
++    if ent is None: r[0] = RES_INVALID_PATH; return
++    m, rest, _ = ent
++    hz.wr64(r[0], m.stat(rest)[2]); r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs9CloseFileENS0_10FileHandleE', 'fsp-srv -> close')
++def close_file(hz, r): hz.fs.files.pop(r[0] >> 4, None)
++
++
++@hle('_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE', 'fsp-srv; the open mode is recorded by the host')
++def file_open_mode(hz, r):
++    ent = hz.fs.files.get(r[0] >> 4); r[0] = ent[2] if ent else 0
++
++
++@hle('_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE', 'fsp-srv -> pwrite')
++def write_file(hz, r):
++    ent = hz.fs.files.get(r[0] >> 4)
++    if ent is None: r[0] = RES_INVALID_PATH; return
++    m, rest, _ = ent
++    if isinstance(m, RomImage): r[0] = RES_READ_ONLY; return
++    data = hz.rd(r[2], r[3])
++    with open(m._p(rest), 'r+b') as f: f.seek(r[1]); f.write(data)
++    r[0] = RES_OK
++
++
++noop('_ZN2nn2fs9FlushFileENS0_10FileHandleE', 'fsp-srv; host writes are already in the page cache')
++
++
++@hle('_ZN2nn2fs10CreateFileEPKcl', 'fsp-srv -> create + truncate')
++def create_file(hz, r):
++    m, rest, _ = hz.fs.resolve(cstr(hz, r[0]))
++    if m is None: r[0] = RES_NOT_FOUND; return
++    if isinstance(m, RomImage): r[0] = RES_READ_ONLY; return
++    p = m._p(rest)
++    if p.exists(): r[0] = RES_EXISTS; return
++    p.parent.mkdir(parents=True, exist_ok=True)
++    with open(p, 'wb') as f: f.truncate(r[1])
++    r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs15CreateDirectoryEPKc', 'fsp-srv -> mkdir')
++def create_dir(hz, r):
++    m, rest, _ = hz.fs.resolve(cstr(hz, r[0]))
++    if m is None: r[0] = RES_NOT_FOUND; return
++    if isinstance(m, RomImage): r[0] = RES_READ_ONLY; return
++    p = m._p(rest)
++    if p.exists(): r[0] = RES_EXISTS; return
++    p.mkdir(parents=True); r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs10DeleteFileEPKc', 'fsp-srv -> unlink')
++def delete_file(hz, r):
++    m, rest, _ = hz.fs.resolve(cstr(hz, r[0]))
++    if m is None or isinstance(m, RomImage) or not m._p(rest).is_file(): r[0] = RES_NOT_FOUND; return
++    m._p(rest).unlink(); r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc', 'fsp-srv -> stat')
++def get_entry_type(hz, r):
++    m, rest, _ = hz.fs.resolve(cstr(hz, r[1]))
++    st = m.stat(rest) if m else None
++    if st is None: r[0] = RES_NOT_FOUND; return
++    hz.wr32(r[0], st[0]); r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci', 'fsp-srv -> opendir')
++def open_dir(hz, r):
++    out, path, mode = r[0], cstr(hz, r[1]), r[2] & 0xFFFFFFFF
++    m, rest, _ = hz.fs.resolve(path)
++    st = m.stat(rest) if m else None
++    if st is None or st[0] != ENT_DIR: r[0] = RES_NOT_FOUND; return
++    entries = [(n, e) for n, e in m.listing(rest) if (mode & DIRMODE_DIR if e[0] else mode & DIRMODE_FILE)]
++    hz.wr64(out, hz.fs.handle(hz.fs.dirs, [entries, 0])); r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl', 'fsp-srv -> readdir')
++def read_dir(hz, r):
++    out_count, buf, h, cap = r[0], r[1], r[2], r[3]
++    d = hz.fs.dirs.get(h >> 4)
++    if d is None: r[0] = RES_INVALID_PATH; return
++    entries, pos = d
++    take = entries[pos:pos + max(0, cap)]
++    for i, (name, (is_dir, _, size)) in enumerate(take):
++        raw = name.encode()[:0x300]
++        hz.wr(buf + i * DIRENT, raw.ljust(0x301, b'\0') + b'\0\0\0' + struct.pack('<b3xq', ENT_DIR if is_dir else ENT_FILE, 0 if is_dir else size))
++    d[1] = pos + len(take)
++    hz.wr64(out_count, len(take)); r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE', 'fsp-srv -> closedir')
++def close_dir(hz, r): hz.fs.dirs.pop(r[0] >> 4, None)
++
++
++@hle('_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE', 'fsp-srv; entry count of an open directory')
++def dir_count(hz, r):
++    d = hz.fs.dirs.get(r[1] >> 4)
++    if d is None: r[0] = RES_INVALID_PATH; return
++    hz.wr64(r[0], len(d[0])); r[0] = RES_OK
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index 91c53f9..54fdada 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -2,7 +2,7 @@
+ signal are reported instead of hanging. The memory is the AOT runtime's regions (aot_lift.Aot: peek / poke / try_map); handles live in a table; a service is a Python object whose `command(id, request)`
+ returns a Response. Everything not implemented is logged as `unhandled ...` and answered with an error, never faked as a success (the boot stops where the game needs it, and the log says where).
+ Usage: h = Horizon(module_set); h.attach(); module_set.call(entry, ...)."""
+-import os, struct, sys, time
++import os, struct, sys, threading, time
+ 
+ M64 = (1 << 64) - 1
+ PAGE = 0x1000
+@@ -21,7 +21,7 @@ SVC_NAMES = {
+     0x10: 'GetCurrentProcessorNumber', 0x11: 'SignalEvent', 0x12: 'ClearEvent', 0x13: 'MapSharedMemory', 0x14: 'UnmapSharedMemory', 0x15: 'CreateTransferMemory', 0x16: 'CloseHandle',
+     0x17: 'ResetSignal', 0x18: 'WaitSynchronization', 0x19: 'CancelSynchronization', 0x1a: 'ArbitrateLock', 0x1b: 'ArbitrateUnlock', 0x1c: 'WaitProcessWideKeyAtomic',
+     0x1d: 'SignalProcessWideKey', 0x1e: 'GetSystemTick', 0x1f: 'ConnectToNamedPort', 0x21: 'SendSyncRequest', 0x22: 'SendSyncRequestWithUserBuffer', 0x24: 'GetProcessId',
+-    0x25: 'GetThreadId', 0x26: 'Break', 0x27: 'OutputDebugString', 0x29: 'GetInfo', 0x34: 'WaitForAddress', 0x35: 'SignalToAddress', 0x36: 'SynchronizePreemptionState',
++    0x25: 'GetThreadId', 0x26: 'Break', 0x27: 'OutputDebugString', 0x29: 'GetInfo', 0x34: 'WaitForAddress', 0x45: 'CreateEvent', 0x35: 'SignalToAddress', 0x36: 'SynchronizePreemptionState',
+ }
+ 
+ # MemoryType values QueryMemory reports (the ones a game checks)
+@@ -40,6 +40,37 @@ class Event(Obj):
+     def __init__(self, signaled=False, auto=False): super().__init__(); self.signaled, self.auto = signaled, auto
+ 
+ 
++class KThread(Obj):
++    """A guest thread: its entry, argument, stack, thread-local region, and the Python thread that runs it once started"""
++    kind = 'thread'
++    _ids = iter(range(2, 1 << 30))
++
++    def __init__(self, hz, entry, arg, stack_top, priority, tlr):
++        super().__init__()
++        self.hz, self.entry, self.arg, self.stack_top, self.priority, self.tlr = hz, entry, arg, stack_top, priority, tlr
++        self.tid, self.handle = next(self._ids), 0
++        self.done, self.started, self.granted, self.signaled, self.tag, self.result = False, False, False, False, 0, None
++
++    def start(self):
++        if self.started: return
++        self.started = True
++        self.py = threading.Thread(target=self.main, name=f'guest-{self.tid}', daemon=True)
++        self.py.start()
++
++    def main(self):
++        hz = self.hz
++        hz.local.thread = self
++        try:
++            self.result = hz.aot.run(self.entry, {'x0': self.arg, 'x1': self.handle, 'x30': hz.ms.STOP}, 0, self.stack_top, self.tlr + 0x800, self.tlr, snapshot=False)
++            if 'fault' in self.result and self.result['fault'] != 'thread exited':
++                regs = [0] * 31; regs[29], regs[30] = self.result.get('x29', 0), self.result.get('x30', 0)
++                hz.log(f'guest thread {self.tid} stopped: {self.result["fault"]} (call chain: {hz.where(regs)})')
++                hz.thread_faults.append((self.tid, self.result['fault']))
++        finally:
++            with hz.cv:
++                self.done = True; hz.cv.notify_all()
++
++
+ class Session(Obj):
+     kind = 'session'
+     def __init__(self, service): super().__init__(); self.service = service
+@@ -74,7 +105,7 @@ class Horizon:
+     FIRST_HANDLE = 0xD000
+     TLS_PER_THREAD = 0x200
+ 
+-    def __init__(self, ms, out=None, verbose=False):
++    def __init__(self, ms, out=None, verbose=False, romfs=None, title_id='0000000000000000'):
+         self.ms, self.aot, self.out, self.verbose = ms, ms.aot, out or sys.stderr, verbose
+         self.handles, self._next_handle = {}, self.FIRST_HANDLE
+         self.heap_size = 0
+@@ -82,13 +113,23 @@ class Horizon:
+         self.named_ports = {}   # ConnectToNamedPort names -> factory
+         self.stats, self.unhandled, self.start = {}, {}, time.monotonic()
+         self.stop_reason = None
++        self.verbose_nvn = bool(os.environ.get('NX2LINUX_NVN_LOG'))
++        self.display_factory = None   # () -> horizon_display.Display, called when the game first presents a frame
++        self.thread_faults = []
++        self.main_thread_obj = KThread(self, 0, 0, 0, 44, ms.TLS)
++        self.main_thread_obj.tid = 1
++        self._init_kernel()
+         self.process_id, self.thread_id = 0x80, 1
+         self._mem_cursor = self.MEM_BASE
+         self.mem_types = []     # (addr, size, type, perm) of what the process mapped beyond the module regions
+-        import horizon_services
++        import horizon_services, horizon_fs
+         horizon_services.install(self)
++        self.fs = horizon_fs.FileSystem(self, romfs, title_id)
+ 
+     # ---- plumbing ----
++    def note(self, msg):
++        if self.verbose: self.log(msg)
++
+     def log(self, msg):
+         print(f'[hz {time.monotonic() - self.start:7.3f}] {msg}', file=self.out, flush=True)
+ 
+@@ -134,23 +175,26 @@ class Horizon:
+             for mod in ms.modules:
+                 d = mod.m['dynamic']
+                 if 'INIT' not in d: continue
+-                r = ms.call(mod.base + d['INIT'])
++                r = ms.call(mod.base + d['INIT'], snapshot=False)
+                 if 'fault' in r: return r
+             return {}
+-        steps = [('_init_libc0', lambda: ms.call('_init_libc0')),
+-                 ('nnosInitialize', lambda: ms.call('nnosInitialize', {'x0': main_thread, 'x1': 0})),
+-                 ('_init_libc1', lambda: ms.call('_init_libc1')),
+-                 ('nninitInitializeSdkModule', lambda: ms.call('nninitInitializeSdkModule')),
+-                 ('SetHostArgc', lambda: ms.call('_ZN2nn2os11SetHostArgcEi', {'x0': len(argv)})),
+-                 ('SetHostArgv', lambda: ms.call('_ZN2nn2os11SetHostArgvEPPc', {'x0': arr})),
+-                 ('nninitStartup', lambda: ms.call('nninitStartup')),
+-                 ('_init_libc2', lambda: ms.call('_init_libc2')),
++        steps = [('_init_libc0', lambda: ms.call('_init_libc0', snapshot=False)),
++                 ('nnosInitialize', lambda: ms.call('nnosInitialize', {'x0': main_thread, 'x1': 0}, snapshot=False)),
++                 ('_init_libc1', lambda: ms.call('_init_libc1', snapshot=False)),
++                 ('nninitInitializeSdkModule', lambda: ms.call('nninitInitializeSdkModule', snapshot=False)),
++                 ('SetHostArgc', lambda: ms.call('_ZN2nn2os11SetHostArgcEi', {'x0': len(argv)}, snapshot=False)),
++                 ('SetHostArgv', lambda: ms.call('_ZN2nn2os11SetHostArgvEPPc', {'x0': arr}, snapshot=False)),
++                 ('nninitStartup', lambda: ms.call('nninitStartup', snapshot=False)),
++                 ('_init_libc2', lambda: ms.call('_init_libc2', snapshot=False)),
+                  ('DT_INIT', run_inits),
+-                 ('nnMain', lambda: ms.call('nnMain'))]
++                 ('nnMain', lambda: ms.call('nnMain', snapshot=False))]
+         for name, f in steps:
+             self.log(f'>>> {name}')
+             r = f()
+-            if 'fault' in r: return dict(r, step=name)
++            if 'fault' in r:
++                regs = [0] * 31; regs[29], regs[30] = r.get('x29', 0), r.get('x30', 0)
++                self.log(f"fault in {name}: {r['fault']} (call chain: {self.where(regs)})")
++                return dict(r, step=name)
+             if name == stop_after: return dict(r, step=name)
+         return dict(r, step='nnMain')
+ 
+@@ -239,15 +283,18 @@ class Horizon:
+ 
+     def svc_GetSystemTick(self, r): r[0] = int((time.monotonic() - self.start) * 19200000)
+     def svc_GetProcessId(self, r): r[0], r[1] = OK, self.process_id
+-    def svc_GetThreadId(self, r): r[0], r[1] = OK, self.thread_id
+ 
+-    def where(self, r, depth=12):
++    def where(self, r, depth=24):
+         """The guest call chain as module+offset: x30, then the saved link registers along the x29 frame chain"""
++        if not hasattr(self, '_syms'):
++            self._syms = sorted((x, n) for mod in self.ms.modules for n, x in mod.exports.items())
++        import bisect
+         def loc(a):
+             for mod in self.ms.modules:
+                 if mod.base <= a < mod.base + mod.size:
+-                    sym = next((n for n, x in mod.exports.items() if x == a), '')
+-                    return f'{mod.name}+{a - mod.base:#x}'
++                    i = bisect.bisect_right(self._syms, (a, '\uffff')) - 1
++                    near = f' {self._syms[i][1][:70]}+{a - self._syms[i][0]:#x}' if i >= 0 and a - self._syms[i][0] < 0x4000 else ''
++                    return f'{mod.name}+{a - mod.base:#x}{near}'
+             return f'{a:#x}'
+         out, fp = [loc(r[30])], r[29]
+         for _ in range(depth):
+@@ -255,7 +302,7 @@ class Horizon:
+             except AssertionError: break
+             if not lr: break
+             out.append(loc(lr))
+-        return ' <- '.join(out)
++        return ' <- '.join(o for o in out if '2sf4hipc' not in o and '2sf4cmif' not in o)
+ 
+     def svc_OutputDebugString(self, r):
+         msg = self.rd(r[0], min(r[1], 512)).decode('utf-8', 'replace').rstrip()
+@@ -275,64 +322,168 @@ class Horizon:
+     def svc_ExitProcess(self, r):
+         self.log('ExitProcess'); os._exit(0)
+ 
+-    # ---- handles and synchronisation (one thread: a wait nothing can signal is an error, not a hang) ----
++    # ---- threads and synchronisation: every guest thread is a Python thread running the recompiled code (the GIL is released while it runs); one condition variable guards the kernel's state ----
++    LISTENERS = 0x40000000   # a Horizon mutex word: the owner's handle, plus this bit while threads wait for it
++    THREAD_REGIONS = 0x7_0000_0000
++
++    def _init_kernel(self):
++        self.cv = threading.Condition()
++        self.local = threading.local()
++        self.threads, self.mutex_waiters, self.key_waiters = {}, {}, {}
++        self._tlr_next = 0
++
++    def current(self):
++        return getattr(self.local, 'thread', None)
++
++    def svc_GetThreadId(self, r):
++        t = self.current(); r[0], r[1] = OK, (t.tid if t else self.thread_id)
++
+     def svc_CloseHandle(self, r):
+         if r[0] in self.handles: del self.handles[r[0]]; r[0] = OK
+         else: r[0] = R_INVALID_HANDLE
+ 
+     def svc_SleepThread(self, r):
+         ns = r[0]
+-        if ns > 0: time.sleep(min(ns / 1e9, 0.05))
++        if ns > 0 and ns < (1 << 62): time.sleep(ns / 1e9)
++        else: time.sleep(0)
+         r[0] = OK
+ 
+     def svc_GetCurrentProcessorNumber(self, r): r[0] = 0
+-    def svc_GetThreadPriority(self, r): r[0], r[1] = OK, 44
+-    def svc_SetThreadPriority(self, r): r[0] = OK
++    def svc_GetThreadPriority(self, r):
++        t = self.handles.get(r[1]); r[0], r[1] = OK, getattr(t, 'priority', 44)
++    def svc_SetThreadPriority(self, r):
++        t = self.handles.get(r[0])
++        if t is not None: t.priority = r[1] & 0xFFFFFFFF
++        r[0] = OK
+     def svc_GetThreadCoreMask(self, r): r[0], r[1], r[2] = OK, 0, 0xF
+     def svc_SetThreadCoreMask(self, r): r[0] = OK
+     def svc_SynchronizePreemptionState(self, r): r[0] = OK
+ 
++    def _ready(self, o):
++        if isinstance(o, Event): return o.signaled
++        if isinstance(o, KThread): return o.done
++        return True   # a session or the like: a request on it never blocks here
++
++    def _take(self, o):
++        if isinstance(o, Event) and o.auto: o.signaled = False
++
++    def svc_WaitSynchronization(self, r):
++        ptr, n, timeout = r[1], r[2] & 0xFFFFFFFF, r[3]
++        hs = struct.unpack(f'<{n}I', self.rd(ptr, 4 * n)) if n else ()
++        deadline = None if timeout >= (1 << 63) or timeout == M64 else time.monotonic() + timeout / 1e9
++        with self.cv:
++            while True:
++                for i, h in enumerate(hs):
++                    o = self.handles.get(h)
++                    if o is None: r[0] = R_INVALID_HANDLE; return
++                    if self._ready(o): self._take(o); r[0], r[1] = OK, i; return
++                if deadline is not None and time.monotonic() >= deadline: r[0] = R_TIMEOUT; return
++                self.cv.wait(None if deadline is None else max(0.0, deadline - time.monotonic()))
++
+     def svc_ResetSignal(self, r):
+         o = self.handles.get(r[0])
+         if not isinstance(o, Event): r[0] = R_INVALID_HANDLE; return
+-        r[0] = OK if o.signaled else R_INVALID_STATE
+-        o.signaled = False
++        with self.cv:
++            r[0] = OK if o.signaled else R_INVALID_STATE
++            o.signaled = False
+ 
+     def svc_ClearEvent(self, r): self.svc_ResetSignal(r)
+ 
+     def svc_SignalEvent(self, r):
+         o = self.handles.get(r[0])
+         if not isinstance(o, Event): r[0] = R_INVALID_HANDLE; return
+-        o.signaled = True; r[0] = OK
++        with self.cv:
++            o.signaled = True; self.cv.notify_all()
++        r[0] = OK
+ 
+-    def svc_WaitSynchronization(self, r):
+-        ptr, n, timeout = r[1], r[2], r[3]
+-        hs = struct.unpack(f'<{n}I', self.rd(ptr, 4 * n)) if n else ()
+-        for i, h in enumerate(hs):
+-            o = self.handles.get(h)
+-            if o is None: r[0] = R_INVALID_HANDLE; return
+-            if isinstance(o, Event) and o.signaled:
+-                if o.auto: o.signaled = False
+-                r[0], r[1] = OK, i; return
+-            if not isinstance(o, Event): r[0], r[1] = OK, i; return   # sessions and the like: ready
+-        if timeout in (0, M64 >> 0) and timeout == 0: r[0] = R_TIMEOUT; return
+-        names = [getattr(self.handles.get(h), 'name', '?') for h in hs]
+-        self.log(f'WaitSynchronization on {names} would block forever (one guest thread, nothing can signal)')
+-        self.stop_reason = 'WaitSynchronization'
+-        r[0] = R_TIMEOUT
+-
+-    # ArbitrateLock / mutex: with one thread, a lock is always free or held by us
+-    def svc_ArbitrateLock(self, r):
+-        tag_addr = r[2]
++    def svc_CreateEvent(self, r):   # -> (writable handle, readable handle) of one event
++        e = Event(); r[1] = self.new_handle(e); r[2] = self.new_handle(e); r[0] = OK
++
++    def _unlock(self, addr):
++        """ArbitrateUnlock: hand the mutex word to the first waiter (keeping the listeners bit while others wait), or clear it"""
++        q = self.mutex_waiters.get(addr)
++        if q:
++            t = q.pop(0); t.granted = True
++            self.wr32(addr, t.tag | (self.LISTENERS if q else 0))
++            self.cv.notify_all()
++        else: self.wr32(addr, 0)
++
++    def _lock(self, addr, tag, owner=None):
++        """Take the mutex word, or wait until an unlock hands it to this thread (caller holds self.cv)"""
++        me = self.current() or self.main_thread_obj
++        while True:
++            v = self.rd32(addr)
++            if v == 0: self.wr32(addr, tag); return
++            if owner is not None and v != (owner | self.LISTENERS): return   # the word changed under the caller: nothing to wait for
++            if not v & self.LISTENERS: self.wr32(addr, v | self.LISTENERS)
++            me.granted, me.tag = False, tag
++            self.mutex_waiters.setdefault(addr, []).append(me)
++            while not me.granted: self.cv.wait()
++            return
++
++    def svc_ArbitrateLock(self, r):   # (owner thread handle, mutex addr, requesting thread's tag)
++        owner, addr, tag = r[0] & 0xFFFFFFFF, r[1], r[2] & 0xFFFFFFFF
++        with self.cv:
++            v = self.rd32(addr)
++            if v != (owner | self.LISTENERS): r[0] = OK; return
++            me = self.current() or self.main_thread_obj
++            me.granted, me.tag = False, tag
++            self.mutex_waiters.setdefault(addr, []).append(me)
++            while not me.granted: self.cv.wait()
++        r[0] = OK
++
++    def svc_ArbitrateUnlock(self, r):
++        with self.cv: self._unlock(r[0])
++        r[0] = OK
++
++    def svc_WaitProcessWideKeyAtomic(self, r):   # (mutex addr, key addr, tag, timeout): release the mutex, wait for the key, take the mutex again
++        mutex, key, tag, timeout = r[0], r[1], r[2] & 0xFFFFFFFF, r[3]
++        deadline = None if timeout >= (1 << 63) else time.monotonic() + timeout / 1e9
++        me = self.current() or self.main_thread_obj
++        with self.cv:
++            self._unlock(mutex)
++            me.signaled = False
++            self.key_waiters.setdefault(key, []).append(me)
++            result = OK
++            while not me.signaled:
++                if deadline is not None and time.monotonic() >= deadline:
++                    if me in self.key_waiters.get(key, []): self.key_waiters[key].remove(me)
++                    result = R_TIMEOUT; break
++                self.cv.wait(None if deadline is None else max(0.0, deadline - time.monotonic()))
++            self._lock(mutex, tag)
++        r[0] = result
++
++    def svc_SignalProcessWideKey(self, r):   # (key addr, count): wake that many waiters, all when count <= 0
++        key, count = r[0], r[1] & 0xFFFFFFFF
++        if count >= 0x80000000: count = 0
++        with self.cv:
++            q = self.key_waiters.get(key, [])
++            for t in (q[:] if count == 0 else q[:count]):
++                q.remove(t); t.signaled = True
++            self.cv.notify_all()
+         r[0] = OK
+-    def svc_ArbitrateUnlock(self, r): r[0] = OK
+-    def svc_WaitProcessWideKeyAtomic(self, r):
+-        self.log('WaitProcessWideKeyAtomic would block forever'); self.stop_reason = 'condvar wait'; r[0] = R_TIMEOUT
+-    def svc_SignalProcessWideKey(self, r): r[0] = OK
+ 
+-    def svc_CreateThread(self, r):
+-        self.log(f'CreateThread entry {r[1]:#x} arg {r[2]:#x} stack {r[3]:#x}: threads are not scheduled yet')
+-        self.stop_reason = 'CreateThread'; r[0] = R_NOT_IMPLEMENTED
++    def svc_CreateThread(self, r):   # (entry, arg, stack top, priority, core) -> handle
++        entry, arg, top, prio = r[1], r[2], r[3], r[4] & 0xFFFFFFFF
++        base = self.THREAD_REGIONS + self._tlr_next * PAGE; self._tlr_next += 1
++        if not self.aot.try_map(base, PAGE): r[0] = R_INVALID_STATE; return
++        t = KThread(self, entry, arg, top, prio, base)
++        t.handle = self.new_handle(t); self.threads[t.tid] = t
++        tls = bytearray(PAGE); struct.pack_into('<Q', tls, 0x1f8, base + 0x200); struct.pack_into('<Q', tls, 0x110, t.tid)
++        self.wr(base, bytes(tls))
++        r[0], r[1] = OK, t.handle
++
++    def svc_StartThread(self, r):
++        t = self.handles.get(r[0])
++        if not isinstance(t, KThread): r[0] = R_INVALID_HANDLE; return
++        t.start(); r[0] = OK
++
++    def svc_ExitThread(self, r):
++        t = self.current()
++        if t is None: self.svc_ExitProcess(r); return
++        self.aot.lib.aot_request_exit()   # the run ends in C when this handler returns
++
++    def svc_GetThreadContext3(self, r): r[0] = R_NOT_IMPLEMENTED
+ 
+     def svc_CreateTransferMemory(self, r):
+         class Transfer(Obj): kind = 'transfer'
+@@ -348,6 +499,7 @@ class Horizon:
+ 
+     def svc_SendSyncRequest(self, r):
+         h = r[0]; sess = self.handles.get(h)
++        self.regs = r
+         self.ipc(sess, self.ms.TLS, r)   # the command buffer is the first 0x100 bytes of the ThreadLocalRegion
+ 
+     def svc_SendSyncRequestWithUserBuffer(self, r):
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+new file mode 100644
+index 0000000..46e8d1c
+--- /dev/null
++++ b/dm/tools/horizon_nvn.py
+@@ -0,0 +1,434 @@
++"""NVN on the Linux host (NX2Linux S7bis): the game's graphics API, replaced wholesale (the SDK's NVN driver does not run), as engine/dm/gfx/nvn/hle_nvn.c does on Mach. nvnBootstrapLoader hands the game
++host functions for the NVN names it asks for; the objects the game allocates (device, pools, textures, queue, command buffers, window) are tracked here by their guest address.
++What exists: devices and limits (Tegra X1 values), memory pools and buffers over the game's own memory, texture storage sizes (nvn_layout.py), sync objects, events, queues, command buffers that record
++and replay at submit (render targets, clears, copies), and the window whose textures are shown through horizon_display. Draws, state and shaders are accepted and counted, not rendered: the
++picture is what the game clears and copies. Anything not implemented answers 0 and is logged once with its name and arguments, never faked as a result the game could act on."""
++import re, struct, time
++from pathlib import Path
++
++import nvn_layout
++from horizon_overrides import hle
++
++OK_BOOL = 1
++SYNC_ALREADY_SIGNALED, SYNC_TIMEOUT = 0, 2
++NAMES_FILE = Path(__file__).resolve().parent.parent / 'gfx/nvn/names.txt'
++M32 = 0xFFFFFFFF
++FLAG_NO_CPU = 0x1
++
++# Tegra X1 device properties, measured by calling nvnDeviceGetInteger item by item (nnheaders nvn_DeviceConstantsNX.h; engine/dm/gfx/nvn/hle_nvn.c g_devinfo)
++DEVINFO = [55, 15, 14, 65536, 256, 8, 16, 4, 16, 32, 16, 4, 4, 4, 16, 32, 32, 256, 256, 4, 8, 512, 256, 2, 256, 4096, 131072, 16, 1536, 1024, 64, 1536, 65535, 65535, 65535, 8, 1048576, 4096,
++           16, 4096, 1, 1, 1, 262144, 15, 2048, 1, 1, 14, 5, 1, 8, 8, 4, 32, 128, 32, 128, 65536, 1, 4, 16384, 134217728, 2048, 16384, 16384, 1, 1, 1, 1, 5, 1, 1, 1, 1, 1, 1, 16, 1024, 32, 4096,
++           65536, 65536, 256, 16384, 262144, 4096, 1, 4, 2, 0, 4096, 16384, 4096, 128, 4096]
++
++
++class Obj(dict):
++    """Per-object state keyed by the guest address of the NVN struct"""
++
++
++class Nvn:
++    def __init__(self, hz, api=(53, 313)):
++        self.hz, self.api = hz, api
++        self.names = [n.strip() for n in NAMES_FILE.read_text().split() if n.strip()] if NAMES_FILE.exists() else []
++        self.known = set(self.names)
++        self.addr = {}       # name -> import address
++        self.o = {}          # guest address -> Obj
++        self.cmdlists = {}   # command handle -> recorded commands
++        self._handle = 0x1000
++        self.unimpl = {}
++        self.stats = {'submits': 0, 'draws': 0, 'clears': 0, 'copies': 0, 'presents': 0}
++        self.display = None
++        self.display_factory = None   # called on the first present, on the presenting thread: SDL and Vulkan then live on one thread
++
++    # ---- plumbing ----
++    def get(self, a, **init):
++        if a not in self.o: self.o[a] = Obj(init)
++        return self.o[a]
++
++    def lookup(self, name):
++        """The import address of an NVN function, registered on first request"""
++        if name in self.addr: return self.addr[name]
++        if name not in self.known:
++            self.hz.log(f'[nvn] address lookup of an unknown name: {name}')
++            return 0
++        a = self.hz.ms._import_address(name)
++        impl = IMPL.get(name)
++        if impl is None:
++            if name.endswith('Initialize'): impl = lambda nvn, r: r.__setitem__(0, OK_BOOL)
++            else: impl = self.unimplemented(name)
++        fn = (lambda r, f=impl: f(self, r))
++        if self.hz.aot.register_import(a, fn, name): raise RuntimeError(f'cannot register {name}')
++        self.addr[name] = a
++        return a
++
++    def unimplemented(self, name):
++        def f(nvn, r):
++            nvn.unimpl[name] = nvn.unimpl.get(name, 0) + 1
++            if nvn.unimpl[name] == 1 and nvn.hz.verbose_nvn:
++                nvn.hz.log(f'[nvn] {name} not implemented (x0={r[0]:#x} x1={r[1]:#x} x2={r[2]:#x}); answers 0')
++            r[0] = 0
++        return f
++
++    def new_handle(self):
++        self._handle += 8; return self._handle
++
++    def pool_addr(self, pool_ptr, off=0):
++        p = self.o.get(pool_ptr)
++        return (p['mem'] if p else 0) + off
++
++    def texture_bitmap(self, t):
++        if 'bitmap' not in t:
++            t['bitmap'] = bytearray(t['w'] * t['h'] * 4)
++        return t['bitmap']
++
++    # ---- replay of a submitted command list ----
++    def replay(self, cmds, state):
++        for c in cmds:
++            op = c[0]
++            if op == 'targets': state['rt'] = c[1]
++            elif op == 'clear':
++                _, index, color, mask = c
++                if 0 <= index < len(state.get('rt', [])): self.fill(state['rt'][index], color, mask)
++                self.stats['clears'] += 1
++            elif op == 'cleartex': self.fill(c[1], c[2], c[3]); self.stats['clears'] += 1
++            elif op == 'call':
++                for h in c[1]: self.replay(self.cmdlists.get(h, []), state)
++            elif op == 'draw': self.stats['draws'] += 1
++            elif op == 'signal': self.signal_event(*c[1:])
++            elif op == 'copy': self.stats['copies'] += 1
++
++    def fill(self, tex_ptr, color, mask):
++        t = self.o.get(tex_ptr)
++        if not t or not t.get('w'): return
++        bm = self.texture_bitmap(t)
++        px = bytes(int(max(0.0, min(1.0, v)) * 255 + 0.5) for v in color)
++        if mask & 0xF == 0xF: bm[:] = px * (len(bm) // 4)
++        else:
++            for i in range(4):
++                if mask >> i & 1: bm[i::4] = bytes([px[i]]) * (len(bm) // 4)
++
++    def signal_event(self, ev_ptr, mode, value):
++        e = self.o.get(ev_ptr)
++        if not e: return
++        a = self.pool_addr(e['pool'], e['off'])
++        cur = self.hz.rd32(a)
++        self.hz.wr32(a, (cur + value) & M32 if mode == 1 else value)
++
++    def present(self, win_ptr, index):
++        w = self.o.get(win_ptr)
++        self.stats['presents'] += 1
++        self.hz.frames_presented = self.stats['presents']
++        if not w or not w['textures']: return
++        t = self.o.get(w['textures'][index % len(w['textures'])])
++        if not t or not t.get('w'): return
++        if self.display is None and self.display_factory is not None:
++            try: self.display = self.display_factory()
++            except Exception as e:
++                self.hz.log(f'[nvn] cannot open the display: {e}'); self.display_factory = None
++        if self.display is not None:
++            try:
++                self.display.present(bytes(self.texture_bitmap(t)), t['w'], t['h'])
++                for ev in self.display.events():
++                    if ev[0] == 'quit': self.hz.log('window closed'); import os; os._exit(0)
++            except Exception as e: self.hz.log(f'[nvn] present failed: {e}')
++
++
++IMPL = {}
++
++
++def nvn(name):
++    def deco(fn):
++        IMPL[name] = fn
++        return fn
++    return deco
++
++
++def ret(r, v): r[0] = v & 0xFFFFFFFFFFFFFFFF
++
++
++# ---- device ----
++@nvn('nvnDeviceBuilderSetDefaults')
++def _(n, r): n.get(r[0]).clear()
++@nvn('nvnDeviceBuilderSetFlags')
++def _(n, r): n.get(r[0])['flags'] = r[1] & M32
++@nvn('nvnDeviceInitialize')
++def _(n, r): n.get(r[0], origin=0, depth=0).update(kind='device'); n.device = r[0]; ret(r, 1)
++@nvn('nvnDeviceFinalize')
++def _(n, r): n.o.pop(r[0], None)
++@nvn('nvnDeviceGetProcAddress')
++def _(n, r): ret(r, n.lookup(n.hz.cstring(r[1])))
++@nvn('nvnDeviceGetInteger')
++def _(n, r):
++    what = r[1] & M32
++    v = n.api[what] if what <= 1 else 256 if what == 0x67 else DEVINFO[what] if what < len(DEVINFO) else 0
++    if what == 0x2E: v = 1
++    if what == 0x30: v = 16
++    n.hz.wr32(r[2], v)
++@nvn('nvnDeviceGetImageHandle')
++def _(n, r): ret(r, r[1] & M32)
++@nvn('nvnDeviceGetSeparateTextureHandle')
++def _(n, r): ret(r, r[1] & M32)
++@nvn('nvnDeviceGetSeparateSamplerHandle')
++def _(n, r): ret(r, (r[1] & M32) << 20)
++@nvn('nvnDeviceGetTextureHandle')
++def _(n, r): ret(r, (r[1] & M32) | (r[2] & M32) << 20)
++@nvn('nvnDeviceGetTexelFetchHandle')
++def _(n, r): ret(r, r[1] & M32)
++@nvn('nvnDeviceSetWindowOriginMode')
++def _(n, r): n.get(r[0])['origin'] = r[1] & M32
++@nvn('nvnDeviceGetWindowOriginMode')
++def _(n, r): ret(r, n.get(r[0]).get('origin', 0))
++@nvn('nvnDeviceSetDepthMode')
++def _(n, r): n.get(r[0])['depth'] = r[1] & M32
++@nvn('nvnDeviceGetDepthMode')
++def _(n, r): ret(r, n.get(r[0]).get('depth', 0))
++@nvn('nvnDeviceGetCurrentTimestampInNanoseconds')
++def _(n, r): ret(r, time.monotonic_ns())
++@nvn('nvnDeviceInstallDebugCallback')
++def _(n, r): pass
++@nvn('nvnDeviceFinalizeCommandHandle')
++def _(n, r): pass
++
++
++# ---- memory pools and buffers: over the memory the game gives (GPU address = CPU address) ----
++@nvn('nvnMemoryPoolBuilderSetDefaults')
++def _(n, r): n.o[r[0]] = Obj()
++@nvn('nvnMemoryPoolBuilderSetDevice')
++def _(n, r): n.get(r[0])['dev'] = r[1]
++@nvn('nvnMemoryPoolBuilderSetStorage')
++def _(n, r): n.get(r[0]).update(mem=r[1], size=r[2])
++@nvn('nvnMemoryPoolBuilderSetFlags')
++def _(n, r): n.get(r[0])['flags'] = r[1] & M32
++@nvn('nvnMemoryPoolInitialize')
++def _(n, r):
++    b = n.get(r[1])
++    mem = b.get('mem', 0)
++    if not mem and b.get('flags', 0) & 0x200:   # a virtual pool: a range of addresses of its own until pages are mapped into it
++        mem = n.virtual_base = getattr(n, 'virtual_base', 0xA_0000_0000) + (b.get('size', 0) + 0xFFFF & ~0xFFFF)
++        n.hz.aot.try_map(mem, b.get('size', 0) + 0xFFF & ~0xFFF)
++    n.o[r[0]] = Obj(kind='pool', mem=mem, size=b.get('size', 0), flags=b.get('flags', 0))
++    ret(r, 1)
++@nvn('nvnMemoryPoolFinalize')
++def _(n, r): n.o.pop(r[0], None)
++@nvn('nvnMemoryPoolGetBufferAddress')
++def _(n, r): ret(r, n.get(r[0]).get('mem', 0))
++@nvn('nvnMemoryPoolMap')
++def _(n, r): p = n.get(r[0]); ret(r, 0 if p.get('flags', 0) & FLAG_NO_CPU else p.get('mem', 0))
++@nvn('nvnMemoryPoolGetSize')
++def _(n, r): ret(r, n.get(r[0]).get('size', 0))
++@nvn('nvnMemoryPoolGetFlags')
++def _(n, r): ret(r, n.get(r[0]).get('flags', 0))
++@nvn('nvnMemoryPoolFlushMappedRange')
++def _(n, r): pass
++@nvn('nvnBufferBuilderSetDefaults')
++def _(n, r): n.o[r[0]] = Obj()
++@nvn('nvnBufferBuilderSetDevice')
++def _(n, r): pass
++@nvn('nvnBufferBuilderSetStorage')
++def _(n, r): n.get(r[0]).update(pool=r[1], off=r[2], size=r[3])
++@nvn('nvnBufferInitialize')
++def _(n, r): n.o[r[0]] = Obj(kind='buffer', **{k: v for k, v in n.get(r[1]).items()}); ret(r, 1)
++@nvn('nvnBufferFinalize')
++def _(n, r): n.o.pop(r[0], None)
++@nvn('nvnBufferGetAddress')
++def _(n, r): b = n.get(r[0]); ret(r, n.pool_addr(b.get('pool', 0), b.get('off', 0)))
++@nvn('nvnBufferMap')
++def _(n, r):
++    b = n.get(r[0]); p = n.o.get(b.get('pool', 0), {})
++    ret(r, 0 if p.get('flags', 0) & FLAG_NO_CPU else n.pool_addr(b.get('pool', 0), b.get('off', 0)))
++@nvn('nvnBufferGetSize')
++def _(n, r): ret(r, n.get(r[0]).get('size', 0))
++@nvn('nvnBufferGetMemoryPool')
++def _(n, r): ret(r, n.get(r[0]).get('pool', 0))
++@nvn('nvnBufferGetMemoryOffset')
++def _(n, r): ret(r, n.get(r[0]).get('off', 0))
++@nvn('nvnBufferFlushMappedRange')
++def _(n, r): pass
++@nvn('nvnBufferInvalidateMappedRange')
++def _(n, r): pass
++
++
++# ---- descriptor pools ----
++@nvn('nvnTexturePoolInitialize')
++def _(n, r): n.o[r[0]] = Obj(kind='texpool', pool=r[1], off=r[2], count=r[3] & M32, tex={}); ret(r, 1)
++@nvn('nvnTexturePoolRegisterTexture')
++def _(n, r): n.get(r[0]).setdefault('tex', {})[r[1] & M32] = r[2]
++@nvn('nvnSamplerPoolInitialize')
++def _(n, r): n.o[r[0]] = Obj(kind='samplerpool', pool=r[1], off=r[2], count=r[3] & M32); ret(r, 1)
++
++
++# ---- textures ----
++def desc_of(b): return nvn_layout.Desc(**{k: b.get(k, getattr(nvn_layout.Desc, k)) for k in ('target', 'width', 'height', 'depth', 'levels', 'samples', 'format', 'flags', 'stride', 'pkg_block_h')})
++
++
++@nvn('nvnTextureBuilderSetDefaults')
++def _(n, r): n.o[r[0]] = Obj(target=1, width=0, height=0, depth=0, levels=1, samples=0, format=0, flags=0, stride=0, pkg_block_h=0)
++for _name, _key in (('Target', 'target'), ('Width', 'width'), ('Height', 'height'), ('Depth', 'depth'), ('Levels', 'levels'), ('Format', 'format'), ('Samples', 'samples'), ('Flags', 'flags'), ('Stride', 'stride')):
++    IMPL[f'nvnTextureBuilderSet{_name}'] = (lambda k: lambda n, r: n.get(r[0]).__setitem__(k, r[1] & M32))(_key)
++@nvn('nvnTextureBuilderSetDevice')
++def _(n, r): pass
++@nvn('nvnTextureBuilderSetSize1D')
++def _(n, r): n.get(r[0]).update(width=r[1] & M32)
++@nvn('nvnTextureBuilderSetSize2D')
++def _(n, r): n.get(r[0]).update(width=r[1] & M32, height=r[2] & M32)
++@nvn('nvnTextureBuilderSetSize3D')
++def _(n, r): n.get(r[0]).update(width=r[1] & M32, height=r[2] & M32, depth=r[3] & M32)
++@nvn('nvnTextureBuilderSetStorage')
++def _(n, r): n.get(r[0]).update(pool=r[1], off=r[2])
++@nvn('nvnTextureBuilderSetPackagedTextureLayout')
++def _(n, r): n.get(r[0])['pkg_block_h'] = (n.hz.rd(r[1], 1)[0] + 1) if r[1] else 0
++@nvn('nvnTextureBuilderGetStorageSize')
++def _(n, r): ret(r, nvn_layout.layout(desc_of(n.get(r[0]))).size)
++@nvn('nvnTextureBuilderGetStorageAlignment')
++def _(n, r): ret(r, nvn_layout.layout(desc_of(n.get(r[0]))).align)
++for _name, _key in (('Target', 'target'), ('Width', 'width'), ('Height', 'height'), ('Depth', 'depth'), ('Levels', 'levels'), ('Format', 'format'), ('Samples', 'samples'), ('Flags', 'flags'), ('Stride', 'stride'), ('MemoryPool', 'pool'), ('MemoryOffset', 'off')):
++    IMPL[f'nvnTextureBuilderGet{_name}'] = (lambda k: lambda n, r: ret(r, n.get(r[0]).get(k, 0)))(_key)
++@nvn('nvnTextureInitialize')
++def _(n, r):
++    b = n.get(r[1])
++    d = desc_of(b)
++    n.o[r[0]] = Obj(kind='texture', w=max(1, d.width), h=max(1, d.height) if d.target != 0 else 1, d=d, pool=b.get('pool', 0), off=b.get('off', 0), flags=d.flags)
++    ret(r, 1)
++@nvn('nvnTextureFinalize')
++def _(n, r): n.o.pop(r[0], None)
++for _name, _get in (('Width', lambda t: t['d'].width), ('Height', lambda t: t['d'].height), ('Depth', lambda t: t['d'].depth), ('Levels', lambda t: t['d'].levels), ('Samples', lambda t: t['d'].samples),
++                    ('Format', lambda t: t['d'].format), ('Target', lambda t: t['d'].target), ('Flags', lambda t: t['d'].flags), ('Stride', lambda t: t['d'].stride),
++                    ('StorageSize', lambda t: nvn_layout.layout(t['d']).size), ('MemoryPool', lambda t: t['pool']), ('MemoryOffset', lambda t: t['off'])):
++    IMPL[f'nvnTextureGet{_name}'] = (lambda g: lambda n, r: ret(r, g(n.get(r[0])) if 'd' in n.get(r[0]) else 0))(_get)
++@nvn('nvnTextureGetTextureAddress')
++def _(n, r): t = n.get(r[0]); ret(r, (n.pool_addr(t.get('pool', 0), t.get('off', 0)) if t else 0))
++@nvn('nvnTextureGetZCullStorageSize')
++def _(n, r): ret(r, 0)
++
++
++# ---- sync, events ----
++@nvn('nvnSyncInitialize')
++def _(n, r): n.o[r[0]] = Obj(kind='sync', fenced=False); ret(r, 1)
++@nvn('nvnSyncFinalize')
++def _(n, r): n.o.pop(r[0], None)
++@nvn('nvnQueueFenceSync')
++def _(n, r): n.get(r[1])['fenced'] = True
++@nvn('nvnQueueWaitSync')
++def _(n, r): ret(r, 1)
++@nvn('nvnSyncWait')
++def _(n, r): ret(r, SYNC_ALREADY_SIGNALED if n.get(r[0]).get('fenced') else SYNC_TIMEOUT)
++@nvn('nvnEventBuilderSetDefaults')
++def _(n, r): n.o[r[0]] = Obj()
++@nvn('nvnEventBuilderSetStorage')
++def _(n, r): n.get(r[0]).update(pool=r[1], off=r[2])
++@nvn('nvnEventInitialize')
++def _(n, r): n.o[r[0]] = Obj(kind='event', pool=n.get(r[1]).get('pool', 0), off=n.get(r[1]).get('off', 0)); ret(r, 1)
++@nvn('nvnEventFinalize')
++def _(n, r): n.o.pop(r[0], None)
++@nvn('nvnEventGetValue')
++def _(n, r): e = n.get(r[0]); ret(r, n.hz.rd32(n.pool_addr(e.get('pool', 0), e.get('off', 0))))
++@nvn('nvnEventSignal')
++def _(n, r): n.signal_event(r[0], r[1] & M32, r[2] & M32)
++
++
++# ---- queue ----
++@nvn('nvnQueueBuilderSetDefaults')
++def _(n, r): n.o[r[0]] = Obj(cmd=0x40000, comp=0x40000, ctl=0x40000)
++@nvn('nvnQueueBuilderSetCommandMemorySize')
++def _(n, r): n.get(r[0])['cmd'] = r[1]
++@nvn('nvnQueueBuilderSetComputeMemorySize')
++def _(n, r): n.get(r[0])['comp'] = r[1]
++@nvn('nvnQueueBuilderSetControlMemorySize')
++def _(n, r): n.get(r[0])['ctl'] = r[1]
++@nvn('nvnQueueBuilderGetQueueMemorySize')
++def _(n, r): b = n.get(r[0]); ret(r, (b.get('cmd', 0) + b.get('comp', 0) + b.get('ctl', 0) + 4095) & ~4095)
++@nvn('nvnQueueInitialize')
++def _(n, r): n.o[r[0]] = Obj(kind='queue'); ret(r, 1)
++@nvn('nvnQueueFinalize')
++def _(n, r): n.o.pop(r[0], None)
++@nvn('nvnQueueGetError')
++def _(n, r): ret(r, 0)
++@nvn('nvnQueueFlush')
++def _(n, r): pass
++@nvn('nvnQueueFinish')
++def _(n, r): pass
++@nvn('nvnQueueSubmitCommands')
++def _(n, r):
++    count = r[1] & M32
++    handles = struct.unpack(f'<{count}Q', n.hz.rd(r[2], 8 * count)) if count else ()
++    n.stats['submits'] += 1
++    state = {}
++    for h in handles: n.replay(n.cmdlists.get(h, []), state)
++
++
++# ---- command buffers: recorded in Python, replayed at submit ----
++@nvn('nvnCommandBufferInitialize')
++def _(n, r): n.o[r[0]] = Obj(kind='cmd', cmds=[], recording=False); ret(r, 1)
++@nvn('nvnCommandBufferFinalize')
++def _(n, r): n.o.pop(r[0], None)
++@nvn('nvnCommandBufferSetMemoryCallback')
++def _(n, r): pass
++@nvn('nvnCommandBufferSetMemoryCallbackData')
++def _(n, r): pass
++@nvn('nvnCommandBufferAddCommandMemory')
++def _(n, r): pass
++@nvn('nvnCommandBufferAddControlMemory')
++def _(n, r): pass
++@nvn('nvnCommandBufferBeginRecording')
++def _(n, r): c = n.get(r[0]); c['cmds'] = []; c['recording'] = True
++@nvn('nvnCommandBufferEndRecording')
++def _(n, r):
++    c = n.get(r[0]); c['recording'] = False
++    h = n.new_handle(); n.cmdlists[h] = c['cmds']; c['cmds'] = []
++    ret(r, h)
++@nvn('nvnCommandBufferIsRecording')
++def _(n, r): ret(r, int(bool(n.get(r[0]).get('recording'))))
++@nvn('nvnCommandBufferCopyCommands')
++def _(n, r): c = n.get(r[0]); k = r[1] & M32; c.setdefault('cmds', []).append(('call', struct.unpack(f'<{k}Q', n.hz.rd(r[2], 8 * k)) if k else ()))
++IMPL['nvnCommandBufferCallCommands'] = IMPL['nvnCommandBufferCopyCommands']
++@nvn('nvnCommandBufferSetRenderTargets')
++def _(n, r):
++    k = r[1] & M32
++    n.get(r[0]).setdefault('cmds', []).append(('targets', list(struct.unpack(f'<{k}Q', n.hz.rd(r[2], 8 * k))) if k else []))
++@nvn('nvnCommandBufferClearColor')
++def _(n, r): n.get(r[0]).setdefault('cmds', []).append(('clear', r[1] & M32, struct.unpack('<4f', n.hz.rd(r[2], 16)), r[3] & M32))
++@nvn('nvnCommandBufferClearTexture')
++def _(n, r): n.get(r[0]).setdefault('cmds', []).append(('cleartex', r[1], struct.unpack('<4f', n.hz.rd(r[4], 16)), r[5] & M32))
++@nvn('nvnCommandBufferSignalEvent')
++def _(n, r): n.get(r[0]).setdefault('cmds', []).append(('signal', r[1], r[2] & M32, r[5] & M32))
++@nvn('nvnCommandBufferFenceSync')
++def _(n, r): n.get(r[1])['fenced'] = True
++for _name in ('DrawArrays', 'DrawArraysInstanced', 'DrawArraysIndirect', 'DrawElements', 'DrawElementsBaseVertex', 'DrawElementsInstanced', 'DrawElementsIndirect', 'DrawTexture'):
++    IMPL[f'nvnCommandBuffer{_name}'] = lambda n, r: n.get(r[0]).setdefault('cmds', []).append(('draw',))
++for _name in ('CopyBufferToTexture', 'CopyTextureToBuffer', 'CopyTextureToTexture', 'CopyBufferToBuffer'):
++    IMPL[f'nvnCommandBuffer{_name}'] = lambda n, r: n.get(r[0]).setdefault('cmds', []).append(('copy',))
++
++
++# ---- window ----
++@nvn('nvnWindowBuilderSetDefaults')
++def _(n, r): n.o[r[0]] = Obj(textures=[])
++@nvn('nvnWindowBuilderSetTextures')
++def _(n, r): k = r[1] & M32; n.get(r[0])['textures'] = list(struct.unpack(f'<{k}Q', n.hz.rd(r[2], 8 * k))) if k else []
++@nvn('nvnWindowBuilderSetNumActiveTextures')
++def _(n, r): n.get(r[0])['active'] = r[1] & M32
++@nvn('nvnWindowInitialize')
++def _(n, r): b = n.get(r[1]); n.o[r[0]] = Obj(kind='window', textures=list(b.get('textures', [])), next=0); ret(r, 1)
++@nvn('nvnWindowFinalize')
++def _(n, r): n.o.pop(r[0], None)
++@nvn('nvnWindowAcquireTexture')
++def _(n, r):
++    w = n.get(r[0]); k = len(w.get('textures', []))
++    idx = w['next'] % k if k else 0; w['next'] = w.get('next', 0) + 1
++    n.hz.wr32(r[2], idx)
++    if r[1]: n.get(r[1])['fenced'] = True
++    ret(r, 0)
++@nvn('nvnQueueAcquireTexture')
++def _(n, r): IMPL['nvnWindowAcquireTexture'](n, [r[1], r[2], r[3]]); ret(r, 0)
++@nvn('nvnQueuePresentTexture')
++def _(n, r): n.present(r[1], r[2] & M32)
++@nvn('nvnWindowSetPresentInterval')
++def _(n, r): pass
++@nvn('nvnWindowGetPresentInterval')
++def _(n, r): ret(r, 1)
++
++
++# ---- the entry point the game imports ----
++@hle('nvnBootstrapLoader', 'the NVN graphics API is replaced wholesale with a host device; the SDK\'s NVN driver does not run')
++def bootstrap_loader(hz, r):
++    if not hasattr(hz, 'nvn'):
++        hz.nvn = Nvn(hz); hz.nvn.display_factory = hz.display_factory
++    r[0] = hz.nvn.lookup(hz.cstring(r[0]))
+diff --git a/dm/tools/horizon_oe.py b/dm/tools/horizon_oe.py
+new file mode 100644
+index 0000000..bda57d5
+--- /dev/null
++++ b/dm/tools/horizon_oe.py
+@@ -0,0 +1,115 @@
++"""nn::oe (the applet environment) on the Linux host (NX2Linux S7bis): the Python side of engine/dm/host/hle_oe.c. The recompiled game asks the SDK for the operation mode, focus, language and region;
++the SDK would ask the am/apm/set services, so these functions are replaced with host answers. Settings come from the environment: NX2LINUX_OPMODE (1 docked, the default; 0 handheld), NX2LINUX_LANG (default en-US)."""
++import os, struct
++
++from horizon_overrides import hle
++
++M32 = 0xFFFFFFFF
++
++
++def opmode(): return int(os.environ.get('NX2LINUX_OPMODE', '1'))
++def lang(): return os.environ.get('NX2LINUX_LANG', 'en-US') or 'en-US'
++
++
++class OeState:
++    def __init__(self): self.nosleep, self.inactivity, self.cpu_oc, self.focus = 0, 0, 0, 1
++
++
++def state(hz):
++    if not hasattr(hz, 'oe'): hz.oe = OeState()
++    return hz.oe
++
++
++@hle('_ZN2nn2oe16GetOperationModeEv', 'operation mode query; a fixed value from NX2LINUX_OPMODE (1 docked)')
++def get_opmode(hz, r): r[0] = opmode()
++
++
++@hle('_ZN2nn2oe18GetPerformanceModeEv', 'performance mode query; same as the operation mode')
++def get_perfmode(hz, r): r[0] = opmode()
++
++
++@hle('_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_', 'default display resolution: 1920x1080 docked, 1280x720 handheld')
++def default_resolution(hz, r):
++    con = opmode() == 1
++    if r[0]: hz.wr32(r[0], 1920 if con else 1280)
++    if r[1]: hz.wr32(r[1], 1080 if con else 720)
++
++
++@hle('_ZN2nn2oe27GetPerformanceConfigurationENS0_15PerformanceModeE', 'CPU/GPU clock config (through apm): the default for the mode')
++def perf_config(hz, r): r[0] = 0x00010001 if r[0] & M32 == 1 else 0x00010000
++
++
++@hle('_ZN2nn2oe21IsCpuOverclockEnabledEv', 'CPU overclock state: what SetCpuOverclockEnabled set, off at start')
++def cpu_oc(hz, r): r[0] = state(hz).cpu_oc
++
++
++@hle('_ZN2nn2oe22SetCpuOverclockEnabledEb', 'CPU overclock switch; the host does not scale clocks')
++def set_cpu_oc(hz, r): state(hz).cpu_oc = r[0] & 0xFF
++
++
++@hle('_ZN2nn2oe20GetCurrentFocusStateEv', 'foreground / background state: always in focus')
++def focus_state(hz, r): r[0] = state(hz).focus
++
++
++@hle('_ZN2nn2oe25TryPopNotificationMessageEPj', 'system notification queue: the host has no system notifications')
++def try_pop(hz, r): r[0] = 0
++
++
++@hle('_ZN2nn2oe22PopNotificationMessageEv', 'system notification queue (blocking): nothing ever arrives, the thread waits')
++def pop_blocking(hz, r):
++    with hz.cv:
++        while True: hz.cv.wait()
++
++
++@hle('_ZN2nn2oe18GetDesiredLanguageEv', 'system language query; nn::settings::LanguageCode, 8 bytes in x0')
++def desired_language(hz, r): r[0] = struct.unpack('<Q', lang().encode()[:7].ljust(8, b'\0'))[0]
++
++
++@hle('_ZN2nn2oe13GetRegionCodeEv', 'console region fitting the language: 0 Japan, 1 Americas, 2 Europe, 4 Hong Kong / Taiwan / Korea')
++def region_code(hz, r):
++    e = lang()
++    r[0] = 0 if e.startswith('ja') else 4 if e.startswith(('ko', 'zh')) else 1 if e in ('en-US', 'fr-CA', 'es-419', 'pt-BR') else 2
++
++
++@hle('_ZN2nn2oe17GetPseudoDeviceIdEPNS_4util4UuidE', 'pseudo device ID; a fixed host value')
++def pseudo_device_id(hz, r): hz.wr(r[0], bytes([0x78, 0x62, 0x6c, 0x00, 0x53, 0x57, 0x4e, 0x41, 0x54, 0x49, 0x56, 0x45, 0x31, 0x30, 0x30, 0x31]))
++
++
++@hle('_ZN2nn2oe29BeginAutoSleepDisabledSectionEv', 'open an auto-sleep disabled section; counted for the query')
++def nosleep_begin(hz, r): state(hz).nosleep += 1
++
++
++@hle('_ZN2nn2oe27EndAutoSleepDisabledSectionEv', 'close an auto-sleep disabled section')
++def nosleep_end(hz, r): state(hz).nosleep = max(0, state(hz).nosleep - 1)
++
++
++@hle('_ZN2nn2oe19IsAutoSleepDisabledEv', 'whether an auto-sleep disabled section is open')
++def nosleep_query(hz, r): r[0] = int(state(hz).nosleep > 0)
++
++
++@hle('_ZN2nn2oe23GetPreviousProgramIndexEv', 'previous program index: launched from HOME, -1')
++def previous_program(hz, r): r[0] = M32
++
++
++@hle('_ZN2nn2oe21TryPopLaunchParameterEPmPvm', 'launch parameter: none')
++def pop_launch_param(hz, r):
++    if r[0]: hz.wr64(r[0], 0)
++    r[0] = 0
++
++
++@hle('_ZN2nn6applet23GetAppletResourceUserIdEv', 'applet resource user ID; the host returns a fixed non-zero value')
++def aruid(hz, r): r[0] = 0x80
++
++
++# switches the game sets and the host has nothing to scale, record or notify for
++for _sym, _why in (('_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb', 'operation mode change notification switch'),
++                   ('_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb', 'performance mode change notification switch'),
++                   ('_ZN2nn2oe28SetResumeNotificationEnabledEb', 'resume notification switch'),
++                   ('_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE', 'focus handling mode; the host window is always in focus'),
++                   ('_ZN2nn2oe44SetUserInactivityDetectionTimeExtendedUnsafeEb', 'inactivity extension; the host never turns the screen off'),
++                   ('_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb', 'inactivity extension; the host never turns the screen off'),
++                   ('_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi', 'CPU/GPU clock config; the host does not scale clocks')):
++    hle(_sym, _why)(lambda hz, r: None)
++
++hle('_ZN2nn2oe43GetUserInactivityDetectionTimeExtensionModeEv', 'inactivity extension mode: none')(lambda hz, r: r.__setitem__(0, 0))
++hle('_ZN2nn2oe37IsUserInactivityDetectionTimeExtendedEv', 'whether an inactivity extension is requested: no')(lambda hz, r: r.__setitem__(0, 0))
+diff --git a/dm/tools/horizon_overrides.py b/dm/tools/horizon_overrides.py
+new file mode 100644
+index 0000000..5ec1084
+--- /dev/null
++++ b/dm/tools/horizon_overrides.py
+@@ -0,0 +1,43 @@
++"""SDK functions the host replaces (NX2Linux S7bis): the Python side of the Mach host's HLE_FORCE table (engine/dm/host/hle_*.c). The recompiled game calls the SDK's own code except where a name is listed here:
++that function is not lifted and its calls run `fn(hz, regs)`, which reads x0.. and writes x0 (the result). Each entry says why, as HLE_FORCE does. The list grows with what a game's boot needs, not in bulk."""
++
++OK = 0
++TABLE = {}   # symbol -> (fn(hz, r), why)
++
++
++def hle(symbol, why):
++    def deco(fn):
++        if symbol in TABLE: raise ValueError(f'{symbol} replaced twice')
++        TABLE[symbol] = (fn, why)
++        return fn
++    return deco
++
++
++def noop(symbol, why):
++    """A void function the host has nothing to do for (the real one connects to a Horizon service process)"""
++    return hle(symbol, why)(lambda hz, r: hz.note(f'takeover: {symbol} (no-op)'))
++
++
++def returns(symbol, why, value=0):
++    return hle(symbol, why)(lambda hz, r: r.__setitem__(0, value))
++
++
++# ---- hle_sdkinit.c: the service connections nninitInitializeSdkModule and nnMain make ----
++noop('nndiagStartup', 'connect to the lm log service; the host prints diagnostic logs itself')
++noop('_ZN2nn2oe10InitializeEv', 'connect to the am/oe environment services; environment queries are wired one by one to host defaults')
++noop('_ZN2nn3aoc10InitializeEv', 'add-on content service: no session opened')
++noop('_ZN2nn3err26InitializeContextWriterApiEv', 'connect to the err error context service; the host does not report')
++noop('_ZN2nn2fs24InitializeForApplicationEv', 'connect to the fsp-srv file service; the file interface goes to the host file system and the RomFS')
++noop('_ZN2nn4pctl10InitializeEv', 'connect to the pctl parental controls service; single-player has no parental controls')
++noop('_ZN2nn4diag34InitializeApplicationAbortObserverEv', "register with the system's abort observer; the host prints crashes itself")
++
++
++def install(horizon):
++    """The table as {symbol: fn(regs)} for ModuleSet.build(overrides=...); symbols the loaded modules do not export are left out (the game may not use them)"""
++    import horizon_fs, horizon_account, horizon_oe, horizon_vi, horizon_nvn   # register the nn::fs, nn::account, nn::oe, nn::vi/nv and NVN entries
++    import horizon_trivial
++    for sym, value, why, src in horizon_trivial.TRIVIAL:   # generated from the Mach host: entries that do nothing or return a constant; a hand-written port of the same symbol wins
++        if sym in TABLE: continue
++        TABLE[sym] = ((lambda hz, r: None) if value is None else (lambda hz, r, v=value: r.__setitem__(0, v)), why)
++    exported = set().union(*(m.exports for m in horizon.ms.modules))
++    return {sym: (lambda r, f=fn: f(horizon, r)) for sym, (fn, _) in TABLE.items() if sym in exported}
+diff --git a/dm/tools/horizon_services.py b/dm/tools/horizon_services.py
+index 838c858..fa76382 100644
+--- a/dm/tools/horizon_services.py
++++ b/dm/tools/horizon_services.py
+@@ -14,7 +14,7 @@ class ServiceManager(Service):
+         name = req.raw[:8].rstrip(b'\0').decode('ascii', 'replace')
+         f = self.hz.services.get(name)
+         if f is None:
+-            self.hz.log(f'sm: GetService({name!r}) -> not registered')
++            self.hz.log(f'sm: GetService({name!r}) -> not registered, asked by ' + self.hz.where(self.hz.regs))
+             self.hz.missing_services.add(name)
+             return Response(SM_NOT_REGISTERED)
+         return Response(OK, objects=[Session(f(self.hz))])
+diff --git a/dm/tools/horizon_trivial.py b/dm/tools/horizon_trivial.py
+new file mode 100644
+index 0000000..285e3e4
+--- /dev/null
++++ b/dm/tools/horizon_trivial.py
+@@ -0,0 +1,263 @@
++"""Generated by gen_trivial_overrides.py from the Mach host's HLE_FORCE entries that do nothing or return a constant (engine/dm/host/hle_*.c): 259 of them. Do not edit; port entries with logic by hand."""
++# (symbol, value or None for a void function, reason, source file)
++TRIVIAL = [
++    ('_ZN2nn7account10InitializeEv', None, 'connects to the acc:u0 account service; the host has one fixed local user', 'hle_account.c'),
++    ('_ZN2nn7account13PushOpenUsersEv', None, 'hand the open users to the next program: the host runs only this one', 'hle_account.c'),
++    ('_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE', 674, 'network service account, out of scope; cut: always unavailable', 'hle_account.c'),
++    ('_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE', 674, 'network service account, out of scope; cut', 'hle_account.c'),
++    ('_ZN2nn7account40ShowLicenseRequirementsForNetworkServiceERKNS0_10UserHandleE', 674, 'online membership notice applet, out of scope; cut', 'hle_account.c'),
++    ('_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm', 674, 'cached Nintendo Account info: none linked, fails', 'hle_account.c'),
++    ('_ZN2nn7account12AsyncContextC1Ev', None, 'async context constructor; the host creates no IPC object', 'hle_account.c'),
++    ('_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE', 674, 'network service account token, out of scope; cut', 'hle_account.c'),
++    ('_ZN2nn7account12AsyncContext9GetResultEv', 674, 'async result; networking is cut, always fails', 'hle_account.c'),
++    ('_ZN2nn7account42NintendoAccountAuthorizationRequestContextC1Ev', None, 'Nintendo Account authorization, out of scope; the constructor writes no memory', 'hle_account.c'),
++    ('_ZN2nn7account42NintendoAccountAuthorizationRequestContextD1Ev', None, 'Nintendo Account authorization, out of scope', 'hle_account.c'),
++    ('_ZN2nn7account41CreateNintendoAccountAuthorizationRequestEPNS0_42NintendoAccountAuthorizationRequestContextERKNS0_10UserHandleERKNS0_45NintendoAccountAuthorizationRequestParametersEPvm', 674, 'Nintendo Account authorization, out of scope; cut', 'hle_account.c'),
++    ('_ZN2nn7account42NintendoAccountAuthorizationRequestContext34GetResultWithInteractionIfRequiredEv', 674, 'authorization result; always fails', 'hle_account.c'),
++    ('_ZN2nn7account15ShowUserCreatorEv', 0, 'user creation applet; the host already has its local user', 'hle_account.c'),
++    ('_ZN2nn7account27StoreSaveDataThumbnailImageERKNS0_3UidEPKvm', 0, "save-data thumbnail for the system's data management screen; the host keeps none", 'hle_account.c'),
++    ('_ZN2nn7account28DeleteSaveDataThumbnailImageERKNS0_3UidE', 0, 'save-data thumbnail; the host keeps none', 'hle_account.c'),
++    ('_ZN2nn7account9CloseUserERKNS0_10UserHandleE', None, 'close user; the handle holds no session', 'hle_account.c'),
++    ('_ZN2nn7account12AsyncContext6CancelEv', 0, 'async context cancel; no request', 'hle_account.c'),
++    ('_ZN2nn7account12AsyncContextD1Ev', None, 'async context destructor; no session to close', 'hle_account.c'),
++    ('_ZN2nn5audio12ListAudioInsEPNS0_11AudioInInfoEi', 0, 'audio input device list; the host has no microphone: 0 entries', 'hle_audio.c'),
++    ('_ZN2nn5audio12StartAudioInEPNS0_7AudioInE', 674, 'start recording; never opened on the host: fails', 'hle_audio.c'),
++    ('_ZN2nn5audio11StopAudioInEPNS0_7AudioInE', None, 'stop recording; never opened on the host', 'hle_audio.c'),
++    ('_ZN2nn5audio12CloseAudioInEPNS0_7AudioInE', None, 'close the audio input; never opened on the host', 'hle_audio.c'),
++    ('_ZN2nn5audio19AppendAudioInBufferEPNS0_7AudioInEPNS0_13AudioInBufferE', 0, 'append a recording buffer; never opened on the host: refused', 'hle_audio.c'),
++    ('_ZN2nn5audio22GetAudioInChannelCountEPKNS0_7AudioInE', 2, 'recording channel count', 'hle_audio.c'),
++    ('_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv', 2, 'output channel count: 2', 'hle_audren.c'),
++    ('_ZN2nn5audio21GetActiveChannelCountEv', 2, 'output channel count (SDK 7 name): 2', 'hle_audren.c'),
++    ('_ZN2nn5codec47GetHardwareOpusMultiStreamDecoderProcessingTimeEPKNS0_34HardwareOpusMultiStreamDecoderTypeE', 0, 'hwopus service; no hardware decode time', 'hle_codec.c'),
++    ('_ZN2nn7friends10InitializeEv', None, 'connects to the friends service (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends12AsyncContextC1Ev', None, 'async context creates no session (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends12AsyncContextD1Ev', None, 'async context has no session to close (cut)', 'hle_friends.c'),
++    ('_ZNK2nn7friends12AsyncContext9GetResultEv', 674, 'async result always fails (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends14GetProfileListEPNS0_12AsyncContextEPNS0_7ProfileERKNS_7account3UidEPKNS5_23NetworkServiceAccountIdEi', 674, 'profile query fails (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends16UpdateFriendInfoEPNS0_6FriendERKNS_7account3UidEPKNS3_23NetworkServiceAccountIdEi', 674, 'friend info update fails (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends14AddPlayHistoryERKNS0_26PlayHistoryRegistrationKeyERKNS0_15InAppScreenNameES6_', 674, 'play history is not registered (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends29GetPlayHistoryRegistrationKeyEPNS0_26PlayHistoryRegistrationKeyERKNS_7account3UidEb', 674, 'play history key unavailable (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends17NotificationQueueC1Ev', None, 'notification queue creates no session (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends17NotificationQueueD1Ev', None, 'notification queue has no session to close (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE', 674, 'notification queue init fails (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends17NotificationQueue3PopEPNS0_16NotificationInfoE', 674, 'notification queue is always empty (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends38TryPopFriendInvitationNotificationInfoEPNS_7account3UidEPmPvm', 0, 'no invitations (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends21StartFriendInvitationERKNS_7account3UidEiRKNS0_35FriendInvitationGameModeDescriptionEPKvm', 674, 'invitations unavailable (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends28StartSendingFriendInvitationERKNS_7account3UidEPKNS1_23NetworkServiceAccountIdEiRKNS0_35FriendInvitationGameModeDescriptionEPKvm', 674, 'invitations unavailable (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends18ShowUserDetailInfoERKNS_7account3UidERKNS1_23NetworkServiceAccountIdERKNS0_15InAppScreenNameESA_', 674, 'friend detail applet (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends14ShowFriendListERKNS_7account3UidE', 674, 'friend list applet (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends19ShowBlockedUserListERKNS_7account3UidE', 674, 'blocked user list applet (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends29ShowReceivedFriendRequestListERKNS_7account3UidE', 674, 'received friend request applet (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends23StartFacedFriendRequestERKNS_7account3UidE', 674, 'in-person friend request applet (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends25StartSendingFriendRequestERKNS_7account3UidERKNS1_23NetworkServiceAccountIdERKNS0_15InAppScreenNameESA_', 674, 'send friend request applet (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends33ShowMethodsOfSendingFriendRequestERKNS_7account3UidE', 674, 'send friend request applet (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends28DeclareOpenOnlinePlaySessionERKNS_7account3UidE', 674, 'online play session unavailable (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends29DeclareCloseOnlinePlaySessionERKNS_7account3UidE', 674, 'online play session unavailable (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends12UserPresence10InitializeERKNS_7account3UidE', 674, 'presence unavailable (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends12UserPresence14SetDescriptionEPKc', 674, 'presence unavailable (cut)', 'hle_friends.c'),
++    ('_ZN2nn7friends12UserPresence6CommitEv', 674, 'presence unavailable (cut)', 'hle_friends.c'),
++    ('_ZN2nn2fs20OpenCacheStorageListEPNS0_22CacheStorageListHandleE', 0, 'fsp-srv; cache storage list: reports none', 'hle_fs.c'),
++    ('_ZN2nn2fs21CloseCacheStorageListENS0_22CacheStorageListHandleE', None, 'fsp-srv; cache storage list', 'hle_fs.c'),
++    ('_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE', 0, 'fsp-srv; the save directory is created at mount time', 'hle_fs.c'),
++    ('_ZN2nn2fs7UnmountEPKc', None, 'fsp-srv; the mount table is permanent, unmounting is a no-op', 'hle_fs.c'),
++    ('_ZN2nn2fs9FlushFileENS0_10FileHandleE', 0, 'fsp-srv; host writes are already in the page cache, flushing is a no-op', 'hle_fs.c'),
++    ('_ZN2nn2fs25EnableGlobalFileDataCacheEPvm', None, 'fsp-srv global read cache; unused by the host', 'hle_fs.c'),
++    ('_ZN2nn2fs29EnableIndividualFileDataCacheEPKcPvm', 0, 'fsp-srv read cache for one file; unused by the host', 'hle_fs.c'),
++    ('_ZN2nn2fs30DisableIndividualFileDataCacheEPKc', None, 'fsp-srv read cache for one file; unused by the host', 'hle_fs.c'),
++    ('_ZN2nn2fs26DisableGlobalFileDataCacheEv', None, "fsp-srv global read cache; unused by the host (DRAGON QUEST XI S's nninitStartup turns it off again after its start-up thread)", 'hle_fs.c'),
++    ('_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE', 1, 'fsp-srv; save data always exists (returns bool)', 'hle_fs.c'),
++    ('_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE', None, 'fsp-srv; file read priority, ignored by the host', 'hle_fs.c'),
++    ('_ZN2nn2fs6detail18IsEnabledAccessLogEj', 0, 'fsp-srv; access log always off (returns bool)', 'hle_fs.c'),
++    ('_ZN2nn2fs6detail18IsEnabledAccessLogEv', 0, 'fsp-srv; access log always off (returns bool)', 'hle_fs.c'),
++    ('_ZN2nn3hid14InitializeNpadEv', None, 'connect to the hid service; the host takes input from the front-end state', 'hle_hid.c'),
++    ('_ZN2nn3hid14DisconnectNpadERKj', None, 'disconnect a controller; ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid20GetNpadJoyAssignmentERKj', 0, 'Joy-Con assignment: dual', 'hle_hid.c'),
++    ('_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj', None, 'Joy-Con single assignment; ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid18SwapNpadAssignmentERKjS2_', None, 'swap controller ids; ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid21StartLrAssignmentModeEv', None, 'L/R assignment mode; ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid20StopLrAssignmentModeEv', None, 'L/R assignment mode; ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE', None, 'six-axis sensor; always sampling on the host', 'hle_hid.c'),
++    ('_ZN2nn3hid15InitializeMouseEv', None, 'mouse; not provided by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi', 0, 'mouse states: 0 entries', 'hle_hid.c'),
++    ('_ZN2nn3hid18InitializeKeyboardEv', None, 'keyboard; not provided by the host', 'hle_hid.c'),
++    ('_ZN2nn3kpr13GetKeyCodeMapEPNS0_10KeyCodeMapE', None, "keyboard layout key code map: none (no keyboard; the caller's map is left as it is)", 'hle_hid.c'),
++    ('_ZN2nn3hid28SetNpadJoyAssignmentModeDualERKj', None, 'Joy-Con dual assignment; ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKjNS0_17NpadJoyDeviceTypeE', None, 'Joy-Con single assignment (left or right given); ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid30SetNpadJoyAssignmentModeSingleEPjRKjNS0_17NpadJoyDeviceTypeE', 0, 'Joy-Con single assignment (returning the other half); ignored by the host, there is no other half', 'hle_hid.c'),
++    ('_ZN2nn3hid23MergeSingleJoyAsDualJoyERKjS2_', 0, 'merge single Joy-Cons; ignored by the host, reports success', 'hle_hid.c'),
++    ('_ZN2nn3hid24ShowControllerStrapGuideEv', 0, 'strap guide applet; not shown by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid28ShowControllerFirmwareUpdateERKNS0_27ControllerFirmwareUpdateArgE', 0, 'controller firmware update applet; not shown by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid21InitializeTouchScreenEv', None, 'connect to the hid touch screen; the host takes touch points from the front end', 'hle_hid.c'),
++    ('_ZN2nn3hid21InitializeTouchScreenEii', None, 'connect to the hid touch screen (SDK 18 two-argument version); the host takes touch points from the front end', 'hle_hid.c'),
++    ('_ZN2nn3hid17InitializeGestureEv', None, 'connect to the hid gesture recognizer; the host recognizes gestures from the touch points', 'hle_hid.c'),
++    ('_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE', None, 'six-axis sensor; always sampling on the host', 'hle_hid.c'),
++    ('_ZN2nn3hid28InitializeSevenSixAxisSensorEPvm', 0, 'console six-axis sensor initialization; not provided by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid26FinalizeSevenSixAxisSensorEv', 0, 'console six-axis sensor', 'hle_hid.c'),
++    ('_ZN2nn3hid23StartSevenSixAxisSensorEv', 0, 'console six-axis sensor; not provided by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid22StopSevenSixAxisSensorEv', 0, 'console six-axis sensor', 'hle_hid.c'),
++    ('_ZN2nn3hid32ResetSevenSixAxisSensorTimestampEv', None, 'console six-axis sensor timestamp', 'hle_hid.c'),
++    ('_ZN2nn3hid27GetSevenSixAxisSensorStatesEPNS0_23SevenSixAxisSensorStateEi', 0, 'console six-axis sensor states: 0 entries', 'hle_hid.c'),
++    ('_ZN2nn3hid26IsSevenSixAxisSensorAtRestEv', 1, 'console six-axis sensor at rest: yes (Super Mario Odyssey)', 'hle_hid.c'),
++    ('_ZN2nn3hid18InitializeDebugPadEv', None, 'debug pad; the host has none', 'hle_hid.c'),
++    ('_ZN2nn3hid25EnableSixAxisSensorFusionERKNS0_19SixAxisSensorHandleEb', None, 'six-axis sensor fusion; ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid28IsSixAxisSensorFusionEnabledERKNS0_19SixAxisSensorHandleE', 0, 'six-axis sensor fusion: off', 'hle_hid.c'),
++    ('_ZN2nn3hid25GetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleE', 1, 'gyroscope zero-drift mode: standard', 'hle_hid.c'),
++    ('_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE', None, 'gyroscope zero-drift mode; ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid32SetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleEff', None, 'six-axis sensor fusion parameters; ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid34ResetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleE', None, 'six-axis sensor fusion parameters; ignored by the host', 'hle_hid.c'),
++    ('_ZN2nn3hid41IsFirmwareUpdateAvailableForSixAxisSensorERKNS0_19SixAxisSensorHandleE', 0, 'six-axis sensor firmware update: none', 'hle_hid.c'),
++    ('_ZN2nn3hid17SetPalmaBoostModeEb', None, 'Poké Ball Plus boost mode; the host has no Poké Ball Plus', 'hle_hid.c'),
++    ('_ZN2nn3hid24EnableAnyPalmaConnectionEv', 0, 'Poké Ball Plus pairing; the host has none', 'hle_hid.c'),
++    ('_ZN2nn3hid25DisableAnyPalmaConnectionEv', 0, 'Poké Ball Plus pairing; the host has none', 'hle_hid.c'),
++    ('_ZN2nn3mii8Database8FinalizeEv', None, 'mii:u service; nothing to release', 'hle_mii.c'),
++    ('_ZNK2nn3mii8Database11IsAvailableEv', 1, 'mii:u service; always available', 'hle_mii.c'),
++    ('_ZN2nn3mii8Database9IsUpdatedEi', 0, 'mii:u service; the empty database never changes', 'hle_mii.c'),
++    ('_ZNK2nn3mii8Database14IsFullDatabaseEv', 0, 'mii:u service; empty, so not full', 'hle_mii.c'),
++    ('_ZN2nn3mii8Database6FormatEv', 0, 'mii:u service; the database is already empty', 'hle_mii.c'),
++    ('_ZN2nn2ec33InitializeForShopServiceAccessorsEPvm', 0, "shop service accessors' library init (ec service); offline, nothing to set up", 'hle_misc.c'),
++    ('_ZN2nn2ec19ShopServiceAccessorC1Ev', None, 'shop service accessor: no session (cut)', 'hle_misc.c'),
++    ('_ZN2nn2ec19ShopServiceAccessorD1Ev', None, 'shop service accessor: no session to close (cut)', 'hle_misc.c'),
++    ('_ZN2nn2ec19ShopServiceAccessor10InitializeERKNS0_11ShopServiceE', 674, 'shop service accessor: the shop is unavailable offline (cut)', 'hle_misc.c'),
++    ('_ZN2nn2ec19ShopServiceAccessor7RequestEPNS1_13AsyncResponseERKNS_7account3UidENS0_11ShopService6MethodEPKcRKNS1_8PostDataENS_8TimeSpanE', 674, 'shop request: never sent (cut)', 'hle_misc.c'),
++    ('_ZN2nn2ec19ShopServiceAccessor13AsyncResponseC1Ev', None, 'shop async response: no request (cut)', 'hle_misc.c'),
++    ('_ZN2nn2ec19ShopServiceAccessor13AsyncResponseD1Ev', None, 'shop async response: nothing to detach (cut)', 'hle_misc.c'),
++    ('_ZN2nn2ec19ShopServiceAccessor13AsyncResponse7TryWaitEv', 1, 'shop async response: complete at once (cut)', 'hle_misc.c'),
++    ('_ZN2nn2ec19ShopServiceAccessor13AsyncResponse3GetEPvm', 674, 'shop async response: no data (cut)', 'hle_misc.c'),
++    ('_ZN2nn2ec31FinalizeForShopServiceAccessorsEv', None, "shop service accessors' library finalize: nothing was set up", 'hle_misc.c'),
++    ('_ZN2nn2ec19ShopServiceAccessor13AsyncResponse6CancelEv', None, 'shop async response: nothing to cancel (cut)', 'hle_misc.c'),
++    ('_ZNK2nn2ec19ShopServiceAccessor13AsyncResponse12GetErrorCodeEv', 0, 'shop async response: no error code (cut)', 'hle_misc.c'),
++    ('_ZN2nn3ngc15ProfanityFilterD1Ev', None, 'profanity filter', 'hle_misc.c'),
++    ('_ZN2nn3ngc15ProfanityFilter10InitializeEPvm', 0, 'profanity filter init; the host has no word list', 'hle_misc.c'),
++    ('_ZN2nn3ngc15ProfanityFilter17GetContentVersionEv', 0, 'word list version; the host returns 0', 'hle_misc.c'),
++    ('_ZN2nn3ngc15ProfanityFilter11SetMaskModeENS1_8MaskModeE', None, 'profanity mask mode; nothing is masked whatever the mode', 'hle_misc.c'),
++    ('_ZN2nn3ngc15ProfanityFilter8FinalizeEv', None, 'profanity filter shutdown; the host mounted no word list', 'hle_misc.c'),
++    ('_ZN2nn3nsd7ResolveEPNS0_4FqdnERKS1_', 674, 'server name resolution, networking out of scope; cut', 'hle_misc.c'),
++    ('_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_', 674, 'server name resolution, networking out of scope; cut', 'hle_misc.c'),
++    ('_ZN2nn4pctl32CheckFreeCommunicationPermissionEb', 0, 'parental controls · permission to communicate with others, networking out of scope; never, no system UI', 'hle_misc.c'),
++    ('_ZN2nn4pctl25TryBeginFreeCommunicationEb', 0, 'parental controls · communication with others, networking out of scope; never allowed', 'hle_misc.c'),
++    ('_ZN2nn4pctl26GetStereoVisionRestrictionEv', 0, 'parental controls · 3D view restriction; never restricted', 'hle_misc.c'),
++    ('_ZN2nn4pctl26SetStereoVisionRestrictionEb', None, 'parental controls · 3D view restriction; the host does not store it', 'hle_misc.c'),
++    ('_ZN2nn4pctl42ConfirmStereoVisionRestrictionConfigurableEv', 0, 'parental controls · whether the 3D view restriction can be changed; yes', 'hle_misc.c'),
++    ('_ZN2nn4pctl53RequestStereoVisionRestrictionConfigurationPermissionEv', 0, 'parental controls · permission to change the 3D restriction; granted at once', 'hle_misc.c'),
++    ('_ZN2nn4pctl20EndFreeCommunicationEv', None, 'parental controls · communication with others', 'hle_misc.c'),
++    ('_ZN2nn4pctl28IsFreeCommunicationAvailableEv', 0, 'parental controls · whether communication with others is available, networking out of scope; never', 'hle_misc.c'),
++    ('_ZN2nn4pctl27CheckStereoVisionPermissionEb', 0, 'parental controls · stereoscopic 3D permission; the host has no VR display, not permitted', 'hle_misc.c'),
++    ('_ZN5movie7Decoder12GetLastErrorEv', 0, 'movie decoder: last error (none)', 'hle_movie.c'),
++    ('_ZN2nn6socket10InitializeERKNS0_6ConfigE', 0, 'connects to the bsd socket service; offline, creates no session (cut)', 'hle_net.c'),
++    ('_ZN2nn4nifm10InitializeEv', 0, 'connects to the nifm network management service; offline (cut)', 'hle_net.c'),
++    ('_ZN2nn4nifm18IsNetworkAvailableEv', 0, 'offline: the network is always unavailable', 'hle_net.c'),
++    ('_ZN2nn4nifm31HandleNetworkRequestErrorResultEv', 0, 'offline: not resolved, shows no system network screen', 'hle_net.c'),
++    ('_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE', 674, 'offline: no proxy setting', 'hle_net.c'),
++    ('nnsslInitialize', 0, "connects to the ssl service; the network library's global init needs it to succeed, offline creates no session (cut)", 'hle_net.c'),
++    ('nnsslFinalize', 0, 'pairs with nnsslInitialize (cut)', 'hle_net.c'),
++    ('_ZN2nn6socket12FreeAddrInfoEPNS0_8AddrInfoE', None, 'pairs with GetAddrInfo (cut)', 'hle_net.c'),
++    ('_ZN2nn3ssl10InitializeEv', 0, 'same as nnsslInitialize: succeeds, creates no session (cut)', 'hle_net.c'),
++    ('_ZN2nn3ssl8FinalizeEv', 0, 'pairs with Initialize (cut)', 'hle_net.c'),
++    ('NvOsDrvClose', None, 'nvdrv close device; nothing to do', 'hle_nvdrv.c'),
++    ('_ZN2nn2oe17FinishStartupLogoEv', None, 'dismiss the system boot screen (through the am application proxy); the host has no boot screen', 'hle_oe.c'),
++    ('_ZN2nn2oe15EnableRecordingEv', None, 'video recording switch; the host has no system recording', 'hle_oe.c'),
++    ('_ZN2nn6applet23GetAppletResourceUserIdEv', 128, 'applet resource user ID; the host returns a fixed non-zero value', 'hle_oe.c'),
++    ('_ZN2nn2oe16DisableRecordingEv', None, 'video recording switch; the host has no system recording', 'hle_oe.c'),
++    ('_ZN2nn2oe13MuteRecordingEv', None, 'mute the sound of system video recording; the host has no system recording', 'hle_oe.c'),
++    ('_ZN2nn2oe15UnmuteRecordingEv', None, 'unmute the sound of system video recording; the host has no system recording', 'hle_oe.c'),
++    ('_ZN2nn2oe16EnableScreenShotEv', None, 'screenshot switch; the host has no system screenshot', 'hle_oe.c'),
++    ('_ZN2nn2oe17DisableScreenShotEv', None, 'screenshot switch; the host has no system screenshot', 'hle_oe.c'),
++    ('_ZN2nn2oe23BeginBlockingHomeButtonEv', None, 'temporarily block the HOME button (through am); the host has no HOME button', 'hle_oe.c'),
++    ('_ZN2nn2oe21EndBlockingHomeButtonEv', None, 'restore the HOME button (through am)', 'hle_oe.c'),
++    ('_ZN2nn2oe29SetScreenShotImageOrientationENS_5album16ImageOrientationE', None, 'screenshot orientation (through am); the host has no system screenshot', 'hle_oe.c'),
++    ('_ZN2nn2oe30InitializeCopyrightFrameBufferEPvm', None, 'copyright overlay buffer (for screenshots / recording, through am); the host has no system screenshot', 'hle_oe.c'),
++    ('_ZN2nn2oe17SetCopyrightImageEPKvmiiiiNS0_16WindowOriginModeE', None, 'copyright overlay image; the host has no system screenshot', 'hle_oe.c'),
++    ('_ZN2nn2oe22SetCopyrightVisibilityEb', None, 'copyright overlay visibility; the host has no system screenshot', 'hle_oe.c'),
++    ('_ZN2nn2oe40SendServerMaintenanceOverlayNotificationENS_4time9PosixTimeES2_', None, 'server maintenance overlay (through am); the host has no system overlay', 'hle_oe.c'),
++    ('_ZN2nn2oe24SetAlbumImageOrientationENS_5album16ImageOrientationE', None, 'screenshot orientation (through am); the host has no system screenshot', 'hle_oe.c'),
++    ('_ZN2nn2oe34DisableAlbumImageTakenNotificationEv', None, 'screenshot-taken notifications (through am); the host takes no system screenshots', 'hle_oe.c'),
++    ('_ZN2nn2oe33EnableAlbumImageTakenNotificationEv', None, 'screenshot-taken notifications (through am); the host takes no system screenshots', 'hle_oe.c'),
++    ('_ZN2nn2oe24IsInStoreDemoModeEnabledEv', 0, 'retail store demo mode (through am); never', 'hle_oe.c'),
++    ('_ZN2nn2oe28SetResumeNotificationEnabledEb', None, 'resume notification switch; the host expresses resume as focus notification 15', 'hle_oe.c'),
++    ('_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE', 0, 'telemetry report save (user); nothing is sent, reports success', 'hle_offline.c'),
++    ('_ZN2nn5prepo10PlayReport4SaveEv', 0, 'telemetry report save; nothing is sent, reports success', 'hle_offline.c'),
++    ('_ZN2nn5prepo10InitializeEv', 0, 'telemetry init: the original connects to the prepo service (through sm), the host has no service process; no-op (Engage calls it explicitly)', 'hle_offline.c'),
++    ('_ZN2nn5prepo12AddSessionIdEPNS0_10PlayReportEPKc', 0, 'telemetry session ID: no service connection, nothing added, reports success', 'hle_offline.c'),
++    ('_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_', 0, 'telemetry internet connection status: no service connection, nothing added, reports success', 'hle_offline.c'),
++    ('_ZN2nn5prepo28RequestImmediateTransmissionEv', 0, 'telemetry immediate upload; nothing is sent, reports success', 'hle_offline.c'),
++    ('_ZN2nn3ldn10InitializeEv', 674, 'local wireless (cut): initialization fails', 'hle_offline.c'),
++    ('_ZN2nn3ldn8FinalizeEv', None, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn8GetStateEv', 0, 'local wireless (cut): state 0 (none)', 'hle_offline.c'),
++    ('_ZN2nn3ldn11OpenStationEv', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn12CloseStationEv', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn15OpenAccessPointEv', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn16CloseAccessPointEv', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn10DisconnectEv', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn14DestroyNetworkEv', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn14GetNetworkInfoEPNS0_11NetworkInfoE', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn20GetSecurityParameterEPNS0_17SecurityParameterE', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn16SetAdvertiseDataEPKvm', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn19GetDisconnectReasonEv', 0, 'local wireless (cut): 0', 'hle_offline.c'),
++    ('_ZN2nn3ldn20AddAcceptFilterEntryENS0_10MacAddressE', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn22SetStationAcceptPolicyENS0_12AcceptPolicyE', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn6RejectENS0_11Ipv4AddressE', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ldn16GetNetworkConfigEPNS0_13NetworkConfigE', 674, 'local wireless (cut)', 'hle_offline.c'),
++    ('_ZN2nn6socket10InitializeEPvmmi', 0, 'connects to the bsd socket service; offline, creates no session (cut)', 'hle_offline.c'),
++    ('_ZN2nn6socket8FinalizeEv', 0, 'pairs with Initialize (cut)', 'hle_offline.c'),
++    ('_ZN2nn6socket12FreeAddrInfoEP8addrinfo', None, 'pairs with GetAddrInfo (cut)', 'hle_offline.c'),
++    ('_ZN2nn8irsensor10InitializeERKNS0_14IrCameraHandleE', None, 'IR camera (cut): nothing to initialize', 'hle_offline.c'),
++    ('_ZN2nn8irsensor8FinalizeERKNS0_14IrCameraHandleE', None, 'IR camera (cut)', 'hle_offline.c'),
++    ('_ZN2nn8irsensor18StopImageProcessorERKNS0_14IrCameraHandleE', None, 'IR camera (cut)', 'hle_offline.c'),
++    ('_ZN2nn8irsensor18RunMomentProcessorERKNS0_14IrCameraHandleERKNS0_21MomentProcessorConfigE', 674, 'IR camera (cut)', 'hle_offline.c'),
++    ('_ZN2nn8irsensor22RunClusteringProcessorERKNS0_14IrCameraHandleERKNS0_25ClusteringProcessorConfigE', 674, 'IR camera (cut)', 'hle_offline.c'),
++    ('_ZN2nn8irsensor15RunHandAnalysisERKNS0_14IrCameraHandleERKNS0_18HandAnalysisConfigE', 674, 'IR camera (cut)', 'hle_offline.c'),
++    ('_ZN2nn8irsensor25RunImageTransferProcessorERKNS0_14IrCameraHandleERKNS0_28ImageTransferProcessorConfigEPvm', 674, 'IR camera (cut)', 'hle_offline.c'),
++    ('_ZN2nn8irsensor25RunImageTransferProcessorERKNS0_14IrCameraHandleERKNS0_30ImageTransferProcessorExConfigEPvm', 674, 'IR camera (cut)', 'hle_offline.c'),
++    ('_ZN2nn8irsensor30GetImageTransferProcessorStateEPNS0_27ImageTransferProcessorStateEPvmRKNS0_14IrCameraHandleE', 674, 'IR camera (cut)', 'hle_offline.c'),
++    ('_ZN2nn4nifm19SetLocalNetworkModeEb', None, 'offline: the local network mode switch is ignored', 'hle_offline.c'),
++    ('_ZN2nn4nifm27SubmitNetworkRequestAndWaitEv', None, 'offline: the network request is not submitted (returns at once, IsNetworkAvailable is always false)', 'hle_offline.c'),
++    ('_ZN2nn7friends12SetAllocatorEPFPvmEPFvS1_mE', None, 'friends library allocator; no session is created, ignored', 'hle_offline.c'),
++    ('_ZN2nn7friends25EnsureFriendListAvailableEPNS0_12AsyncContextERKNS_7account3UidE', 674, 'friend list (cut): the request fails at once', 'hle_offline.c'),
++    ('_ZN2nn7friends14AddPlayHistoryERKNS_7account3UidERKNS0_26PlayHistoryRegistrationKeyERKNS0_15InAppScreenNameESA_', 674, 'play history is not registered (cut)', 'hle_offline.c'),
++    ('_ZN2nn3ngc15ProfanityFilter10InitializeEPvmb', 0, 'profanity filter init; the host has no word list', 'hle_offline.c'),
++    ('nnsocketFreeAddrInfo', None, 'pairs with GetAddrInfo (cut)', 'hle_offline.c'),
++    ('_ZN2nn4bcat10InitializeEv', None, 'data delivery init (connects to the bcat service); the host has none, no-op', 'hle_offline.c'),
++    ('_ZN2nn4bcat25MountDeliveryCacheStorageEv', 674, 'mount delivery cache: no delivery data, fails', 'hle_offline.c'),
++    ('_ZN2nn4bcat27UnmountDeliveryCacheStorageEv', None, 'unmount delivery cache', 'hle_offline.c'),
++    ('_ZN2nn5album10InitializeEv', None, 'capture album init (capsrv); the host has no album, no-op', 'hle_offline.c'),
++    ('_ZN2nn5album8FinalizeEv', None, 'capture album', 'hle_offline.c'),
++    ('_ZN2nn5album22SaveAndShareScreenshotEPKvmNS0_9ImageSizeENS0_16ImageOrientationENS0_17AlbumReportOptionERKNS_7account3UidEPKc', 674, 'save and share a picture: no album, fails', 'hle_offline.c'),
++    ('_ZN2nn5album22SaveAndShareScreenshotEPNS0_7ShareIdEPKvmNS0_9ImageSizeENS0_17AlbumReportOptionERKNS_7account3UidEPKc', 674, 'save and share a picture: no album, fails', 'hle_offline.c'),
++    ('_ZN2nn5album14ShowAlbumFilesEv', 674, 'album applet: not shown', 'hle_offline.c'),
++    ('_ZN2nn2ro8FinalizeEv', None, 'Initialize opened no ldr:ro session', 'hle_ro.c'),
++    ('_ZN2nn2ro20UnregisterModuleInfoEPNS0_16RegistrationInfoE', None, 'NRRs are not registered', 'hle_ro.c'),
++    ('_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE', None, 'CPU boost mode; the host does not scale clocks', 'hle_sdk16.c'),
++    ('_ZN2nn2oe24SetExpectedVolumeBalanceEff', None, 'volume balance; the host ignores it', 'hle_sdk16.c'),
++    ('_ZN2nn2oe31EnterExitRequestHandlingSectionEv', None, 'exit request critical section; the host exits through SIGTERM / the lifecycle', 'hle_sdk16.c'),
++    ('_ZN2nn2oe31LeaveExitRequestHandlingSectionEv', None, 'exit request critical section; the host ignores it', 'hle_sdk16.c'),
++    ('_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE', 674, 'network clock (offline, unavailable)', 'hle_sdk16.c'),
++    ('_ZN2nn4time8FinalizeEv', 0, 'pairs with Initialize; the host has no session', 'hle_sdk16.c'),
++    ('_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTaskC1Ev', None, 'network clock task constructor; the host opens no session', 'hle_sdk16.c'),
++    ('_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTaskD1Ev', None, 'network clock task destructor; no session to close', 'hle_sdk16.c'),
++    ('_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTask10InitializeENS_2os14EventClearModeE', 0, 'network clock task init (offline)', 'hle_sdk16.c'),
++    ('_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTask9GetResultEv', 674, 'network clock task result: offline, failure', 'hle_sdk16.c'),
++    ('_ZN2nn2pl16IsRunningOnOunceEv', 0, 'running on Switch 2: no', 'hle_sdk16.c'),
++    ('_ZN2nn2pl21RequestSharedFontLoadENS0_14SharedFontTypeE', None, 'request shared font load; the stand-in font is always available, no-op', 'hle_sdk16.c'),
++    ('_ZN2nn2pl8IsVrModeEv', 0, 'VR mode: no', 'hle_sdk16.c'),
++    ('_ZN2nn2pl9EndVrModeEv', None, 'leave VR mode (through am)', 'hle_sdk16.c'),
++    ('_ZN2nn3nfp8GetStateEv', 1, 'amiibo library state: initialized (1)', 'hle_sdk16.c'),
++    ('_ZN2nn3nfp8FinalizeEv', None, 'amiibo library finalize; the host has no session', 'hle_sdk16.c'),
++    ('_ZN2nn4diag12GetBacktraceEPmi', 0, 'backtrace; the host provides none (0 frames)', 'hle_sdk16.c'),
++    ('_ZN2nn2sf4hipc31InitializeHipcServiceResolutionEv', 0, 'service name resolution (connects to sm); the host resolves the names it serves itself', 'hle_sf.c'),
++    ('_ZN2nn2sf4hipc29FinalizeHipcServiceResolutionEv', None, 'service name resolution (sm)', 'hle_sf.c'),
++    ('_ZN2nn5swkbd14InlineKeyboard15SetUserWordInfoERKNS0_12UserWordInfoE', 0, 'inline keyboard user words (sent through applet storage): the host keeps none', 'hle_swkbd.c'),
++    ('_ZN2nn5swkbd14InlineKeyboard25SetCustomizedDictionariesERKNS0_23CustomizedDictionarySetE', 0, 'inline keyboard dictionaries (applet storage): the host keeps none', 'hle_swkbd.c'),
++    ('_ZN2nn5swkbd14InlineKeyboard27UnsetCustomizedDictionariesEv', 0, 'inline keyboard dictionaries: none kept', 'hle_swkbd.c'),
++    ('_ZN2nn5swkbd14InlineKeyboard26IsUsedTouchPointByKeyboardEii', 0, 'inline keyboard touch hit test: the keyboard is never shown', 'hle_swkbd.c'),
++    ('_ZN2nn5swkbd14InlineKeyboard12GetMaxHeightEv', 400, 'inline keyboard height on screen: 400 of the 720 lines (the keyboard is never shown)', 'hle_swkbd.c'),
++    ('_ZN2nn5swkbd14InlineKeyboard12SetInputTextERKNS0_9InputTextE', None, 'inline keyboard: set text (the host does not show it, ignored)', 'hle_swkbd.c'),
++    ('_ZN2nn5swkbd14InlineKeyboard12SetCursorPosEi', None, 'inline keyboard: set cursor (the host does not show it, ignored)', 'hle_swkbd.c'),
++    ('_ZN2nn5swkbd14InlineKeyboard8GetImageEPvm', 0, 'inline keyboard image: none (returns false)', 'hle_swkbd.c'),
++    ('_ZN2nn4time10InitializeEv', 0, 'connect to the time service; clocks come from the host system time instead', 'hle_time.c'),
++    ('_ZN2nn4time13IsInitializedEv', 1, 'the time service is taken over, always initialized', 'hle_time.c'),
++    ('_ZN2nn4time26StandardNetworkSystemClock20IsAccuracySufficientEv', 0, 'network clock accuracy (time service): offline, never sufficient', 'hle_time.c'),
++]
+diff --git a/dm/tools/horizon_vi.py b/dm/tools/horizon_vi.py
+new file mode 100644
+index 0000000..3ee6792
+--- /dev/null
++++ b/dm/tools/horizon_vi.py
+@@ -0,0 +1,99 @@
++"""nn::vi (display, layers, the native window) and nv:: (the GPU driver glue) on the Linux host (NX2Linux S7bis): the Python side of engine/dm/gfx/hle_vi.c and hle_nv.c. The host has no vi service:
++the game gets static objects that live in a page of guest memory, and the native window it hands to NVN's window builder."""
++import struct
++
++from horizon_overrides import hle, noop
++
++RES_OK = 0
++OBJECTS = 0x8_0000_0000   # one page: the display, the layer and the native window
++DISPLAY, LAYER, NATIVE = OBJECTS, OBJECTS + 0x100, OBJECTS + 0x200
++
++
++def objects(hz):
++    """Map the page of static objects once"""
++    if not getattr(hz, '_vi_ready', False):
++        hz.aot.try_map(OBJECTS, 0x1000)
++        hz.wr32(DISPLAY, 0x50534944); hz.wr32(LAYER, 0x5259414c); hz.wr32(NATIVE, 0x4e49574e); hz.wr64(NATIVE + 8, LAYER)
++        hz._vi_ready = True
++        hz.layer_size = None
++        hz.layer_crop = None
++
++
++noop('_ZN2nn2vi10InitializeEv', 'display service init; the host has no vi service')
++noop('_ZN2nn2vi8FinalizeEv', 'display service shutdown; the host has no vi service')
++noop('_ZN2nn2vi12DestroyLayerEPNS0_5LayerE', 'destroy layer; host static object')
++noop('_ZN2nn2vi12CloseDisplayEPNS0_7DisplayE', 'close display; host static object')
++
++
++@hle('_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE', 'open default display; the host returns a static object')
++def open_display(hz, r): objects(hz); hz.wr64(r[0], DISPLAY); r[0] = RES_OK
++
++
++@hle('_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE', 'create layer; the host returns a static object')
++def create_layer(hz, r): objects(hz); hz.wr64(r[0], LAYER); r[0] = RES_OK
++
++
++@hle('_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayEii', 'create layer of a given size; the host returns a static object')
++def create_layer_wh(hz, r):
++    objects(hz); w, h = r[2] & 0xFFFFFFFF, r[3] & 0xFFFFFFFF
++    if 0 < w < 0x10000 and 0 < h < 0x10000: hz.layer_size = (w, h)
++    hz.note(f'vi::CreateLayer {w}x{h}'); hz.wr64(r[0], LAYER); r[0] = RES_OK
++
++
++@hle('_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE', 'native window handle, passed to the NVN window builder; the host returns a static object')
++def native_window(hz, r): objects(hz); hz.wr64(r[0], NATIVE); r[0] = RES_OK
++
++
++@hle('_ZN2nn2vi12SetLayerCropEPNS0_5LayerEiiii', 'layer crop; the host records it and the present crops by it')
++def set_crop(hz, r):
++    objects(hz); x, y, w, h = (struct.unpack('<i', struct.pack('<I', v & 0xFFFFFFFF))[0] for v in r[1:5])
++    hz.layer_crop = None if min(x, y) < 0 or min(w, h) <= 0 else (x, y, w, h); r[0] = RES_OK
++
++
++@hle('_ZN2nn2vi19SetLayerScalingModeEPNS0_5LayerENS0_11ScalingModeE', 'layer scaling mode; the host present does its own scaling')
++def set_scaling(hz, r): r[0] = RES_OK
++
++
++@hle('_ZN2nn2vi20GetLatestFrameNumberEPmPKNS0_5LayerE', "the layer's latest frame number: the frames presented so far")
++def frame_number(hz, r): hz.wr64(r[0], getattr(hz, 'frames_presented', 0)); r[0] = RES_OK
++
++
++@hle('_ZN2nn2vi16ListFrameHistoryEPNS0_9FrameInfoEiPKNS0_5LayerE', "the layer's frame history: none kept, 0 entries")
++def frame_history(hz, r): r[0] = 0
++
++
++@hle('_ZN2nn2vi32GetDefaultDisplayPanelIdentifierEPNS0_15PanelIdentifierE', 'built-in panel identity; the host has no panel: all zero')
++def panel_id(hz, r): hz.wr(r[0], bytes(0x18)); r[0] = RES_OK
++
++
++@hle('_ZN2nn2vi12ListDisplaysEPNS0_11DisplayInfoEi', 'list displays; the host has one, "Default"')
++def list_displays(hz, r):
++    if (r[1] & 0xFFFFFFFF) <= 0 or not r[0]: r[0] = 0; return
++    hz.wr(r[0], b'Default'.ljust(0x40, b'\0') + b'\1'.ljust(8, b'\0') + struct.pack('<QQQ', 1, 1920, 1080)); r[0] = 1
++
++
++# ---- nv:: : the driver glue beneath NVN; NVN is replaced wholesale, so these only remember what the game installs ----
++@hle('_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_', 'NVN is replaced wholesale; the allocator is recorded')
++def nv_set_alloc(hz, r): hz.nv_alloc = tuple(r[:4])
++
++
++@hle('_ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_', 'NVN is replaced wholesale; the devtools allocator is recorded')
++def nv_set_dev_alloc(hz, r): hz.nv_dev_alloc = tuple(r[:4])
++
++
++@hle('_ZN2nv18InitializeGraphicsEPvm', 'NVN is replaced wholesale; the graphics pool is recorded for nv::GetGraphicsMemoryInfo')
++def nv_init(hz, r): hz.nv_pool = (r[0], r[1]); hz.note(f'nv::InitializeGraphics: pool {r[1] / 1048576:.2f} MB, recorded')
++
++
++@hle('_ZN2nv16FinalizeGraphicsEv', 'NVN is replaced wholesale; nothing to finalize')
++def nv_fini(hz, r): hz.nv_pool = None
++
++
++@hle('_ZN2nv21GetGraphicsMemoryInfoEPNS_10MemoryInfoE', 'pool figures from nv::InitializeGraphics, no driver statistics')
++def nv_meminfo(hz, r):
++    size = hz.nv_pool[1] if getattr(hz, 'nv_pool', None) else 0
++    hz.wr(r[0], struct.pack('<QQQQ', size, 0, size, 0))   # [0] total, [1] used (0), [2] free: 0x20 bytes, the size SDK 10 and older have (SDK 11 has 0x40; writing more overruns an old caller)
++
++
++@hle('_ZN2nv22DumpGraphicsMemoryInfoEv', 'the dump goes to the host log')
++def nv_dump(hz, r): hz.note('nv::DumpGraphicsMemoryInfo')
+diff --git a/dm/tools/nvn_layout.py b/dm/tools/nvn_layout.py
+new file mode 100644
+index 0000000..d616109
+--- /dev/null
++++ b/dm/tools/nvn_layout.py
+@@ -0,0 +1,172 @@
++"""Storage size, alignment and level offsets of NVN textures (Tegra X1 block-linear layout): a port of engine/dm/gfx/nvn/nvn_tex.c, which ports deko3d's dk_image.cpp (zlib licence, (C) 2018-2020 fincs).
++One GOB is 64 bytes x 8 rows = 512 bytes; the block height (tileH, in GOBs) is picked from height x 1.5; levels accumulate with block alignment. A game sizes its memory pools with these numbers,
++so they must match the real driver's. Usage: layout(Desc(...)) -> Layout(size, align, layer_size, tileH, tileD, bpb)."""
++from dataclasses import dataclass, field
++
++SPARSE_TILE = 0x10000
++ASTC = [(4, 4), (5, 4), (5, 5), (6, 5), (6, 6), (8, 5), (8, 6), (8, 8), (10, 5), (10, 6), (10, 8), (10, 10), (12, 10), (12, 12)]
++UNCOMPRESSED = [(0x01, 0x04, 1), (0x05, 0x09, 2), (0x0A, 0x0C, 4), (0x0D, 0x10, 2), (0x11, 0x15, 4), (0x16, 0x18, 8),
++                (0x19, 0x1C, 3), (0x1D, 0x21, 6), (0x22, 0x24, 12), (0x25, 0x28, 4), (0x29, 0x2D, 8), (0x2E, 0x30, 16),
++                (0x31, 0x31, 1), (0x32, 0x32, 2), (0x33, 0x35, 4), (0x36, 0x36, 8), (0x37, 0x38, 4), (0x39, 0x3C, 2), (0x3D, 0x40, 4),
++                (0x51, 0x52, 1), (0x53, 0x54, 2), (0x55, 0x56, 4), (0x57, 0x58, 2), (0x59, 0x5A, 4), (0x5B, 0x5C, 8),
++                (0x5D, 0x5E, 3), (0x5F, 0x60, 6), (0x61, 0x62, 12), (0x63, 0x64, 4), (0x65, 0x66, 8), (0x67, 0x68, 16),
++                (0x69, 0x6C, 4), (0x6D, 0x70, 4), (0x71, 0x75, 8), (0x76, 0x78, 16), (0x95, 0x98, 2), (0x99, 0x9C, 4)]
++
++
++@dataclass
++class Desc:
++    """What a texture builder holds (nvn_texdesc)"""
++    target: int = 1
++    width: int = 0
++    height: int = 0
++    depth: int = 0
++    levels: int = 1
++    samples: int = 0
++    format: int = 0
++    flags: int = 0
++    stride: int = 0
++    pkg_block_h: int = 0
++
++
++@dataclass
++class Layout:
++    size: int = 0
++    align: int = 512
++    layer_size: int = 0
++    tileH: int = 0
++    tileD: int = 0
++    bpb: int = 0
++    layers: int = 1
++
++
++def fmt_of(f):
++    """(bytes per block, block width, block height); bpb 0 for a format that is not known"""
++    if 0x79 <= f <= 0x94:
++        bw, bh = ASTC[(f - 0x79) % 14]
++        return 16, bw, bh
++    if 0x41 <= f <= 0x50:   # DXT / RGTC / BPTC: 4x4 blocks
++        b8 = f <= 0x42 or f in (0x45, 0x46) or f in (0x49, 0x4A)
++        return (8 if b8 else 16), 4, 4
++    for lo, hi, bpb in UNCOMPRESSED:
++        if lo <= f <= hi: return bpb, 1, 1
++    return 0, 1, 1
++
++
++def bpb_of(f): return fmt_of(f)[0]
++def mip(s, level): return max(1, s >> level)
++def blk(s, b): return (s + b - 1) // b
++
++
++def pick_tile(gobs): return 4 if gobs >= 16 else 3 if gobs >= 8 else 2 if gobs >= 4 else 1 if gobs >= 2 else 0
++
++
++def adj_tile(shift, unit, dim):
++    if not shift: return 0
++    x = unit << (shift - 1)
++    if x >= dim:
++        while True:
++            shift -= 1
++            if not shift: break
++            x >>= 1
++            if x < dim: break
++    return shift
++
++
++def shape(d):
++    """(dims per layer, layered, w, h, z)"""
++    w, h, z, layered = d.width, d.height, d.depth, False
++    t = d.target
++    if t == 0: dpl, h, z = 1, 1, 1
++    elif t == 3: dpl, z, h, layered = 1, d.height, 1, True
++    elif t == 2: dpl = 3
++    elif t in (4, 6): dpl, layered = 2, True
++    elif t == 8: dpl, z, layered = 2, 6, True
++    elif t == 9: dpl, layered = 2, True
++    else: dpl, z = 2, 1
++    return dpl, layered, w, h, (z or 1)
++
++
++def samples_xy(s):
++    return (2, 1) if s == 2 else (2, 2) if s == 4 else (4, 2) if s == 8 else (1, 1)
++
++
++def sparse_of(d): return bool(d.flags & 0x20) and not (d.flags & 0x50) and d.target != 10
++
++
++def sparse_tile_h(bpb): return 5 if bpb == 1 else 4 if bpb in (2, 4) else 3 if bpb in (8, 16) else -1
++
++
++def tile_shape_h(d, dpl, bpb, tileH):
++    return sparse_tile_h(bpb) if dpl == 2 and not d.pkg_block_h and sparse_tile_h(bpb) >= 0 else tileH
++
++
++def level_walk(d, level, dpl, w, h, z, tileH, tileD, t):
++    bpb, bw, bh = t
++    sx, sy = samples_xy(d.samples)
++    sh = tile_shape_h(d, dpl, bpb, tileH)
++    tw = max(1, 128 >> (sh + tileD))
++    tiled = sparse_of(d)
++    off, i = 0, 0
++    while True:
++        lw = blk(mip(w * sx, i), bw)
++        lh = blk(mip(h * sy, i), bh) if dpl >= 2 else 1
++        ld = mip(z, i) if dpl >= 3 else 1
++        lwb = lw * bpb
++        th, td = adj_tile(tileH, 8, lh), adj_tile(tileD, 1, ld)
++        wg, hg = (lwb + 63) // 64, (lh + 7) // 8
++        tiled = tiled and lwb >= tw * 64 and lh >= (8 << sh) and ld >= (1 << tileD)
++        if tiled: wg = (wg + tw - 1) // tw * tw
++        if i == level: return off, wg
++        ht, dt = (hg + (1 << th) - 1) >> th, (ld + (1 << td) - 1) >> td
++        off += (wg * ht * dt) << (9 + th + td)
++        i += 1
++
++
++def layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t):
++    ls, _ = level_walk(d, d.levels or 1, dpl, w, h, z, tileH, tileD, t)
++    if sparse_of(d): ls = (ls + SPARSE_TILE - 1) & ~(SPARSE_TILE - 1)
++    if layered:
++        hh = blk(h, t[2]); th, td = tileH, tileD
++        while th and hh <= (8 << (th - 1)): th -= 1
++        while td and z <= (1 << (td - 1)): td -= 1
++        sh = th + td + 9
++        g = ls >> sh
++        if ls != g << sh: ls = (g + 1) << sh
++    return ls
++
++
++def layout(d):
++    t = fmt_of(d.format)
++    bpb, bw, bh = t
++    dpl, layered, w, h, z = shape(d)
++    sx, sy = samples_xy(d.samples)
++    o = Layout(bpb=bpb, layers=z if layered else 1)
++    if not bpb: o.size, o.align, o.layer_size = 0, 512, 0; return o
++    if d.target == 10:   # BUFFER
++        o.layer_size = o.size = bpb * d.width
++        o.align = 4 if bpb == 12 else bpb
++        return o
++    if d.flags & 0x50:   # LINEAR or LINEAR_RENDER_TARGET
++        o.align = 128 if d.flags & 0x40 else 32
++        stride = d.stride or ((bpb * blk(w, bw) + o.align - 1) & ~(o.align - 1))
++        o.layer_size = o.size = stride * h
++        return o
++    tileH = tileD = 0
++    if d.pkg_block_h:   # packaged byte 0: low nibble block height, high nibble block depth
++        pl = (d.pkg_block_h - 1) & 0xff
++        if dpl >= 2: tileH = pl & 0xf
++        if dpl == 3: tileD = pl >> 4
++    elif dpl == 2 and sparse_of(d) and sparse_tile_h(bpb) >= 0 and blk(w * sx, bw) * bpb >= (128 >> sparse_tile_h(bpb)) * 64 and blk(h * sy, bh) >= (8 << sparse_tile_h(bpb)):
++        tileH = sparse_tile_h(bpb)
++    elif dpl == 2:
++        ah = blk(h * sy, bh); tileH = pick_tile(ah * 3 // 16)
++    elif dpl == 3:
++        tileD = pick_tile(z + z // 2)
++    ls = layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t)
++    if (d.flags & 0x200) and not d.pkg_block_h and not sparse_of(d) and (tileH or tileD):   # MINIMAL_LAYOUT: keep the automatic block only when no larger than with 1-GOB blocks
++        one = layer_bytes(d, dpl, layered, w, h, z, 0, 0, t)
++        if one != ls: tileH = tileD = 0; ls = one
++    o.tileH, o.tileD, o.layer_size = tileH, tileD, ls
++    o.size = ls * z if layered else ls
++    o.align = SPARSE_TILE if sparse_of(d) else 512
++    return o
+diff --git a/dm/tools/tests/test_horizon_hle.py b/dm/tools/tests/test_horizon_hle.py
+index 2d89b19..99acf72 100644
+--- a/dm/tools/tests/test_horizon_hle.py
++++ b/dm/tools/tests/test_horizon_hle.py
+@@ -23,7 +23,7 @@ class FakeAot:
+ 
+ def make():
+     aot = FakeAot()
+-    ms = types.SimpleNamespace(aot=aot, modules=[], TLS=0x1000)
++    ms = types.SimpleNamespace(aot=aot, modules=[], TLS=0x1000, STOP=0xFFFF0000)
+     ms.modules = []
+     return hh.Horizon(ms, out=io.StringIO()), aot
+ 
+@@ -70,12 +70,74 @@ class Svc(unittest.TestCase):
+         hz.svc(0x18, r, 0)
+         self.assertEqual(r[0], hh.R_INVALID_HANDLE)
+ 
+-    def test_a_wait_nothing_can_signal_is_reported_not_hung(self):
++    def test_a_wait_that_times_out_says_so(self):
+         hz, aot = make(); h = hz.new_handle(hh.Event(False))
+         aot.mem[0x100:0x104] = struct.pack('<I', h)
+-        r = [0] * 31; r[1], r[2], r[3] = 0x100, 1, (1 << 64) - 1
++        r = [0] * 31; r[1], r[2], r[3] = 0x100, 1, 2_000_000   # 2 ms
+         hz.svc(0x18, r, 0)
+-        self.assertEqual(hz.stop_reason, 'WaitSynchronization')
++        self.assertEqual(r[0], hh.R_TIMEOUT)
++
++    def test_a_wait_is_woken_by_another_thread_signalling_the_event(self):
++        import threading, time
++        hz, aot = make(); e = hh.Event(False); h = hz.new_handle(e)
++        aot.mem[0x100:0x104] = struct.pack('<I', h)
++        def signal():
++            time.sleep(0.05); r = [0] * 31; r[0] = h; hz.svc(0x11, r, 0)
++        threading.Thread(target=signal).start()
++        r = [0] * 31; r[1], r[2], r[3] = 0x100, 1, (1 << 64) - 1   # forever
++        t0 = time.monotonic(); hz.svc(0x18, r, 0)
++        self.assertEqual((r[0], r[1]), (0, 0)); self.assertLess(time.monotonic() - t0, 2)
++
++    def test_create_event_gives_a_writable_and_a_readable_handle_of_one_event(self):
++        hz, _ = make(); r = [0] * 31; hz.svc(0x45, r, 0)
++        w, rd = r[1], r[2]
++        self.assertIs(hz.handles[w], hz.handles[rd])
++
++
++class Sync(unittest.TestCase):
++    """Horizon's mutex word and condition variable (ArbitrateLock / ArbitrateUnlock, WaitProcessWideKeyAtomic / SignalProcessWideKey)"""
++    MUTEX, KEY = 0x200, 0x300
++    OWNER, WAITER = 0x11, 0x22
++
++    def call(self, hz, num, *args):
++        r = [0] * 31
++        for i, a in enumerate(args): r[i] = a
++        hz.svc(num, r, 0); return r
++
++    def test_lock_returns_at_once_when_the_word_is_not_the_owner_with_listeners(self):
++        hz, aot = make(); hz.wr32(self.MUTEX, 0)
++        self.assertEqual(self.call(hz, 0x1a, self.OWNER, self.MUTEX, self.WAITER)[0], 0)
++
++    def test_unlock_with_no_waiter_clears_the_word(self):
++        hz, _ = make(); hz.wr32(self.MUTEX, self.OWNER | hz.LISTENERS)
++        self.call(hz, 0x1b, self.MUTEX)
++        self.assertEqual(hz.rd32(self.MUTEX), 0)
++
++    def test_a_waiting_thread_gets_the_word_when_the_owner_unlocks(self):
++        import threading, time
++        hz, _ = make(); hz.wr32(self.MUTEX, self.OWNER | hz.LISTENERS)
++        done = []
++        def waiter():
++            hz.local.thread = hh.KThread(hz, 0, 0, 0, 44, 0); self.call(hz, 0x1a, self.OWNER, self.MUTEX, self.WAITER); done.append(time.monotonic())
++        t = threading.Thread(target=waiter); t.start(); time.sleep(0.05)
++        self.assertEqual(done, [])   # still blocked
++        self.call(hz, 0x1b, self.MUTEX); t.join(2)
++        self.assertEqual(len(done), 1); self.assertEqual(hz.rd32(self.MUTEX), self.WAITER)
++
++    def test_condvar_wait_times_out_and_takes_the_mutex_again(self):
++        hz, _ = make(); hz.wr32(self.MUTEX, self.WAITER)   # held by the caller
++        r = self.call(hz, 0x1c, self.MUTEX, self.KEY, self.WAITER, 3_000_000)
++        self.assertEqual(r[0], hh.R_TIMEOUT); self.assertEqual(hz.rd32(self.MUTEX), self.WAITER)
++
++    def test_signal_wakes_a_condvar_waiter(self):
++        import threading, time
++        hz, _ = make(); hz.wr32(self.MUTEX, self.WAITER)
++        out = []
++        def waiter():
++            hz.local.thread = hh.KThread(hz, 0, 0, 0, 44, 0); out.append(self.call(hz, 0x1c, self.MUTEX, self.KEY, self.WAITER, (1 << 64) - 1)[0])
++        t = threading.Thread(target=waiter); t.start(); time.sleep(0.05)
++        self.call(hz, 0x1d, self.KEY, 1); t.join(2)
++        self.assertEqual(out, [0])
+ 
+ 
+ class Ipc(unittest.TestCase):
+diff --git a/dm/tools/tests/test_horizon_services.py b/dm/tools/tests/test_horizon_services.py
+new file mode 100644
+index 0000000..b613143
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_services.py
+@@ -0,0 +1,243 @@
++"""The SDK functions the host replaces (horizon_overrides.py and the modules that fill it), against a fake guest memory: nn::fs over a RomFS image, nn::account, nn::oe, nn::vi, and the NVN device
++(texture layout, clears replayed at submit, presentation). No Remill, no game data."""
++import io, os, struct, sys, tempfile, types, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE.parent)); sys.path.insert(0, str(HERE))
++import horizon_hle as hh
++import horizon_overrides as ho
++import nvn_layout
++import romfs_image
++from test_horizon_hle import FakeAot
++
++
++class Aot(FakeAot):
++    def __init__(self):
++        super().__init__()
++        self.mem = bytearray(0x40000); self.lib.mem = self.mem; self.regions = [(0, 0x40000, b'')]
++        self.imports = {}
++    def register_import(self, addr, fn, name): self.imports[addr] = (name, fn); return 0
++
++
++def make():
++    aot = Aot()
++    ms = types.SimpleNamespace(aot=aot, modules=[], TLS=0x1000, STOP=0xFFFF0000, _n=0)
++    def import_address(name): ms._n += 1; return 0x70000000 + 16 * ms._n
++    ms._import_address = import_address
++    hz = hh.Horizon(ms, out=io.StringIO())
++    ho.install(hz)   # fills the table (no module exports anything here, so nothing is selected)
++    return hz, aot
++
++
++def call(hz, symbol, *args):
++    r = [0] * 31
++    for i, a in enumerate(args): r[i] = a
++    ho.TABLE[symbol][0](hz, r)
++    return r
++
++
++def put(aot, addr, data): aot.mem[addr:addr + len(data)] = data
++
++
++class Fs(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.dir = tempfile.TemporaryDirectory()
++        root = Path(cls.dir.name, 'src'); (root / 'data/sub').mkdir(parents=True)
++        (root / 'data/a.bin').write_bytes(b'0123456789abcdef'); (root / 'data/sub/b.txt').write_bytes(b'hello')
++        cls.img = str(Path(cls.dir.name, 'RomFS.img')); romfs_image.pack(str(root), cls.img)
++
++    @classmethod
++    def tearDownClass(cls): cls.dir.cleanup()
++
++    def setUp(self):
++        self.hz, self.aot = make()
++        self.hz.fs.romfs_img = self.img
++        put(self.aot, 0x100, b'rom\0'); self.assertEqual(call(self.hz, '_ZN2nn2fs8MountRomEPKcPvm', 0x100, 0, 0)[0], 0)
++
++    def open(self, path):
++        put(self.aot, 0x200, path.encode() + b'\0')
++        r = call(self.hz, '_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci', 0x300, 0x200, 1)
++        return r[0], self.hz.rd64(0x300)
++
++    def test_a_file_is_opened_sized_and_read(self):
++        rc, h = self.open('rom:/data/a.bin'); self.assertEqual(rc, 0)
++        self.assertEqual(h & 0xF, 0)   # the low bits are clear, as a heap pointer's are
++        call(self.hz, '_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE', 0x400, h); self.assertEqual(self.hz.rd64(0x400), 16)
++        r = call(self.hz, '_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm', 0x408, h, 4, 0x500, 8)
++        self.assertEqual((r[0], self.hz.rd64(0x408), bytes(self.aot.mem[0x500:0x508])), (0, 8, b'456789ab'))
++
++    def test_a_read_past_the_end_is_short(self):
++        _, h = self.open('rom:/data/a.bin')
++        call(self.hz, '_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm', 0x408, h, 12, 0x500, 100)
++        self.assertEqual(self.hz.rd64(0x408), 4)
++
++    def test_a_missing_file_is_path_not_found(self):
++        self.assertEqual(self.open('rom:/data/nope')[0], 0x202)
++
++    def test_an_unmounted_name_is_not_found(self):
++        self.assertEqual(self.open('save:/x')[0], 0x202)
++
++    def test_entry_types(self):
++        put(self.aot, 0x200, b'rom:/data\0')
++        call(self.hz, '_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc', 0x300, 0x200); self.assertEqual(self.hz.rd32(0x300), 0)
++        put(self.aot, 0x200, b'rom:/data/a.bin\0')
++        call(self.hz, '_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc', 0x300, 0x200); self.assertEqual(self.hz.rd32(0x300), 1)
++
++    def test_a_directory_lists_its_entries_in_order(self):
++        put(self.aot, 0x200, b'rom:/data\0')
++        self.assertEqual(call(self.hz, '_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci', 0x300, 0x200, 3)[0], 0)
++        h = self.hz.rd64(0x300)
++        call(self.hz, '_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl', 0x400, 0x1000, h, 8)
++        self.assertEqual(self.hz.rd64(0x400), 2)
++        names = [bytes(self.aot.mem[0x1000 + i * 0x310:0x1000 + i * 0x310 + 8]).split(b'\0')[0] for i in range(2)]
++        self.assertEqual(names, [b'a.bin', b'sub'])
++        self.assertEqual(self.aot.mem[0x1000 + 0x304], 1); self.assertEqual(self.aot.mem[0x1000 + 0x310 + 0x304], 0)   # a file, then a directory
++        self.assertEqual(struct.unpack_from('<q', self.aot.mem, 0x1000 + 0x308)[0], 16)
++
++
++class SaveData(unittest.TestCase):
++    def test_save_data_is_a_writable_host_directory(self):
++        with tempfile.TemporaryDirectory() as d:
++            os.environ['XDG_DATA_HOME'] = d
++            try:
++                hz, aot = make()
++                put(aot, 0x100, b'save\0'); put(aot, 0x120, bytes(16))
++                self.assertEqual(call(hz, '_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE', 0x100, 0x120)[0], 0)
++                put(aot, 0x200, b'save:/slot1.dat\0')
++                self.assertEqual(call(hz, '_ZN2nn2fs10CreateFileEPKcl', 0x200, 8)[0], 0)
++                self.assertEqual(call(hz, '_ZN2nn2fs10CreateFileEPKcl', 0x200, 8)[0], 0x402)   # exists
++                call(hz, '_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci', 0x300, 0x200, 3); h = hz.rd64(0x300)
++                put(aot, 0x400, b'DATA1234')
++                call(hz, '_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE', h, 0, 0x400, 8, 0x500)
++                call(hz, '_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm', 0x408, h, 0, 0x600, 8)
++                self.assertEqual(bytes(aot.mem[0x600:0x608]), b'DATA1234')
++                self.assertTrue(any(Path(d).rglob('slot1.dat')))
++            finally: os.environ.pop('XDG_DATA_HOME')
++
++
++class Account(unittest.TestCase):
++    def test_one_local_user_whose_handle_gives_back_its_uid(self):
++        hz, aot = make()
++        r = call(hz, '_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE', 0x100); self.assertEqual(r[0], 1)
++        call(hz, '_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE', 0x200, 0x100)
++        self.assertEqual(bytes(aot.mem[0x200:0x210]), bytes(aot.mem[0x100:0x110]))
++        call(hz, '_ZN2nn7account12ListAllUsersEPiPNS0_3UidEi', 0x300, 0x400, 4); self.assertEqual(hz.rd32(0x300), 1)
++
++
++class Oe(unittest.TestCase):
++    def test_docked_1080p_by_default_and_handheld_on_request(self):
++        hz, aot = make()
++        self.assertEqual(call(hz, '_ZN2nn2oe16GetOperationModeEv')[0], 1)
++        call(hz, '_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_', 0x100, 0x104); self.assertEqual((hz.rd32(0x100), hz.rd32(0x104)), (1920, 1080))
++        os.environ['NX2LINUX_OPMODE'] = '0'
++        try:
++            call(hz, '_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_', 0x100, 0x104); self.assertEqual((hz.rd32(0x100), hz.rd32(0x104)), (1280, 720))
++        finally: os.environ.pop('NX2LINUX_OPMODE')
++
++    def test_language_is_a_code_in_x0(self):
++        hz, _ = make()
++        self.assertEqual(struct.pack('<Q', call(hz, '_ZN2nn2oe18GetDesiredLanguageEv')[0])[:5], b'en-US')
++
++
++class Layout(unittest.TestCase):
++    def test_a_linear_render_target_is_stride_times_height(self):
++        d = nvn_layout.Desc(target=1, width=1280, height=720, depth=1, format=0x25, flags=0x40)   # RGBA8, LINEAR_RENDER_TARGET
++        self.assertEqual(nvn_layout.layout(d).size, 1280 * 4 * 720)
++
++    def test_a_block_linear_rgba8_is_a_whole_number_of_gobs(self):
++        l = nvn_layout.layout(nvn_layout.Desc(target=1, width=256, height=256, depth=1, format=0x25))
++        self.assertEqual(l.size % 512, 0); self.assertGreaterEqual(l.size, 256 * 256 * 4); self.assertEqual(l.align, 512)
++
++    def test_bytes_per_block_of_common_formats(self):
++        self.assertEqual([nvn_layout.bpb_of(f) for f in (0x25, 0x41, 0x45, 0x79)], [4, 8, 8, 16])   # RGBA8, BC1, BC4, ASTC 4x4
++
++    def test_mip_levels_add_to_the_storage(self):
++        one = nvn_layout.layout(nvn_layout.Desc(target=1, width=256, height=256, depth=1, format=0x25, levels=1)).size
++        all_ = nvn_layout.layout(nvn_layout.Desc(target=1, width=256, height=256, depth=1, format=0x25, levels=9)).size
++        self.assertGreater(all_, one)
++
++
++class NvnDevice(unittest.TestCase):
++    def setUp(self):
++        self.hz, self.aot = make()
++        self.shown = []
++        class Display:
++            def present(d, rgba, w, h): self.shown.append((rgba, w, h))
++            def events(d): return []
++        self.hz.display_factory = lambda: Display()
++        self.hz.verbose_nvn = False
++        put(self.aot, 0x100, b'nvnDeviceGetProcAddress\0')
++        self.loader = call(self.hz, 'nvnBootstrapLoader', 0x100)[0]
++        self.nvn = self.hz.nvn
++
++    def fn(self, name, *args):
++        put(self.aot, 0x2000, name.encode() + b'\0')
++        addr = self.nvn.lookup(name)
++        r = [0] * 31
++        for i, a in enumerate(args): r[i] = a
++        self.aot.imports[addr][1](r)
++        return r[0]
++
++    def test_the_loader_gives_import_addresses_by_name(self):
++        self.assertNotEqual(self.loader, 0)
++        self.assertEqual(self.nvn.lookup('nvnDeviceGetProcAddress'), self.loader)
++        self.assertEqual(self.nvn.lookup('nvnNoSuchThing'), 0)
++
++    def test_device_limits_are_the_tegra_x1_ones(self):
++        self.fn('nvnDeviceInitialize', 0x4000, 0x4100)
++        self.fn('nvnDeviceGetInteger', 0x4000, 0x4, 0x300); self.assertEqual(self.hz.rd32(0x300), 256)
++        self.fn('nvnDeviceGetInteger', 0x4000, 0x0, 0x300); self.assertEqual(self.hz.rd32(0x300), 53)
++
++    def test_a_texture_builder_reports_the_layout_size(self):
++        self.fn('nvnTextureBuilderSetDefaults', 0x5000)
++        self.fn('nvnTextureBuilderSetTarget', 0x5000, 1); self.fn('nvnTextureBuilderSetSize2D', 0x5000, 256, 256); self.fn('nvnTextureBuilderSetFormat', 0x5000, 0x25)
++        want = nvn_layout.layout(nvn_layout.Desc(target=1, width=256, height=256, depth=0, format=0x25)).size
++        self.assertEqual(self.fn('nvnTextureBuilderGetStorageSize', 0x5000), want)
++
++    def window(self):
++        for i, t in enumerate((0x6000, 0x6200)):
++            self.fn('nvnTextureBuilderSetDefaults', 0x5000); self.fn('nvnTextureBuilderSetSize2D', 0x5000, 4, 2); self.fn('nvnTextureBuilderSetFormat', 0x5000, 0x25)
++            self.assertEqual(self.fn('nvnTextureInitialize', t, 0x5000), 1)
++        put(self.aot, 0x6400, struct.pack('<2Q', 0x6000, 0x6200))
++        self.fn('nvnWindowBuilderSetDefaults', 0x7000); self.fn('nvnWindowBuilderSetTextures', 0x7000, 2, 0x6400)
++        self.assertEqual(self.fn('nvnWindowInitialize', 0x7100, 0x7000), 1)
++
++    def test_a_cleared_window_texture_is_what_is_presented(self):
++        self.window()
++        idx_addr, sync = 0x7200, 0x7300
++        self.fn('nvnSyncInitialize', sync, 0x4000)
++        self.assertEqual(self.fn('nvnWindowAcquireTexture', 0x7100, sync, idx_addr), 0); idx = self.hz.rd32(idx_addr); self.assertEqual(idx, 0)
++        self.fn('nvnCommandBufferInitialize', 0x7400, 0x4000); self.fn('nvnCommandBufferBeginRecording', 0x7400)
++        put(self.aot, 0x7500, struct.pack('<Q', 0x6000)); self.fn('nvnCommandBufferSetRenderTargets', 0x7400, 1, 0x7500, 0, 0, 0)
++        put(self.aot, 0x7600, struct.pack('<4f', 1.0, 0.0, 0.5, 1.0)); self.fn('nvnCommandBufferClearColor', 0x7400, 0, 0x7600, 0xF)
++        handle = self.fn('nvnCommandBufferEndRecording', 0x7400)
++        self.fn('nvnQueueInitialize', 0x7700, 0x7800)
++        put(self.aot, 0x7900, struct.pack('<Q', handle)); self.fn('nvnQueueSubmitCommands', 0x7700, 1, 0x7900)
++        self.fn('nvnQueuePresentTexture', 0x7700, 0x7100, idx)
++        rgba, w, h = self.shown[0]
++        self.assertEqual((w, h, rgba[:4]), (4, 2, bytes([255, 0, 128, 255])))
++        self.assertEqual(self.nvn.stats['clears'], 1); self.assertEqual(self.hz.frames_presented, 1)
++
++    def test_the_channel_mask_keeps_the_other_channels(self):
++        self.window()
++        self.fn('nvnCommandBufferInitialize', 0x7400, 0x4000); self.fn('nvnCommandBufferBeginRecording', 0x7400)
++        put(self.aot, 0x7500, struct.pack('<Q', 0x6000)); self.fn('nvnCommandBufferSetRenderTargets', 0x7400, 1, 0x7500, 0, 0, 0)
++        put(self.aot, 0x7600, struct.pack('<4f', 1.0, 1.0, 1.0, 1.0)); self.fn('nvnCommandBufferClearColor', 0x7400, 0, 0x7600, 0x1)   # red only
++        h = self.fn('nvnCommandBufferEndRecording', 0x7400)
++        put(self.aot, 0x7900, struct.pack('<Q', h)); self.fn('nvnQueueSubmitCommands', 0x7700, 1, 0x7900)
++        self.fn('nvnQueuePresentTexture', 0x7700, 0x7100, 0)
++        self.assertEqual(self.shown[0][0][:4], bytes([255, 0, 0, 0]))
++
++    def test_an_event_is_stored_in_the_pool(self):
++        self.fn('nvnMemoryPoolBuilderSetDefaults', 0x8000); self.fn('nvnMemoryPoolBuilderSetStorage', 0x8000, 0x9000, 0x1000)
++        self.fn('nvnMemoryPoolInitialize', 0x8100, 0x8000)
++        self.fn('nvnEventBuilderSetDefaults', 0x8200); self.fn('nvnEventBuilderSetStorage', 0x8200, 0x8100, 0x10)
++        self.fn('nvnEventInitialize', 0x8300, 0x8200)
++        self.fn('nvnEventSignal', 0x8300, 0, 7); self.assertEqual(self.fn('nvnEventGetValue', 0x8300), 7)
++        self.fn('nvnEventSignal', 0x8300, 1, 3); self.assertEqual(self.fn('nvnEventGetValue', 0x8300), 10)
++        self.assertEqual(self.hz.rd32(0x9010), 10)   # the game's own memory holds it
++
++
++if __name__ == '__main__': unittest.main()

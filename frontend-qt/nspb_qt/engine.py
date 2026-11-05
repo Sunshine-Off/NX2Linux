@@ -125,9 +125,12 @@ def run_sync(cmd: list[str], cwd: str, line: Callable[[str], None], **popen) -> 
     try:
         p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', **popen)
         assert p.stdout is not None
-        for out in p.stdout:
-            line(out)
-            tail = (tail + out)[-4000:]
+        try:
+            for out in p.stdout:
+                line(out)
+                tail = (tail + out)[-4000:]
+        finally:
+            p.stdout.close()
         ok = p.wait() == 0
     except OSError as e:
         line(f'{e}\n')

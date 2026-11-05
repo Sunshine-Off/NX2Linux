@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 23:27:03 +0100
+Subject: [PATCH] horizon on linux: the driver constant segment c0 as the Mach
+ host fills it
+
+The largest point size GLSLC clamps gl_PointSize to (2047.0), the pixel stage's sample position, the draw's base instance and a compute shader's workgroup counts were zero.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: driver constant segment c0 (point size, sample position, base instance, group counts)
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/nvn_gpu.py                | 21 ++++++++++++++++++++-
+ dm/tools/tests/test_horizon_gpu.py | 11 +++++++++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/dm/tools/nvn_gpu.py b/dm/tools/nvn_gpu.py
+index a7ef0e0..f1b84fd 100644
+--- a/dm/tools/nvn_gpu.py
++++ b/dm/tools/nvn_gpu.py
+@@ -94,6 +94,7 @@ class GpuBackend:
+         self.spirv = {}      # shader key -> its SPIR-V as loaded (for the variants)
+         self.alpha = {}      # pixel shader key -> module id of its alpha-test variant (0: it has none)
+         self.c1 = {}         # shader key -> its constant buffer 1
++        self.drivers = {}    # (stage kind, draw values) -> the c0 segment
+         self.images = {}     # texture pointer -> dict(id, w, h, fmt, uploaded, target)
+         self.dummies = {}
+         self.draw_texture_modules = None
+@@ -131,6 +132,24 @@ class GpuBackend:
+             c1 = self.c1[key] = (nvn_spirv.shader_c1(stage_name, ctl, code).ljust(DRIVER_SEGMENT_BYTES, b'\0'))
+         return c1
+ 
++    C0_POINT_SIZE, C0_SAMPLE_TABLE, C0_BASE_INSTANCE, C0_DISPATCH = 0x610, 0x620, 0x644, 0x200   # engine/dm/gfx/nvn/dmsh_abi.h
++
++    def driver_segment(self, slot, stage_name, d):
++        """A driver constant segment, as nvn_mtl.m fills it: c0 holds, for the graphics stages, the largest point size GLSLC clamps gl_PointSize to (2047.0), the pixel stage's sample position
++        (the table of one sample: 0x88, the pixel centre) and the draw's base instance, and for a compute shader the workgroup counts; c2 (the handle tables) stays zero, the handles come from the bindings"""
++        if slot != 0: return bytes(DRIVER_SEGMENT_BYTES)
++        groups = tuple(d.groups) if stage_name == 'cs' else ()
++        key = (stage_name == 'ps', stage_name == 'cs', groups or d.base_instance)
++        seg = self.drivers.get(key)
++        if seg is None:
++            b = bytearray(DRIVER_SEGMENT_BYTES)
++            if stage_name == 'cs': struct.pack_into('<3I', b, self.C0_DISPATCH, *groups)
++            else:
++                struct.pack_into('<f', b, self.C0_POINT_SIZE, 2047.0); struct.pack_into('<I', b, self.C0_BASE_INSTANCE, d.base_instance & 0xFFFFFFFF)
++                if stage_name == 'ps': b[self.C0_SAMPLE_TABLE] = 0x88
++            seg = self.drivers[key] = bytes(b)
++        return seg
++
+     def alpha_module(self, key):
+         """The module of a pixel shader with the alpha test in front of its return (nvn_spirv.alpha_variant), made once"""
+         if key not in self.alpha:
+@@ -484,7 +503,7 @@ class GpuBackend:
+                     addr, size = state['ubo'][(stage, cb['slot'] - 3)]
+                     add_buf(cb['binding'], 0, self._buffer(addr, size, 1 << 16).ljust(16, b'\0'))
+                 elif cb['slot'] == 1: add_buf(cb['binding'], 0, self.constant_segment(key, stage_name))   # c1: the constants the shader's own code area keeps (39% of XC2's shaders read it: zeros made them black)
+-                else: add_buf(cb['binding'], 0, bytes(DRIVER_SEGMENT_BYTES))
++                else: add_buf(cb['binding'], 0, self.driver_segment(cb['slot'], stage_name, d))
+             for sb in res['sbufs']:
+                 if sb['binding'] in seen: continue
+                 seen.add(sb['binding'])
+diff --git a/dm/tools/tests/test_horizon_gpu.py b/dm/tools/tests/test_horizon_gpu.py
+index 81d10ab..bcf4cc5 100644
+--- a/dm/tools/tests/test_horizon_gpu.py
++++ b/dm/tools/tests/test_horizon_gpu.py
+@@ -219,6 +219,17 @@ class Gpu(unittest.TestCase):
+         px = g.read(img, 8 * 4)
+         self.assertEqual(tuple(px[4 * 4:4 * 4 + 4]), (127, 0, 255, 255))
+ 
++    def test_the_driver_constant_segment_c0_carries_the_point_size_sample_position_base_instance_and_group_counts(self):
++        import nvn_gpu
++        b = nvn_gpu.GpuBackend.__new__(nvn_gpu.GpuBackend); b.drivers = {}
++        draw = hg.Draw(); draw.base_instance = 7
++        vs, ps = b.driver_segment(0, 'vs', draw), b.driver_segment(0, 'ps', draw)
++        self.assertEqual(struct.unpack_from('<f', vs, 0x610)[0], 2047.0); self.assertEqual(struct.unpack_from('<I', vs, 0x644)[0], 7)
++        self.assertEqual((vs[0x620], ps[0x620]), (0, 0x88))
++        disp = hg.Dispatch(); disp.groups[:] = (3, 4, 5)
++        self.assertEqual(struct.unpack_from('<3I', b.driver_segment(0, 'cs', disp), 0x200), (3, 4, 5))
++        self.assertEqual(b.driver_segment(2, 'ps', draw), bytes(nvn_gpu.DRIVER_SEGMENT_BYTES))
++
+     def test_a_shaders_constant_segment_is_its_constant_buffer_1(self):
+         import nvn_gpu, nvn_spirv
+         class Nvn:

@@ -1,0 +1,614 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Tue, 3 Nov 2026 00:12:50 +0100
+Subject: [PATCH] horizon on linux: the draws of a command stream are converted
+ and made in C
+
+linux/host/nvnreplay.inc keeps the state a draw reads from the recorded streams and turns each draw into the GPU library's call without Python (the conversion nvn_gpu.py does, ported); the programs, render target images and texture bindings it has not seen are asked of Python once and kept (a texture binding once a frame, so a texture the game wrote since is read again). A draw with storage images, an indirect draw and the other commands Python does itself get the state exported from C. NX2LINUX_NVN_REPLAY=py replays in Python, =check does both and compares every draw.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux S7bis: the replay and conversion of NVN draws in C, off the Python bridge and the GIL
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/horizon_nvn.py        |  49 ++++--
+ dm/tools/horizon_run.py        |   1 +
+ dm/tools/nvn_gpu.py            |  69 +++++----
+ dm/tools/nvn_rec.py            |   9 +-
+ dm/tools/nvn_replay.py         | 263 +++++++++++++++++++++++++++++++++
+ dm/tools/tests/test_nvn_rec.py |  28 +++-
+ 6 files changed, 375 insertions(+), 44 deletions(-)
+ create mode 100644 dm/tools/nvn_replay.py
+
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+index 15c6959..9b0f241 100644
+--- a/dm/tools/horizon_nvn.py
++++ b/dm/tools/horizon_nvn.py
+@@ -50,6 +50,7 @@ class Nvn:
+         self.input = None
+         self.queue_idle = self.queue_busy = self.queue_cpu = self.sync_wait = self.acquire_wait = 0.0   # seconds: the queue thread idle and busy, the game's threads blocked in nvnSyncWait and in acquiring a window texture
+         self.jobs = None         # the queue's work (start_worker): submits, fences and presents run on a thread of their own, in order, as on a GPU
++        self.creplay = None      # a nvn_replay.CReplay: the draws of the recorded streams are converted and made in C
+         self.rec = None          # a nvn_rec.Recorder: the hot calls are host functions in C and their commands are taken from there
+         self.draw_sink = None   # called with the described draw (describe_draw) of every draw at submit: the hook of a rendering backend
+         self.draw_log, self.draw_log_max = None, int(os.environ.get('NX2LINUX_DRAW_LOG_MAX', '2000'))
+@@ -80,11 +81,13 @@ class Nvn:
+             if name.endswith('Initialize'): impl = lambda nvn, r: r.__setitem__(0, OK_BOOL)
+             else: impl = self.unimplemented(name)
+         calls = self.calls
++        epoch = 0 if name.startswith('nvnProgram') else 1 if name.startswith(('nvnTexturePool', 'nvnSamplerPool', 'nvnSampler', 'nvnTexture')) else None   # what the replay in C keeps of programs and pool bindings goes stale
+         def fn(r, f=impl, name=name):
+             calls[name] = calls.get(name, 0) + 1
+             if self.trace and name in self.trace_names or (self.trace and self.trace_names == {'*'}):
+                 self.trace -= 1; self.hz.log(f'[nvn.trace] {name}({r[0]:#x}, {r[1]:#x}, {r[2]:#x}) thread={threading.current_thread().name}')
+             f(self, r)
++            if epoch is not None and self.creplay: self.creplay.bump(epoch)
+         if self.hz.aot.register_import(a, fn, name): raise RuntimeError(f'cannot register {name}')
+         self.addr[name] = a
+         return a
+@@ -99,9 +102,7 @@ class Nvn:
+             t0 = time.monotonic(); job = self.jobs.get(); t1 = time.monotonic(); c1 = time.thread_time()
+             self.queue_idle += t1 - t0   # time the queue had nothing to do: the game was not feeding it
+             try:
+-                if job[0] == 'submit':
+-                    state = {}
+-                    for cmds in job[1]: self.replay(cmds, state)
++                if job[0] == 'submit': self.run_submit(job[1])
+                 elif job[0] == 'present': self.present(job[1], job[2])
+             except Exception as e:
+                 self.hz.log(f'[nvn] queue job {job[0]} failed: {type(e).__name__}: {e}')
+@@ -117,6 +118,10 @@ class Nvn:
+         if self.jobs is None: return
+         ev = threading.Event(); self.enqueue('drain', event=ev); ev.wait(60)
+ 
++    def pull_stats(self):
++        """The counters the replay in C keeps, added to Python's"""
++        return self.creplay.pull_stats() if self.creplay else {}
++
+     def all_calls(self):
+         """The calls counted in Python and in C"""
+         out = dict(self.calls)
+@@ -151,13 +156,25 @@ class Nvn:
+         return t['bitmap']
+ 
+     # ---- replay of a submitted command list ----
++    ENCODED = frozenset(('targets', 'program', 'bind_state', 'vattr', 'vstream', 'vbuf', 'ubo', 'ssbo', 'tex', 'samp', 'img', 'texpool', 'samppool', 'viewports', 'scissors', 'misc'))
++
++    def run_submit(self, lists):
++        """The command lists of one submit, one after the other with one state"""
++        state = {}
++        if self.creplay: self.creplay.begin()
++        for cmds in lists: self.replay(cmds, state)
++
+     def replay(self, cmds, state):
++        cr = self.creplay
+         for c in cmds:
+             op = c[0]
+-            if op == 'targets':
++            if cr and op in self.ENCODED: cr.apply_python(c)   # what Python recorded goes to the state C keeps, and to the one Python keeps
++            if op == 'cstream': cr.run(c[1], state)
++            elif op == 'targets':
+                 state['rt'], state['depth'] = c[1], c[2] if len(c) > 2 else 0
+                 state['rt_views'], state['depth_view'] = c[3] if len(c) > 3 else [], c[4] if len(c) > 4 else None
+             elif op == 'clear':
++                if cr: cr.sync(state, 1)
+                 _, index, color, mask = c
+                 if 0 <= index < len(state.get('rt', [])):
+                     self.fill(state['rt'][index], color, mask)
+@@ -166,10 +183,12 @@ class Nvn:
+                         self.gpu.clear(state['rt'][index], color, views[index] if index < len(views) else None)
+                 self.stats['clears'] += 1
+             elif op == 'clear_raw':   # integer clears: the 16 bytes are the value in the target's own integer type
++                if cr: cr.sync(state, 1)
+                 _, index, raw, mask = c
+                 self.stats['clears'] += 1
+                 if self.gpu and mask & 0xF == 0xF and 0 <= index < len(state.get('rt', [])): self.gpu.clear(state['rt'][index], None, None, bits=raw)
+             elif op == 'cleards':
++                if cr: cr.sync(state, 1)
+                 self.stats['clears'] += 1   # depth and stencil are not kept in the CPU bitmaps
+                 if self.gpu and state.get('depth'): self.gpu.clear_depth(state['depth'], c[1], c[2], c[3], c[4])
+             elif op == 'cleartex':
+@@ -177,15 +196,21 @@ class Nvn:
+                 if self.gpu and c[3] & 0xF == 0xF: self.gpu.clear(c[1], c[2])
+             elif op == 'call':
+                 for h in c[1]: self.replay(self.cmdlists.get(h, []), state)
+-            elif op == 'draw': self.draw(state, c[1])
+-            elif op == 'dispatch': self.dispatch(state, c[1])
++            elif op == 'draw':
++                if cr: cr.sync(state)
++                self.draw(state, c[1])
++            elif op == 'dispatch':
++                if cr: cr.sync(state)
++                self.dispatch(state, c[1])
+             elif op == 'tex_deferred':   # the GPU reads the handles when it runs the command, not when it was recorded (BindTexturesDeferred)
+                 _, stage, first, k, src = c
+                 hs = struct.unpack(f'<{k}Q', self.hz.rd(src, 8 * k)) if k else ()
+-                self.apply_state(state, ('tex', {(stage, first + i): h for i, h in enumerate(hs)}))
++                t = ('tex', {(stage, first + i): h for i, h in enumerate(hs)})
++                if cr: cr.apply_python(t)
++                self.apply_state(state, t)
+             elif op == 'signal': self.signal_event(*c[1:])
+             elif op == 'copy': self.copy(state, c[1])
+-            else: self.apply_state(state, c)
++            elif op != 'cstream': self.apply_state(state, c)
+ 
+     @staticmethod
+     def apply_state(state, c):
+@@ -328,6 +353,7 @@ class Nvn:
+         if self.gpu_profile and self.stats['presents'] % 150 == 1 and self.stats['presents'] > 1:   # the run ends with os._exit: the profile is printed while it goes
+             import io, pstats
+             out = io.StringIO(); pstats.Stats(self.gpu_profile, stream=out).sort_stats(os.environ.get('NX2LINUX_GPU_PROFILE_SORT', 'cumulative')).print_stats(int(os.environ.get('NX2LINUX_GPU_PROFILE_LINES', '30'))); self.hz.log('[nvn] gpu profile by cumulative time:\n' + out.getvalue())
++        if self.creplay and self.stats['presents'] % 60 == 1: self.pull_stats()
+         if self.gpu and self.stats['presents'] % 60 == 1: self.hz.log(f'[nvn] gpu: {self.gpu.stats} gpu lib {self.gpu.gpu.stats()} errors {self.gpu_errors} gpu seconds {self.gpu_seconds:.1f} write-back {self.gpu.stats.get("write_back_seconds", 0)} s lib draw {getattr(self.gpu, "lib_draw_seconds", 0):.1f} s queue idle {self.queue_idle:.1f} busy {self.queue_busy:.1f} (cpu {self.queue_cpu:.1f}) s, game blocked in SyncWait {self.sync_wait:.1f} s, in acquire {self.acquire_wait:.1f} s window frames {self.display.frames if self.display is not None else 0}')
+         if not w or not w['textures']: return
+         t = self.o.get(w['textures'][index % len(w['textures'])])
+@@ -606,8 +632,7 @@ def _(n, r):
+     n.stats['submits'] += 1
+     lists = [n.cmdlists.get(h, []) for h in handles]
+     if n.jobs is not None: n.enqueue('submit', lists); return
+-    state = {}
+-    for cmds in lists: n.replay(cmds, state)
++    n.run_submit(lists)
+ 
+ 
+ # ---- command buffers: recorded in Python, replayed at submit ----
+@@ -966,5 +991,9 @@ def bootstrap_loader(hz, r):
+                 import nvn_rec
+                 try: hz.nvn.rec = nvn_rec.Recorder(hz.nvn.gpu.gpu.lib, ctypes.cast(hz.aot.lib.aot_guest_ptr, ctypes.c_void_p)); hz.log(f'[nvn] {len(hz.nvn.rec.names)} NVN calls recorded in C')
+                 except (AttributeError, OSError) as e: hz.log(f'[nvn] recording in C not available: {e}')
++            mode = os.environ.get('NX2LINUX_NVN_REPLAY', 'c')   # c: the draws are converted and made in C; py: in Python; check: both, and the draws compared
++            if hz.nvn.rec and mode != 'py' and hz.nvn.draw_log is None and hz.nvn.draw_sink is None:
++                import nvn_replay
++                hz.nvn.creplay = nvn_replay.CReplay(hz.nvn, hz.nvn.gpu, hz.nvn.rec); hz.nvn.rec.chunks = True; hz.nvn.creplay.check = mode == 'check'; hz.log(f'[nvn] draws converted and made in C ({mode})')
+         if hz.nvn.gpu and os.environ.get('NX2LINUX_NVN_ASYNC', '1') != '0': hz.nvn.start_worker(); hz.log('[nvn] the queue runs on its own thread')   # NX2LINUX_NVN_ASYNC=0: the submitting thread replays
+     r[0] = hz.nvn.lookup(hz.cstring(r[0]))
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 9496093..212e823 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -42,6 +42,7 @@ def main():
+     import threading
+     def report():
+         print('frames presented:', getattr(hz, 'frames_presented', 0), '| svc calls:', hz.stats, '| not translated functions called:', hz.aot.stat('unlifted_calls'))
++        if hasattr(hz, 'nvn'): hz.nvn.pull_stats()
+         if hasattr(hz, 'nvn'): print('nvn:', hz.nvn.stats, '| not implemented NVN calls:', sorted(hz.nvn.unimpl)[:60])
+         if hasattr(hz, 'nvn'): print('NVN calls (most frequent):', sorted(hz.nvn.all_calls().items(), key=lambda kv: -kv[1])[:30])
+         if hasattr(hz, 'nvn'): print('NVN queue/window/recording calls:', {k: v for k, v in hz.nvn.all_calls().items() if any(x in k for x in ('Queue', 'Window', 'Recording', 'Commands', 'Sync'))})
+diff --git a/dm/tools/nvn_gpu.py b/dm/tools/nvn_gpu.py
+index f1b84fd..f241ef3 100644
+--- a/dm/tools/nvn_gpu.py
++++ b/dm/tools/nvn_gpu.py
+@@ -528,41 +528,46 @@ class GpuBackend:
+             for tx in res['textures']:
+                 if tx['binding'] in seen: continue
+                 seen.add(tx['binding'])
+-                kind, array = tx['type'] & 0xFF, bool(tx['type'] & 0x100)
+-                if kind not in (3, 4, 5) or tx['type'] & 0x200 or (kind == 4 and array): raise Skip(f'texture type {tx["type"]:#x}')
+-                view_type = {3: 5 if array else 1, 4: 2, 5: 6 if array else 3}[kind]   # VkImageViewType: 2D / 2D array, 3D, cube / cube array
+-                handle = self.handle_of(state, stage, tx)
+-                tex_id, samp_id = handle & 0xFFFFF, handle >> 20 & 0xFFF
+-                tp = n.o.get(state.get('texpool', 0), {})
+-                ptr = tp.get('tex', {}).get(tex_id)
+-                view = tp.get('views', {}).get(tex_id)
+-                image, base_level, nlevels, base_layer, nlayers = None, 0, 0, 0, 0
+-                if ptr:
+-                    try:
+-                        im = self.image_of(ptr)
+-                        if self.view_fits(im, view_type): image = im['id']
+-                        else: self.count(f'dummy: view type {view_type} of a {"3D" if im["kind"] else str(im["layers"]) + "-layer"} image')
+-                    except Skip as e: self.count('dummy: ' + str(e))
+-                    if image and view:
+-                        if view['set_levels']: base_level, nlevels = view['base_level'], view['nlevels']
+-                        if view['set_layers']: base_layer, nlayers = view['min_layer'], view['nlayers']
+-                else: self.count('dummy: texture id not in the pool')
+-                if image is None: image, view_type, base_level, nlevels, base_layer, nlayers = self.dummy_image(view_type), view_type, 0, 0, 0, 0
+-                sp = n.o.get(state.get('samppool', 0), {}).get('samplers', {}).get(samp_id, {})
+-                t = hg.Tex(); t.binding, t.image = tx['binding'], image
+-                t.view_type, t.base_level, t.nlevels, t.base_layer, t.nlayers = view_type, base_level, nlevels, base_layer, nlayers
+-                t.swz[:] = self.swizzle_of(ptr, view)
+-                mn = sp.get('min_filter', 0)
+-                t.min_filter, t.mag_filter = int(mn & 1), int(sp.get('mag_filter', 0) & 1)
+-                t.mip_mode = 1 if mn in (4, 5) else 0
+-                t.wrap_s, t.wrap_t, t.wrap_r = (WRAP.get(sp.get(k, 1), 0) for k in ('wrap_s', 'wrap_t', 'wrap_r'))
+-                t.lod_min, t.lod_max, t.lod_bias, t.aniso = sp.get('lod_min', 0.0), (sp.get('lod_max', 1000.0) if mn >= 2 else 0.0), sp.get('lod_bias', 0.0), max(1.0, sp.get('aniso', 1.0))
+-                bc = sp.get('border', (0.0, 0.0, 0.0, 0.0))
+-                t.border = 4 if bc[0] > 0.5 and bc[3] > 0.5 else 2 if bc[3] > 0.5 else 0   # opaque white, opaque black, transparent black (the three Vulkan has)
+-                if tx['type'] & 0x400: t.compare_enable, t.compare_op = 1, max(0, sp.get('cmp_func', 2) - 1)
++                t = hg.Tex(); t.binding = tx['binding']
++                self.fill_texture(t, state.get('texpool', 0), state.get('samppool', 0), self.handle_of(state, stage, tx), tx['type'])
+                 d.tex[d.ntex] = t; d.ntex += 1
+         return writeback
+ 
++    def fill_texture(self, t, texpool, samppool, handle, tx_type):
++        """Fills the hg.Tex t (all of it but its binding) for a shader texture of type tx_type that reads handle through the pools; raises Skip for a type that cannot be sampled"""
++        n = self.nvn
++        kind, array = tx_type & 0xFF, bool(tx_type & 0x100)
++        if kind not in (3, 4, 5) or tx_type & 0x200 or (kind == 4 and array): raise Skip(f'texture type {tx_type:#x}')
++        view_type = {3: 5 if array else 1, 4: 2, 5: 6 if array else 3}[kind]   # VkImageViewType: 2D / 2D array, 3D, cube / cube array
++        tex_id, samp_id = handle & 0xFFFFF, handle >> 20 & 0xFFF
++        tp = n.o.get(texpool, {})
++        ptr = tp.get('tex', {}).get(tex_id)
++        view = tp.get('views', {}).get(tex_id)
++        image, base_level, nlevels, base_layer, nlayers = None, 0, 0, 0, 0
++        if ptr:
++            try:
++                im = self.image_of(ptr)
++                if self.view_fits(im, view_type): image = im['id']
++                else: self.count(f'dummy: view type {view_type} of a {"3D" if im["kind"] else str(im["layers"]) + "-layer"} image')
++            except Skip as e: self.count('dummy: ' + str(e))
++            if image and view:
++                if view['set_levels']: base_level, nlevels = view['base_level'], view['nlevels']
++                if view['set_layers']: base_layer, nlayers = view['min_layer'], view['nlayers']
++        else: self.count('dummy: texture id not in the pool')
++        if image is None: image, view_type, base_level, nlevels, base_layer, nlayers = self.dummy_image(view_type), view_type, 0, 0, 0, 0
++        sp = n.o.get(samppool, {}).get('samplers', {}).get(samp_id, {})
++        t.image = image
++        t.view_type, t.base_level, t.nlevels, t.base_layer, t.nlayers = view_type, base_level, nlevels, base_layer, nlayers
++        t.swz[:] = self.swizzle_of(ptr, view)
++        mn = sp.get('min_filter', 0)
++        t.min_filter, t.mag_filter = int(mn & 1), int(sp.get('mag_filter', 0) & 1)
++        t.mip_mode = 1 if mn in (4, 5) else 0
++        t.wrap_s, t.wrap_t, t.wrap_r = (WRAP.get(sp.get(k, 1), 0) for k in ('wrap_s', 'wrap_t', 'wrap_r'))
++        t.lod_min, t.lod_max, t.lod_bias, t.aniso = sp.get('lod_min', 0.0), (sp.get('lod_max', 1000.0) if mn >= 2 else 0.0), sp.get('lod_bias', 0.0), max(1.0, sp.get('aniso', 1.0))
++        bc = sp.get('border', (0.0, 0.0, 0.0, 0.0))
++        t.border = 4 if bc[0] > 0.5 and bc[3] > 0.5 else 2 if bc[3] > 0.5 else 0   # opaque white, opaque black, transparent black (the three Vulkan has)
++        if tx_type & 0x400: t.compare_enable, t.compare_op = 1, max(0, sp.get('cmp_func', 2) - 1)
++
+     def swizzle_of(self, ptr, view):
+         """The VkComponentSwizzle of r, g, b, a for sampling a texture: the texture builder's swizzle, the view's over it, a format without alpha reading 1 (0: identity)"""
+         t = self.nvn.o.get(ptr) if ptr else None
+diff --git a/dm/tools/nvn_rec.py b/dm/tools/nvn_rec.py
+index 56ed68f..ad640b5 100644
+--- a/dm/tools/nvn_rec.py
++++ b/dm/tools/nvn_rec.py
+@@ -8,6 +8,7 @@ import struct
+ import nvn_state
+ 
+ OP_UBO, OP_SSBO, OP_VBUF, OP_TEX, OP_VIEWPORT, OP_SCISSOR, OP_PROGRAM, OP_BIND_STATE, OP_VATTR, OP_VSTREAM, OP_DRAW, OP_TARGETS, OP_STENCIL = range(1, 14)
++OP_SAMP, OP_IMG, OP_TEXPOOL, OP_SAMPPOOL, OP_MISC, OP_VIEWPORT_F = range(14, 20)   # records only the replay in C (nvnreplay.inc) and Python's encoding of its own commands use
+ STATE_KINDS = (nvn_state.BLEND, nvn_state.COLOR, nvn_state.CHMASK, nvn_state.MULTISAMPLE, nvn_state.POLYGON, nvn_state.DEPTH_STENCIL)   # the order of nvnrec.c r_bind_state
+ STENCIL_KEYS = ('stencil_ref_', 'stencil_mask_', 'stencil_value_mask_')
+ F_MASK, F_BOOL, F_ADV_MODE, F_NOT = range(4)
+@@ -69,6 +70,7 @@ class Recorder:
+         buf = C.create_string_buffer(1 << 14)
+         n = L.nx2rec_names(buf, len(buf))
+         self.names = set(buf.raw[:n].decode().split())
++        self.chunks = False   # the replay in C reads the streams as they are: take() hands them over undecoded
+         self.cache = {}   # (op, raw bytes) -> decoded state objects, shared: nothing changes them after they are recorded
+ 
+     def native(self, name):
+@@ -90,7 +92,7 @@ class Recorder:
+         if not n: return []
+         buf = C.create_string_buffer(n)
+         n = self.lib.nx2rec_take(cb, buf, n)
+-        return self.decode(buf.raw[:n])
++        return [('cstream', buf.raw[:n])] if self.chunks else self.decode(buf.raw[:n])
+ 
+     def decode(self, raw):
+         out, pos, end, cache = [], 0, len(raw), self.cache
+@@ -132,6 +134,11 @@ class Recorder:
+             elif op == OP_STENCIL:
+                 which, faces, value = struct.unpack_from('<3Q', raw, body); key = STENCIL_KEYS[which]
+                 out.append(('misc', {f'{key}{f}': value for f in (1, 2) if faces & f}))
++            elif op == OP_SAMP or op == OP_IMG:
++                stage, idx, h = struct.unpack_from('<3Q', raw, body); out.append(('samp' if op == OP_SAMP else 'img', {(stage, idx): h}))
++            elif op == OP_TEXPOOL or op == OP_SAMPPOOL: out.append(('texpool' if op == OP_TEXPOOL else 'samppool', struct.unpack_from('<Q', raw, body)[0]))
++            elif op == OP_VIEWPORT_F:
++                out.append(('viewports', {0: struct.unpack('<4f', struct.pack('<4I', *(w & 0xFFFFFFFF for w in struct.unpack_from('<4Q', raw, body))))}))
+             else: raise ValueError(f'unknown record {op} in the stream of a command buffer')
+         return out
+ 
+diff --git a/dm/tools/nvn_replay.py b/dm/tools/nvn_replay.py
+new file mode 100644
+index 0000000..d08f4ce
+--- /dev/null
++++ b/dm/tools/nvn_replay.py
+@@ -0,0 +1,263 @@
++"""The replay of NVN command streams in C (NX2Linux S7bis): linux/host/nvnreplay.inc keeps the state a draw reads from the streams nvnrec.c records and turns each draw into the GPU library's call without
++Python: the conversion nvn_gpu.py GpuBackend._draw does, ported. This module is its Python side: the callbacks the C code asks when it meets a program, a render target or a texture binding it has not
++seen (the answers are kept there, once per frame for textures: a texture the game wrote since is read again), the encoding of the commands Python records itself into the same records, and the
++export of the C state when Python does a command itself (a clear, a compute dispatch, an indirect draw, a draw with storage images). NX2LINUX_NVN_REPLAY=py turns it off; =check runs both and compares the draws."""
++import ctypes as C
++import struct
++
++import horizon_gpu as hg
++import nvn_gpu
++import nvn_rec
++import nvn_spirv
++import nvn_state
++
++U32, U64 = C.c_uint32, C.c_uint64
++KIND = {'vs': 0, 'ps': 1, 'gs': 2, 'tcs': 3, 'tes': 4}
++MISC_BLEND_COLOR, MISC_DEPTH_RANGE, MISC_ALPHA_REF, MISC_POLY_OFFSET, MISC_PATCH_SIZE = range(1, 6)
++# the skip reasons the C code finds, in the order of its enum (nvnreplay.inc SK_*)
++SKIPS = ('no program', 'targets', 'no target', 'vertex stream not bound', 'vertex format', 'unreadable buffer', 'index buffer', 'primitive', 'patches without tessellation shaders',
++         'tessellation without both stages', 'too many buffers', 'alpha test: no variant', 'texture slot', 'program skipped', 'image skipped', 'texture skipped', 'empty draw')
++STAT_NAMES = ('draws', 'lib_errors', 'write_backs', 'prog_callbacks', 'image_callbacks', 'texture_callbacks', 'fallbacks')
++
++
++class CbInfo(C.Structure): _fields_ = [('binding', U32), ('slot', U32)]
++class SbInfo(C.Structure): _fields_ = [('binding', U32), ('cb_slot', U32), ('cb_offset', U32), ('flags', U32)]
++class TxInfo(C.Structure): _fields_ = [('binding', U32), ('type', U32), ('handle', U32), ('cbuf_slot', U32)]
++class StInfo(C.Structure):
++    _fields_ = [('module', U32), ('kind', U32), ('nvn_stage', U32), ('ncb', U32), ('nsb', U32), ('ntx', U32), ('nim', U32), ('pad', U32),
++                ('cb', CbInfo * 32), ('sb', SbInfo * 32), ('tx', TxInfo * 32), ('c1', C.c_void_p)]
++class ProgInfo(C.Structure):
++    _fields_ = [('status', C.c_int32), ('nst', U32), ('alpha_known', U32), ('alpha_module', U32), ('program', U64), ('epoch', U64), ('st', StInfo * 5)]
++class ImgInfo(C.Structure):
++    _fields_ = [('status', C.c_int32), ('id', U32), ('w', U32), ('h', U32), ('depth', U32), ('kind', U32), ('layers', U32), ('pad', U32)]
++
++
++PROG_CB = C.CFUNCTYPE(C.c_int, U64, C.POINTER(ProgInfo))
++ALPHA_CB = C.CFUNCTYPE(C.c_int, U64, C.POINTER(U32))
++IMG_CB = C.CFUNCTYPE(C.c_int, U64, C.POINTER(ImgInfo))
++TEX_CB = C.CFUNCTYPE(C.c_int, U64, U64, U64, U32, C.POINTER(hg.Tex))
++HOOK = C.CFUNCTYPE(None, C.c_void_p)
++
++
++def words(*ws): return b''.join(struct.pack('<Q', w & 0xFFFFFFFFFFFFFFFF) for w in ws)
++def record(op, *ws): return struct.pack('<Q', op | (len(ws) + 1) << 32) + words(*ws)
++def fbits(f): return struct.unpack('<I', struct.pack('<f', f))[0]
++
++
++class CReplay:
++    def __init__(self, nvn, backend, rec):
++        self.nvn, self.b, self.rec = nvn, backend, rec
++        self.lib = L = rec.lib
++        L.nx2rep_callbacks.argtypes = [C.c_void_p] * 4
++        L.nx2rep_tables.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_char_p, U32, U32, U32]
++        L.nx2rep_epoch.argtypes = [C.c_int]; L.nx2rep_frame.argtypes = [U64]; L.nx2rep_depth_mode.argtypes = [U32]
++        L.nx2rep_hook.argtypes = [C.c_void_p]
++        L.nx2rep_apply.argtypes = [C.c_char_p, U32]
++        L.nx2rep_run.argtypes = [C.c_char_p, U32, C.POINTER(U32)]; L.nx2rep_run.restype = C.c_int
++        L.nx2rep_export.argtypes = [C.c_char_p, U32, U32]; L.nx2rep_export.restype = U32
++        L.nx2rep_stats.argtypes = [C.POINTER(U64)]
++        self.cbs = (PROG_CB(self.prog_cb), ALPHA_CB(self.alpha_cb), IMG_CB(self.img_cb), TEX_CB(self.tex_cb))   # kept alive: the library holds the raw pointers
++        L.nx2rep_callbacks(*[C.cast(c, C.c_void_p).value for c in self.cbs])
++        vk = (U32 * 256)(); [vk.__setitem__(k, v) for k, v in nvn_gpu.NVN_TO_VK.items() if k < 256]
++        bf = (C.c_int16 * 0x65)(*([-1] * 0x65)); [bf.__setitem__(k, v) for k, v in nvn_gpu.BLEND_FACTOR.items()]
++        wrap = (C.c_uint8 * 8)(*[nvn_gpu.WRAP.get(i, 0) for i in range(8)])
++        support = nvn_gpu.SUPPORT
++        L.nx2rep_tables(C.addressof(vk), C.addressof(bf), C.addressof(wrap), support, len(support), nvn_spirv.ALPHA_FUNC_OFFSET, nvn_spirv.ALPHA_REF_OFFSET)
++        self.seen = [0] * (8 + len(SKIPS) + 32)
++        self.prog_names = {}   # program pointer -> the stage keys of its last resolution (for the alpha variant)
++        self.export_buf = C.create_string_buffer(1 << 18)
++        self.check = False                      # NX2LINUX_NVN_REPLAY=check: every stream goes through both paths and the draws are compared
++        self.checked = self.differed = self.shown = 0
++        self.hook_cb = HOOK(self.on_draw); self.captured = []
++
++    # ---- per submit ----
++    def begin(self):
++        dev = self.nvn.o.get(getattr(self.nvn, 'device', 0), {})
++        self.lib.nx2rep_depth_mode(int(dev.get('depth', 0) == 0))
++        self.lib.nx2rep_frame(self.nvn.stats['presents'] + 1)
++        self.lib.nx2rep_begin()
++
++    def bump(self, which): self.lib.nx2rep_epoch(which)
++
++    def run(self, chunk, state):
++        """Replays a stream of records; a draw C hands back is done here with the exported state"""
++        if self.check: return self.run_check(chunk, state)
++        stop = U32(0)
++        while chunk:
++            if not self.lib.nx2rep_run(chunk, len(chunk), C.byref(stop)): return
++            pos = stop.value; nw = struct.unpack_from('<Q', chunk, pos)[0] >> 32
++            call = self.rec.decode(chunk[pos:pos + 8 * nw])[0][1]
++            self.sync(state)
++            self.nvn.draw(state, call)
++            chunk = chunk[pos + 8 * nw:]
++
++    def sync(self, state, what=3):
++        """The state C keeps, into the state dict Python commands read"""
++        n = self.lib.nx2rep_export(self.export_buf, len(self.export_buf), what)
++        for c in self.rec.decode(self.export_buf.raw[:n]):
++            if c[0] == 'targets': state['rt'], state['depth'], state['rt_views'], state['depth_view'] = c[1], c[2], c[3], c[4]
++            else: self.nvn.apply_state(state, c)
++
++    # ---- the commands Python records itself, encoded for C ----
++    def apply_python(self, c):
++        out = self.encode(c)
++        if out: self.lib.nx2rep_apply(out, len(out))
++
++    def encode(self, c):
++        op, out = c[0], []
++        if op == 'program': out.append(record(nvn_rec.OP_PROGRAM, c[1], c[2]))
++        elif op == 'bind_state':
++            kind = next(i for i, s in enumerate(nvn_rec.STATE_KINDS) if s.name == c[1])
++            raw = nvn_rec.STATE_KINDS[kind].pack(c[2]).ljust(16, b'\0'); out.append(record(nvn_rec.OP_BIND_STATE, kind, *struct.unpack('<2Q', raw)))
++        elif op in ('vattr', 'vstream'):
++            spec = nvn_state.VERTEX_ATTRIB if op == 'vattr' else nvn_state.VERTEX_STREAM
++            raw = b''.join(spec.pack(a) for a in c[1]); raw = raw.ljust(-(-len(raw) // 8) * 8, b'\0')
++            out.append(struct.pack('<Q', (nvn_rec.OP_VATTR if op == 'vattr' else nvn_rec.OP_VSTREAM) | (2 + len(raw) // 8) << 32) + words(len(c[1])) + raw)
++        elif op in ('ubo', 'ssbo'):
++            for (stage, idx), (addr, size) in c[1].items(): out.append(record(nvn_rec.OP_UBO if op == 'ubo' else nvn_rec.OP_SSBO, stage, idx, addr, size))
++        elif op == 'vbuf':
++            for idx, (addr, size) in c[1].items(): out.append(record(nvn_rec.OP_VBUF, idx, addr, size))
++        elif op in ('tex', 'samp', 'img'):
++            code = {'tex': nvn_rec.OP_TEX, 'samp': nvn_rec.OP_SAMP, 'img': nvn_rec.OP_IMG}[op]
++            for (stage, idx), h in c[1].items(): out.append(record(code, stage, idx, h))
++        elif op == 'texpool': out.append(record(nvn_rec.OP_TEXPOOL, c[1]))
++        elif op == 'samppool': out.append(record(nvn_rec.OP_SAMPPOOL, c[1]))
++        elif op in ('viewports', 'scissors'):
++            v = c[1].get(0)
++            if v is not None:
++                if op == 'scissors': out.append(record(nvn_rec.OP_SCISSOR, *v))
++                elif all(isinstance(x, int) for x in v): out.append(record(nvn_rec.OP_VIEWPORT, *v))
++                else: out.append(record(nvn_rec.OP_VIEWPORT_F, *[fbits(x) for x in v]))
++        elif op == 'targets':
++            ptrs, depth, views, dview = c[1], c[2], c[3], c[4]
++            ws = [len(ptrs), depth, int(dview is not None)] + list(struct.unpack('<2Q', (nvn_state.TEXTURE_VIEW.pack(dview) if dview else bytes(16))))
++            for i, p in enumerate(ptrs):
++                v = views[i] if i < len(views) else None
++                ws += [p, int(v is not None)] + list(struct.unpack('<2Q', nvn_state.TEXTURE_VIEW.pack(v) if v else bytes(16)))
++            out.append(record(nvn_rec.OP_TARGETS, *ws))
++        elif op == 'misc':
++            for k, v in c[1].items():
++                if k == 'blend_color': out.append(record(nvn_rec.OP_MISC, MISC_BLEND_COLOR, *[fbits(x) for x in v]))
++                elif k == 'depth_range': out.append(record(nvn_rec.OP_MISC, MISC_DEPTH_RANGE, *[fbits(x) for x in v], 0, 0))
++                elif k == 'alpha_ref': out.append(record(nvn_rec.OP_MISC, MISC_ALPHA_REF, fbits(v), 0, 0, 0))
++                elif k == 'polygon_offset': out.append(record(nvn_rec.OP_MISC, MISC_POLY_OFFSET, *[fbits(x) for x in v], 0))
++                elif k == 'patch_size': out.append(record(nvn_rec.OP_MISC, MISC_PATCH_SIZE, v, 0, 0, 0))
++                elif k.startswith('stencil_'):
++                    which, face = next((i, int(k[len(p):])) for i, p in enumerate(nvn_rec.STENCIL_KEYS) if k.startswith(p))
++                    out.append(record(nvn_rec.OP_STENCIL, which, face, v))
++        return b''.join(out)
++
++    # ---- the callbacks: what C asks of the game's objects ----
++    def stages_of(self, ptr):
++        n = self.nvn; by_stage = {}
++        for st in n.program_stages(ptr):
++            key = st.get('key')
++            if key in n.shader_bytes: by_stage[nvn_spirv.stage_of(n.shader_bytes[key][1], n.shader_bytes[key][0])] = key
++        return by_stage
++
++    def prog_cb(self, ptr, out):
++        b, info = self.b, out[0]
++        try:
++            by_stage = self.stages_of(ptr)
++            if 'vs' not in by_stage or (set(by_stage) - set(nvn_gpu.NVN_STAGE)): raise nvn_gpu.Skip('stages ' + '+'.join(sorted(by_stage)))
++            loaded = {st: b.shader_of(key) for st, key in by_stage.items()}
++            info.nst = len(loaded)
++            for i, (st, (module, _, res)) in enumerate(loaded.items()):
++                s = info.st[i]; s.module, s.kind, s.nvn_stage = module, KIND[st], nvn_gpu.NVN_STAGE[st]
++                if len(res['cbufs']) > 32 or len(res['sbufs']) > 32 or len(res['textures']) > 32: raise nvn_gpu.Skip('more than 32 resources of a kind')
++                s.ncb, s.nsb, s.ntx, s.nim = len(res['cbufs']), len(res['sbufs']), len(res['textures']), len(res['images'])
++                for k, cb in enumerate(res['cbufs']): s.cb[k].binding, s.cb[k].slot = cb['binding'], cb['slot']
++                for k, sb in enumerate(res['sbufs']): s.sb[k].binding, s.sb[k].cb_slot, s.sb[k].cb_offset, s.sb[k].flags = sb['binding'], sb['cb_slot'], sb['cb_offset'], sb['flags']
++                for k, tx in enumerate(res['textures']): s.tx[k].binding, s.tx[k].type, s.tx[k].handle, s.tx[k].cbuf_slot = tx['binding'], tx['type'], tx['handle'], tx['cbuf_slot']
++                if any(cb['slot'] == 1 for cb in res['cbufs']):
++                    c1 = b.constant_segment(by_stage[st], st)   # kept by the backend: the pointer stays valid
++                    s.c1 = C.cast(C.c_char_p(c1), C.c_void_p).value
++            info.status = 2 if any(res['images'] for _, _, res in loaded.values()) else 0
++            self.prog_names[ptr] = by_stage
++        except nvn_gpu.Skip as e:
++            b.skip(str(e)); info.status = 1
++        except Exception as e:
++            self.nvn.hz.log(f'[nvn] replay: program callback failed: {type(e).__name__}: {e}'); info.status = 1
++        return 0
++
++    def alpha_cb(self, ptr, module):
++        try:
++            key = self.prog_names.get(ptr, {}).get('ps')
++            module[0] = self.b.alpha_module(key) if key else 0
++        except Exception as e: self.nvn.hz.log(f'[nvn] replay: alpha callback failed: {type(e).__name__}: {e}'); module[0] = 0
++        return 0
++
++    def img_cb(self, ptr, out):
++        info = out[0]
++        try:
++            im = self.b.image_of(ptr, target=True)
++            info.id, info.w, info.h, info.depth, info.kind, info.layers = im['id'], im['w'], im['h'], int(im['depth']), im['kind'], im['layers']; info.status = 0
++        except nvn_gpu.Skip as e: self.b.skip(str(e)); info.status = 1
++        except Exception as e: self.nvn.hz.log(f'[nvn] replay: image callback failed: {type(e).__name__}: {e}'); info.status = 1
++        return 0
++
++    def tex_cb(self, texpool, samppool, handle, tx_type, out):
++        try:
++            self.b.fill_texture(out[0], texpool, samppool, handle, tx_type); return 0
++        except nvn_gpu.Skip as e: self.b.skip(str(e)); return 1
++        except Exception as e: self.nvn.hz.log(f'[nvn] replay: texture callback failed: {type(e).__name__}: {e}'); return 1
++
++    # ---- counters ----
++    def pull_stats(self):
++        """Adds what C counted since the last call to the counters Python keeps"""
++        arr = (U64 * (8 + len(SKIPS) + 32))(); self.lib.nx2rep_stats(arr)
++        cur = list(arr); d = [a - b for a, b in zip(cur, self.seen)]; self.seen = cur
++        n, b = self.nvn, self.b
++        n.stats['draws'] += d[0]; b.stats['draws'] += d[0]; n.gpu_errors += d[1]; b.stats['write_backs'] = b.stats.get('write_backs', 0) + d[2]
++        for i, name in enumerate(SKIPS):
++            if d[8 + i]: b.stats['skipped'][name] = b.stats['skipped'].get(name, 0) + d[8 + i]
++        for p in range(32):
++            if d[8 + len(SKIPS) + p]: n.draw_by_prim[p] = n.draw_by_prim.get(p, 0) + d[8 + len(SKIPS) + p]
++        return dict(zip(STAT_NAMES, cur))
++
++    # ---- check mode: C and Python make the same draws? ----
++    def normalize(self, d):
++        """A draw as bytes: the struct with its pointers cleared, and the memory it points to"""
++        c = hg.Draw.from_buffer_copy(d); blobs = []
++        for i in range(c.nstreams): s = c.streams[i]; blobs.append(C.string_at(s.data, s.size) if s.size else b''); s.data = 0
++        for i in range(c.nbufs): b = c.bufs[i]; blobs.append(C.string_at(b.data, b.size) if b.size else b''); b.data = 0; b.ring_offset = 0
++        if c.index_size: blobs.append(C.string_at(c.index_data, c.index_size)); c.index_data = 0
++        return bytes(c), blobs
++
++    def on_draw(self, ptr): self.captured.append(self.normalize(hg.Draw.from_address(ptr)))
++
++    def run_check(self, chunk, state):
++        self.captured = []; self.lib.nx2rep_hook(C.cast(self.hook_cb, C.c_void_p).value)
++        stop, rest = U32(0), chunk
++        while rest and self.lib.nx2rep_run(rest, len(rest), C.byref(stop)):   # a draw C does not do is left to the Python pass
++            pos = stop.value; self.captured.append(None); rest = rest[pos + 8 * (struct.unpack_from('<Q', rest, pos)[0] >> 32):]   # the Python pass makes it: a placeholder keeps the order
++        self.lib.nx2rep_hook(None)
++        from_c, self.captured = self.captured, []
++        py, orig, saved = [], self.b.gpu.draw, self.nvn.creplay
++        def cap(d): py.append(self.normalize(d)); return orig(d)
++        self.b.gpu.draw = cap; self.nvn.creplay = None
++        try: self.nvn.replay(self.rec.decode(chunk), state)
++        finally: self.b.gpu.draw = orig; self.nvn.creplay = saved
++        self.checked += len(py)
++        for i in range(max(len(py), len(from_c))):
++            if i < len(py) and i < len(from_c) and (from_c[i] is None or py[i] == from_c[i]): continue
++            self.differed += 1
++            if self.shown < 8:
++                self.shown += 1
++                self.nvn.hz.log(f'[nvn] replay check: draw {i} of a stream of {len(py)} (C made {len(from_c)}): ' + (self.diff(py[i], from_c[i]) if i < len(py) and i < len(from_c) else 'only one side made it'))
++        if self.checked and self.checked // 5000 != (self.checked - len(py)) // 5000: self.nvn.hz.log(f'[nvn] replay check: {self.checked} draws compared, {self.differed} differ')
++
++    def diff(self, a, b):
++        names = []
++        for name, typ in hg.Draw._fields_:
++            off, size = getattr(hg.Draw, name).offset, C.sizeof(typ)
++            if a[0][off:off + size] != b[0][off:off + size]:
++                if name in ('bufs', 'streams', 'tex', 'attrs', 'targets', 'blend'):
++                    el = size // len(getattr(hg.Draw(), name)); idx = next(i for i in range(size // el) if a[0][off + i * el:off + (i + 1) * el] != b[0][off + i * el:off + (i + 1) * el])
++                    names.append(f'{name}[{idx}]')
++                    if name == 'tex':
++                        ta, tb = hg.Tex.from_buffer_copy(a[0][off + idx * el:off + (idx + 1) * el]), hg.Tex.from_buffer_copy(b[0][off + idx * el:off + (idx + 1) * el])
++                        names.append({f: (getattr(ta, f), getattr(tb, f)) for f, _ in hg.Tex._fields_ if f != 'swz' and getattr(ta, f) != getattr(tb, f)} or 'swz')
++                else: names.append(name)
++        blobs = [i for i, (x, y) in enumerate(zip(a[1], b[1])) if x != y]
++        return f'fields {names or "-"}, memory blobs {blobs or "-"} ({len(a[1])} against {len(b[1])})'
+diff --git a/dm/tools/tests/test_nvn_rec.py b/dm/tools/tests/test_nvn_rec.py
+index 006f520..8992b77 100644
+--- a/dm/tools/tests/test_nvn_rec.py
++++ b/dm/tools/tests/test_nvn_rec.py
+@@ -1,6 +1,6 @@
+ """nvn_rec.py / linux/host/nvnrec.c: the NVN calls recorded in C give the same commands, and change state objects to the same bytes, as the Python versions in horizon_nvn.py (random arguments, a fake guest memory)"""
+ import ctypes as C
+-import random, struct, sys, unittest
++import random, struct, sys, types, unittest
+ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+@@ -110,4 +110,30 @@ class Native(unittest.TestCase):
+         self.assertEqual(self.rec.counts()['nvnDeviceGetTextureHandle'], 1)
+ 
+ 
++    def test_the_state_c_keeps_matches_the_one_python_builds_from_the_same_commands(self):
++        import nvn_replay
++        nvn = types.SimpleNamespace(o={}, stats={'presents': 0}, device=0, apply_state=hn.Nvn.apply_state)
++        rp = nvn_replay.CReplay(nvn, None, self.rec); rp.begin()
++        blend = nvn_state.BLEND.default(); blend.update(target=1, src_rgb=6, dst_rgb=7)
++        ds = nvn_state.DEPTH_STENCIL.default(); ds.update(dt=1, df=4, st=1)
++        view = nvn_state.TEXTURE_VIEW.default(); view.update(set_levels=1, base_level=2, set_layers=1, min_layer=3)
++        cmds = [('program', 0x1000, 0x1F), ('program', 0x2000, 0x20), ('ubo', {(0, 1): (0x10, 64), (1, 3): (0x20, 16)}), ('ssbo', {(1, 0): (0x30, 128)}), ('vbuf', {0: (0x40, 256), 2: (0x50, 32)}),
++                ('tex', {(1, 0): 0x300005, (1, 129): 7}), ('samp', {(1, 0): 0x99}), ('img', {(5, 2): 0x1234}), ('texpool', 0x7000), ('samppool', 0x8000),
++                ('bind_state', 'blend', blend), ('bind_state', 'depth_stencil', ds), ('bind_state', 'chmask', {'mask': 0xFFFFFF0F}),
++                ('vattr', [nvn_state.VERTEX_ATTRIB.unpack(bytes([0x25, 4, 0, 0])), nvn_state.VERTEX_ATTRIB.unpack(bytes([0x0A, 0, 0, 8]))]), ('vstream', [{'stride': 16, 'divisor': 0}]),
++                ('viewports', {0: (1, 2, 640, 360)}), ('scissors', {0: (0, 0, 640, 360)}), ('targets', [0x5000, 0x5100], 0x6000, [view, None], view)]
++        state = {}
++        for c in cmds: rp.apply_python(c)
++        py = {}
++        for c in cmds:
++            if c[0] == 'targets': py['rt'], py['depth'], py['rt_views'], py['depth_view'] = c[1], c[2], c[3], c[4]
++            else: hn.Nvn.apply_state(py, c)
++        rp.sync(state)
++        for key in ('program', 'cs_program', 'ubo', 'ssbo', 'vbuf', 'tex', 'samp', 'img', 'texpool', 'samppool', 'vattr', 'vstream', 'rt', 'depth', 'rt_views', 'depth_view'):
++            self.assertEqual(state.get(key), py.get(key), key)
++        self.assertEqual(state['states']['depth_stencil'], py['states']['depth_stencil']); self.assertEqual(state['blends'], py['blends'])
++        self.assertEqual(state['states']['chmask']['mask'], 0xFFFFFF0F)
++        self.assertEqual(state['viewport'][0], (1.0, 2.0, 640.0, 360.0)); self.assertEqual(state['scissor'][0], (0, 0, 640, 360))
++
++
+ if __name__ == '__main__': unittest.main()

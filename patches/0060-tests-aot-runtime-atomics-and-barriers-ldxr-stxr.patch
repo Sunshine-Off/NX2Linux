@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 14:28:11 +0100
+Subject: [PATCH] tests, aot_runtime: atomics and barriers (ldxr/stxr,
+ ldaxr/stlxr, ldar/stlr, dmb, isb)
+
+The runtime gets a real compare-and-swap (naturally aligned access required, else an explicit error),
+the four Remill barriers as fences, the atomic bracket intrinsics and atomic counters. test_aot_atomics.py
+checks twelve instruction sequences against Unicorn, the barrier order in the lifted IR, a failed exclusive
+store without an exclusive load, and four host threads adding to one counter with an ldaxr/stlxr loop
+(80000 exactly, three times; the same threads with ldr/add/str lose updates). Needs the fork's Remill
+patches (ADC/ADCS, exclusive monitor); skipped otherwise.
+
+Upstream-Status: pending
+Reason: atomics of the AArch64 -> x86_64 recompilation (NX2Linux); runtime and tests, nothing in the host, loader or shader chain changes
+Issue: none yet (NX2Linux, branch feat/teo-t3-branches-memoire-appels)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/aot_runtime.cpp           |  31 ++++--
+ dm/tools/tests/test_aot_atomics.py | 147 +++++++++++++++++++++++++++++
+ 2 files changed, 172 insertions(+), 6 deletions(-)
+ create mode 100644 dm/tools/tests/test_aot_atomics.py
+
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index 38d5923..d2b0ace 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -5,6 +5,7 @@
+ //   · errors leave the lifted code by longjmp (its frames hold no destructors), and aot_run reports them as text.
+ // ADDRESS_SIZE_BITS=64 and Remill's include folder are on the command line (aot_lift.py). Flag and compare intrinsics are markers whose first argument is already the value, as in remill_host.cpp.
+ #include "remill/Arch/AArch64/Runtime/State.h"
++#include <atomic>
+ #include <csetjmp>
+ #include <cstdarg>
+ #include <cstdint>
+@@ -25,6 +26,7 @@ thread_local jmp_buf *g_jb;
+ thread_local char g_err[300];
+ uint64_t g_stats[6];   // indirect calls, indirect jumps, fallback requests, memory reads, memory writes, regions mapped
+ enum { S_CALLS, S_JUMPS, S_FALLBACK, S_READS, S_WRITES, S_REGIONS };
++inline void count(int i) { __atomic_fetch_add(&g_stats[i], 1, __ATOMIC_RELAXED); }   // guest threads run the lifted code at once
+ 
+ [[noreturn]] void fail(const char *fmt, ...) {
+     va_list ap; va_start(ap, fmt); vsnprintf(g_err, sizeof g_err, fmt, ap); va_end(ap);
+@@ -54,23 +56,40 @@ bool __remill_flag_computation_overflow(bool r, ...) { return r; }
+ COMPARE(eq) COMPARE(neq) COMPARE(slt) COMPARE(sle) COMPARE(sgt) COMPARE(sge) COMPARE(ult) COMPARE(ule) COMPARE(ugt) COMPARE(uge)
+ 
+ #define ACCESS(N, T) \
+-    T __remill_read_memory_##N(Memory *, uint64_t a) { T v; memcpy(&v, guest(a, sizeof(T), "read"), sizeof v); g_stats[S_READS]++; return v; } \
+-    Memory *__remill_write_memory_##N(Memory *m, uint64_t a, T v) { memcpy(guest(a, sizeof(T), "write"), &v, sizeof v); g_stats[S_WRITES]++; return m; }
++    T __remill_read_memory_##N(Memory *, uint64_t a) { T v; memcpy(&v, guest(a, sizeof(T), "read"), sizeof v); count(S_READS); return v; } \
++    Memory *__remill_write_memory_##N(Memory *m, uint64_t a, T v) { memcpy(guest(a, sizeof(T), "write"), &v, sizeof v); count(S_WRITES); return m; }
+ ACCESS(8, uint8_t) ACCESS(16, uint16_t) ACCESS(32, uint32_t) ACCESS(64, uint64_t)
+ 
++// Atomics. An exclusive store (stxr, stlxr) is a compare-and-swap against the value the exclusive load read (the Remill patch keeps it in MONITOR_VALUE), so it fails when another thread wrote
++// the location in between. The access must be naturally aligned, as the hardware requires of an exclusive access: otherwise an explicit error.
++#define CAS(N, T) \
++    Memory *__remill_compare_exchange_memory_##N(Memory *m, uint64_t a, T &expected, T desired) { \
++        if (a % sizeof(T)) fail("atomic access of %u bytes at %#llx is not naturally aligned", (unsigned)sizeof(T), (unsigned long long)a); \
++        __atomic_compare_exchange_n((T *)guest(a, sizeof(T), "atomic access"), &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); \
++        count(S_WRITES); return m; }
++CAS(8, uint8_t) CAS(16, uint16_t) CAS(32, uint32_t) CAS(64, uint64_t)
++Memory *__remill_atomic_begin(Memory *m) { return m; }   // the CAS above is the atomic operation; these only bracket the instruction
++Memory *__remill_atomic_end(Memory *m) { return m; }
++
++// Barriers, each ordering what its name says on any host (free on x86 but store->load, which needs the full fence)
++Memory *__remill_barrier_load_load(Memory *m) { std::atomic_thread_fence(std::memory_order_acquire); return m; }
++Memory *__remill_barrier_load_store(Memory *m) { std::atomic_thread_fence(std::memory_order_acquire); return m; }
++Memory *__remill_barrier_store_store(Memory *m) { std::atomic_thread_fence(std::memory_order_release); return m; }
++Memory *__remill_barrier_store_load(Memory *m) { std::atomic_thread_fence(std::memory_order_seq_cst); return m; }
++
+ Memory *__remill_function_return(State &, uint64_t, Memory *m) { return m; }   // `ret`: the C return of the lifted function is the AArch64 return (x30 is not consulted, see hypotheses.md)
+ 
+ Memory *__remill_function_call(State &st, uint64_t pc, Memory *m) {   // blr
+-    g_stats[S_CALLS]++;
++    count(S_CALLS);
+     if (AotFn f = find(pc)) return f(&st, pc, m);
+-    g_stats[S_FALLBACK]++;
++    count(S_FALLBACK);
+     fail("indirect call to %#llx: not the entry of an AOT function, and no JIT fallback yet", (unsigned long long)pc);
+ }
+ 
+ Memory *__remill_jump(State &st, uint64_t pc, Memory *m) {   // br: a tail call, so the target must be a function entry too
+-    g_stats[S_JUMPS]++;
++    count(S_JUMPS);
+     if (AotFn f = find(pc)) return f(&st, pc, m);
+-    g_stats[S_FALLBACK]++;
++    count(S_FALLBACK);
+     fail("indirect jump to %#llx: not the entry of an AOT function (a jump table inside a function is not supported yet), and no JIT fallback yet", (unsigned long long)pc);
+ }
+ 
+diff --git a/dm/tools/tests/test_aot_atomics.py b/dm/tools/tests/test_aot_atomics.py
+new file mode 100644
+index 0000000..d90db2c
+--- /dev/null
++++ b/dm/tools/tests/test_aot_atomics.py
+@@ -0,0 +1,147 @@
++"""T3 follow-up, atomics and barriers: ldxr/ldaxr/stxr/stlxr, ldar/stlr, dmb and isb (the ones the Switch's A57 cores use: no LSE).
++  · each instruction sequence equals the Unicorn ARM64 reference on registers, NZCV and memory;
++  · the order of the barriers around the access is what acquire and release require (read in the lifted IR);
++  · an exclusive store with no exclusive load fails, as the hardware's does, and an unaligned exclusive access is an explicit error;
++  · several host threads incrementing one counter with an ldaxr/stlxr loop lose no update: the exclusive store is a real compare-and-swap.
++Needs a Remill with the ADC/ADCS and exclusive-store patches (fork en cours/remill-patches), REMILL_BUILD, clang++ and unicorn; skipped otherwise."""
++import re, struct, sys, tempfile, threading, unittest, os
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_fixture as fx
++import arm64_ref as ref
++from test_aot_t3 import DATA, DATA_SIZE, MEM, SP, READY, same
++
++ADDR = 0x1000
++RET = aot_lift.RET
++LDXR_X, LDXR_W, STXR_X, STXR_W = 0xC85F7C02, 0x885F7C02, 0xC8047C01, 0x88047C01
++LDAXR_X, LDAXR_W, STLXR_X, STLXR_W = 0xC85FFC02, 0x885FFC02, 0xC804FC01, 0x8804FC01
++LDAR_X, STLR_X, STLR_W, ISB, DMB_ISH = 0xC8DFFC02, 0xC89FFC01, 0x889FFC01, 0xD5033FDF, 0xD5033BBF
++TEXT = {LDXR_X: 'ldxr x2, [x0]', LDXR_W: 'ldxr w2, [x0]', STXR_X: 'stxr w4, x1, [x0]', STXR_W: 'stxr w4, w1, [x0]', LDAXR_X: 'ldaxr x2, [x0]', LDAXR_W: 'ldaxr w2, [x0]',
++        STLXR_X: 'stlxr w4, x1, [x0]', STLXR_W: 'stlxr w4, w1, [x0]', LDAR_X: 'ldar x2, [x0]', STLR_X: 'stlr x1, [x0]', STLR_W: 'stlr w1, [x0]', ISB: 'isb', DMB_ISH: 'dmb ish'}
++
++
++def words(*w): return struct.pack('<%dI' % len(w), *w)
++
++
++def counter_loop(atomic=True):
++    """x0 = the counter's address, x1 = how many times to add 1. atomic: ldaxr / add / stlxr / retry; otherwise ldr / add / str (loses updates under threads)"""
++    body = [LDAXR_X, 0x91000442, 0xC803FC02, 0x35000003 | ((-3 & 0x7FFFF) << 5)] if atomic else [0xF9400002, 0x91000442, 0xF9000002]
++    n = len(body)
++    return words(*body, fx.SUBSI(1, 1, 1), fx.BCOND(ADDR + 4 * (n + 1), ADDR, 1), RET)   # subs x1,x1,#1 ; b.ne loop ; ret
++
++
++def mapped(code):
++    aot = aot_lift.Aot([(ADDR, code)])
++    for b, data in MEM.items(): aot.map(b, len(data), data)
++    return aot
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD (a Remill build folder), clang++ and unicorn')
++class Atomics(unittest.TestCase):
++    def test_encodings_are_what_the_table_says(self):
++        import capstone
++        md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
++        for w, want in TEXT.items():
++            i = next(md.disasm(struct.pack('<I', w), ADDR))
++            self.assertEqual(f'{i.mnemonic} {i.op_str}'.strip(), want, hex(w))
++
++    def test_sequences_equal_the_arm64_reference(self):
++        seqs = [(LDXR_X, STXR_X), (LDXR_W, STXR_W), (LDAXR_X, STLXR_X), (LDAXR_W, STLXR_W), (LDAXR_X, STXR_X), (LDXR_X, STLXR_X),
++                (STLR_X, LDAR_X), (STLR_W, LDAR_X), (LDAR_X, STLR_X), (ISB, LDXR_X, STXR_X), (STLR_X, DMB_ISH, LDAR_X), (LDXR_X, DMB_ISH, STXR_X)]
++        for seq in seqs:
++            code = words(*seq, RET)
++            aot = mapped(code)   # one library per sequence; the memory is put back before each run
++            try:
++                for value in (0, 1, 0xFFFFFFFF, 0x123456789ABCDEF0):
++                    for addr in (DATA + 0x40, DATA + 0x1008):
++                        regs = {'x0': addr, 'x1': value, 'x2': 0xDEADBEEF, 'x4': 0x77}
++                        want = ref.run_image(bytes(ADDR) + code, ADDR, [(regs, 0, SP)], MEM)[0]   # one core per run: the exclusive monitor of an earlier run is gone
++                        what = f'{" ; ".join(TEXT[w] for w in seq)}: x1={value:#x} at {addr:#x}'
++                        aot.reset()
++                        got = aot.run(ADDR, dict(regs, x30=ref.STOP), 0, SP)
++                        same(self, got, want, what)
++                        if {STXR_X, STXR_W, STLXR_X, STLXR_W} & set(seq): self.assertEqual(got['x4'], 0, f'{what}: the exclusive store after its load must succeed')
++            finally: aot.close()
++
++    def test_exclusive_store_without_an_exclusive_load_fails(self):
++        for w in (STXR_X, STLXR_W):
++            code = words(w, RET)
++            regs = {'x0': DATA + 0x40, 'x1': 0x55, 'x4': 0x77}
++            want = ref.run_image(bytes(ADDR) + code, ADDR, [(regs, 0, SP)], MEM)[0]
++            aot = mapped(code)
++            try:
++                got = aot.run(ADDR, dict(regs, x30=ref.STOP), 0, SP)
++                same(self, got, want, TEXT[w])
++                self.assertEqual(got['x4'], 1); self.assertEqual(got['mem'][DATA], MEM[DATA], 'a failed exclusive store wrote')
++            finally: aot.close()
++
++    def test_unaligned_exclusive_access_is_an_explicit_error(self):
++        aot = mapped(words(LDXR_X, STXR_X, RET))
++        try:
++            got = aot.run(ADDR, {'x0': DATA + 0x41, 'x1': 1, 'x30': ref.STOP}, 0, SP)
++            self.assertIn('not naturally aligned', got['fault']); self.assertIn(f'{DATA + 0x41:#x}', got['fault'])
++        finally: aot.close()
++
++    def test_barriers_surround_the_access_in_the_order_acquire_and_release_need(self):
++        """Read in the lifted IR: acquire = access then barriers; release = barriers, access, then store->load (the instructions are sequentially consistent with each other); dmb and isb = full"""
++        want = {STLR_X: ['load_store', 'store_store', 'write_memory_64', 'store_load'], STLR_W: ['load_store', 'store_store', 'write_memory_32', 'store_load'],
++                LDAR_X: ['read_memory_64', 'load_load', 'load_store'], LDAXR_X: ['read_memory_64', 'load_load', 'load_store'],
++                DMB_ISH: ['store_store', 'store_load'], ISB: ['store_store', 'store_load']}
++        with tempfile.TemporaryDirectory() as d:
++            for w, order in want.items():
++                ll = os.path.join(d, 'a.ll'); aot_lift.lift(w, ll)
++                calls = [re.sub('^__remill_(barrier_)?', '', c) for c in re.findall(r'call [^@\n]*@(__remill_[a-z_0-9]+)', Path(ll).read_text())
++                         if re.match(r'__remill_(barrier_|read_memory|write_memory)', c)]
++                self.assertEqual(calls, order, TEXT[w])
++
++    def test_exclusive_store_is_a_compare_and_swap(self):
++        """ldaxr/stlxr is lifted into __remill_compare_exchange_memory (the 32-bit one for w registers), which the runtime does with a locked instruction"""
++        with tempfile.TemporaryDirectory() as d:
++            for w, n in ((STXR_X, 64), (STXR_W, 32), (STLXR_X, 64), (STLXR_W, 32)):
++                ll = os.path.join(d, 'a.ll'); aot_lift.lift(w, ll)
++                self.assertIn(f'@__remill_compare_exchange_memory_{n}', Path(ll).read_text(), TEXT[w])
++
++    def test_counter_loop_equals_the_reference(self):
++        code = counter_loop()
++        regs = {'x0': DATA + 0x80, 'x1': 7}
++        want = ref.run_image(bytes(ADDR) + code, ADDR, [(regs, 0, SP)], MEM)[0]
++        aot = mapped(code)
++        try:
++            same(self, aot.run(ADDR, dict(regs, x30=ref.STOP), 0, SP), want, 'counter loop')
++            self.assertEqual(struct.unpack_from('<Q', aot.peek(DATA, DATA_SIZE), 0x80)[0] - struct.unpack_from('<Q', MEM[DATA], 0x80)[0], 7)
++        finally: aot.close()
++
++    def threads_add(self, atomic, nthreads=4, n=20000):
++        aot = mapped(counter_loop(atomic))
++        try:
++            start = struct.unpack_from('<Q', MEM[DATA], 0x80)[0]
++            errs = []
++            def work():
++                r = aot.run(ADDR, {'x0': DATA + 0x80, 'x1': n, 'x30': ref.STOP}, 0, SP)   # each thread has its own stack in a real guest; this code does not use it
++                if 'fault' in r: errs.append(r['fault'])
++            ts = [threading.Thread(target=work) for _ in range(nthreads)]
++            for t in ts: t.start()
++            for t in ts: t.join()
++            self.assertEqual(errs, [])
++            return struct.unpack_from('<Q', aot.peek(DATA, DATA_SIZE), 0x80)[0] - start, nthreads * n
++        finally: aot.close()
++
++    def test_threads_incrementing_one_counter_lose_no_update(self):
++        for _ in range(3):
++            got, want = self.threads_add(True)
++            self.assertEqual(got, want, 'an exclusive store succeeded although another thread had written the counter')
++
++    def test_the_race_is_real_without_exclusives(self):
++        """Sensitivity of the test above: the same threads with ldr/add/str do lose updates (by chance, so a few tries; skipped if the host never interleaves them)"""
++        for _ in range(5):
++            got, want = self.threads_add(False)
++            self.assertLessEqual(got, want)
++            if got < want: return
++        self.skipTest('no lost update seen in 5 tries: this host did not interleave the threads')
++
++
++if __name__ == '__main__':
++    unittest.main()

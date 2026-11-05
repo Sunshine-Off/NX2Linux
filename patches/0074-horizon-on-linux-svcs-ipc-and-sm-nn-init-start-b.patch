@@ -1,0 +1,754 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 2 Nov 2026 14:14:35 +0100
+Subject: [PATCH] Horizon on Linux: SVCs, IPC and sm:, nn::init::Start boot;
+ trap words lift; svc wrappers are entries; peek/poke keep the run's jump
+ buffer
+
+horizon_hle.py implements the SVCs a retail SDK issues (memory, GetInfo, handles, waits, IPC framing) and the nn::init::Start order of host/main.c; horizon_services.py has sm: and lm. Found booting Xenoblade Chronicles 2: an undefined-encoding word (0xe7ffdefe) made 18 functions unliftable, exported svc wrappers sharing one unwind entry were not entries, and aot_peek/aot_poke reset the run's jump buffer to null.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: S7bis, the Linux Horizon layer (SVCs, IPC, sm:, boot order) plus three AOT fixes found booting Xenoblade 2; tests use synthetic code and a fake guest memory, no game data
+Issue: none yet (NX2Linux, branch swann/jalon-s7bis-xc2)
+
+---
+ dm/tools/aot_lift.py                |  12 +-
+ dm/tools/aot_runtime.cpp            |   9 +-
+ dm/tools/elf_module.py              |   4 +-
+ dm/tools/horizon_hle.py             | 408 ++++++++++++++++++++++++++++
+ dm/tools/horizon_services.py        |  43 +++
+ dm/tools/tests/test_aot_tailcall.py |  31 +++
+ dm/tools/tests/test_elf_module.py   |  16 ++
+ dm/tools/tests/test_horizon_hle.py  | 114 ++++++++
+ 8 files changed, 632 insertions(+), 5 deletions(-)
+ create mode 100644 dm/tools/horizon_hle.py
+ create mode 100644 dm/tools/horizon_services.py
+ create mode 100644 dm/tools/tests/test_horizon_hle.py
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index 371ac8d..6cdb5e4 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -78,6 +78,12 @@ def _disasm(word, address):
+ MAX_LIFT_BYTES = 60000   # remill-lift takes the code as one hex argument, and Linux caps an argument at 128 KiB: a longer function cannot be handed over
+ 
+ 
++def _is_trap(word, address):
++    """An instruction no decoder knows, or UDF: code that is meant to fault if it ever runs (the compiler's unreachable/assert trap, e.g. 0xe7ffdefe)"""
++    d = _disasm(word, address)
++    return d == '?' or d.startswith('udf')
++
++
+ def _run_lift(code, address, ll, entry=None):
+     if len(code) > MAX_LIFT_BYTES:
+         raise LiftError(f'function {address:#x}: {len(code)} bytes are more than the {MAX_LIFT_BYTES} remill-lift accepts on its command line (one hex argument, 128 KiB at most)')
+@@ -96,9 +102,13 @@ def lift_function(code, address, ll, entry=None):
+     entry: lift from this address inside the bytes instead of from their start (a case of a switch, reached by the jump table), the whole function being there for the branches that go back before it"""
+     if not _run_lift(code, address, ll, entry): return
+     scratch = ll + '.insn.ll'
++    traps = 0
+     for i, (w,) in enumerate(struct.iter_unpack('<I', code)):
+         try: lift(w, scratch, address + 4 * i)
+-        except LiftError as e: raise LiftError(f'function {address:#x}: {e}') from None
++        except LiftError as e:
++            if _is_trap(w, address + 4 * i): traps += 1; continue   # an undefined encoding on purpose: __remill_error in the IR stops the run at it (aot_runtime.cpp)
++            raise LiftError(f'function {address:#x}: {e}') from None
++    if traps: return
+     raise LiftError(f'function {address:#x}: Remill could not lift it (its IR calls __remill_error), though each instruction lifts alone: a control flow it does not follow')
+ 
+ 
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index 5586a1c..405942c 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -202,6 +202,11 @@ Memory *__remill_missing_block(State &st, uint64_t pc, Memory *m) {
+     fail("control reached %#llx, which was not lifted as code (a call returned to an unexpected address)", (unsigned long long)pc);
+ }
+ 
++// An encoding nothing decodes, or UDF: the guest faulted (aot_lift.py lets a function contain one on purpose, as the compilers' unreachable/assert trap)
++Memory *__remill_error(State &st, uint64_t pc, Memory *m) {
++    fail("undefined instruction executed at %#llx", (unsigned long long)pc);
++}
++
+ // A call of an import: pc is the address the guest branched to, which names the import
+ Memory *import_call(State *st, uint64_t pc, Memory *m) {
+     ImportEnt *e = import_find(pc);
+@@ -257,8 +262,8 @@ void aot_unmap_all() {
+     for (unsigned i = 0, n = g_nregions.load(); i < n; i++) { free(g_regions[i].host); g_regions[i].size = 0; g_regions[i].host = nullptr; }
+     g_nregions.store(0);
+ }
+-int aot_poke(uint64_t a, const uint8_t *src, uint64_t n) { jmp_buf jb; if (setjmp(jb)) return 1; g_jb = &jb; memcpy(guest(a, n, "poke"), src, n); g_jb = nullptr; if (aot_write_hook) aot_write_hook(a, n); return 0; }
+-int aot_peek(uint64_t a, uint8_t *dst, uint64_t n) { jmp_buf jb; if (setjmp(jb)) return 1; g_jb = &jb; memcpy(dst, guest(a, n, "peek"), n); g_jb = nullptr; return 0; }
++int aot_poke(uint64_t a, const uint8_t *src, uint64_t n) { jmp_buf jb, *outer = g_jb; g_jb = &jb; if (setjmp(jb)) { g_jb = outer; return 1; } memcpy(guest(a, n, "poke"), src, n); g_jb = outer; if (aot_write_hook) aot_write_hook(a, n); return 0; }
++int aot_peek(uint64_t a, uint8_t *dst, uint64_t n) { jmp_buf jb, *outer = g_jb; g_jb = &jb; if (setjmp(jb)) { g_jb = outer; return 1; } memcpy(dst, guest(a, n, "peek"), n); g_jb = outer; return 0; }
+ uint64_t aot_stat(int i) { return g_stats[i]; }
+ void aot_stats_reset() { memset(g_stats, 0, sizeof g_stats); }
+ 
+diff --git a/dm/tools/elf_module.py b/dm/tools/elf_module.py
+index c7d20dc..0c7c48f 100644
+--- a/dm/tools/elf_module.py
++++ b/dm/tools/elf_module.py
+@@ -115,8 +115,8 @@ def find_functions(img, text_end, symbols, relocs):
+         end = order[i] if i < len(order) else text_end
+         if i and a < funcs[order[i - 1]][0]:
+             # Inside a known function. A direct call or branch from another function lands there only on an entry: the PLT is the usual case (one FDE for the whole table, each stub called on its own).
+-            # The function is split at the target; anything else that merely points inside is not an entry
+-            if how != 'call' or a == order[i - 1]: return False
++            # The function is split at the target (also at an exported function: the SDK's svc wrappers share a unwind entry); anything else that merely points inside is not an entry
++            if how not in ('call', 'export') or a == order[i - 1]: return False   # an exported function symbol is an entry too: the SDK's svc wrappers (`svc #n; ret`) share one unwind entry
+             end = funcs[order[i - 1]][0]; funcs[order[i - 1]][0] = a
+         funcs[a] = [end, how]; order.insert(i, a)
+         return True
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+new file mode 100644
+index 0000000..91c53f9
+--- /dev/null
++++ b/dm/tools/horizon_hle.py
+@@ -0,0 +1,408 @@
++"""Horizon on Linux, for the recompiled modules (NX2Linux S7): the SVCs a retail game's SDK issues, and the services behind SendSyncRequest. One guest thread (the harness's), so waits that nothing can ever
++signal are reported instead of hanging. The memory is the AOT runtime's regions (aot_lift.Aot: peek / poke / try_map); handles live in a table; a service is a Python object whose `command(id, request)`
++returns a Response. Everything not implemented is logged as `unhandled ...` and answered with an error, never faked as a success (the boot stops where the game needs it, and the log says where).
++Usage: h = Horizon(module_set); h.attach(); module_set.call(entry, ...)."""
++import os, struct, sys, time
++
++M64 = (1 << 64) - 1
++PAGE = 0x1000
++
++# Horizon result codes: module | description << 9
++def rc(module, desc): return module | desc << 9
++OK = 0
++R_INVALID_SIZE, R_INVALID_ADDRESS, R_INVALID_HANDLE = rc(1, 101), rc(1, 102), rc(1, 114)
++R_TIMEOUT, R_NOT_IMPLEMENTED = rc(1, 117), rc(1, 33)
++R_INVALID_STATE, R_INVALID_ENUM = rc(1, 106), rc(1, 120)
++R_NOT_FOUND = rc(21, 1)   # sm: service not registered
++
++SVC_NAMES = {
++    0x01: 'SetHeapSize', 0x02: 'SetMemoryPermission', 0x03: 'SetMemoryAttribute', 0x04: 'MapMemory', 0x05: 'UnmapMemory', 0x06: 'QueryMemory', 0x07: 'ExitProcess', 0x08: 'CreateThread',
++    0x09: 'StartThread', 0x0a: 'ExitThread', 0x0b: 'SleepThread', 0x0c: 'GetThreadPriority', 0x0d: 'SetThreadPriority', 0x0e: 'GetThreadCoreMask', 0x0f: 'SetThreadCoreMask',
++    0x10: 'GetCurrentProcessorNumber', 0x11: 'SignalEvent', 0x12: 'ClearEvent', 0x13: 'MapSharedMemory', 0x14: 'UnmapSharedMemory', 0x15: 'CreateTransferMemory', 0x16: 'CloseHandle',
++    0x17: 'ResetSignal', 0x18: 'WaitSynchronization', 0x19: 'CancelSynchronization', 0x1a: 'ArbitrateLock', 0x1b: 'ArbitrateUnlock', 0x1c: 'WaitProcessWideKeyAtomic',
++    0x1d: 'SignalProcessWideKey', 0x1e: 'GetSystemTick', 0x1f: 'ConnectToNamedPort', 0x21: 'SendSyncRequest', 0x22: 'SendSyncRequestWithUserBuffer', 0x24: 'GetProcessId',
++    0x25: 'GetThreadId', 0x26: 'Break', 0x27: 'OutputDebugString', 0x29: 'GetInfo', 0x34: 'WaitForAddress', 0x35: 'SignalToAddress', 0x36: 'SynchronizePreemptionState',
++}
++
++# MemoryType values QueryMemory reports (the ones a game checks)
++MT_UNMAPPED, MT_CODE, MT_CODE_DATA, MT_NORMAL, MT_STACK, MT_HEAP = 0, 3, 4, 5, 11, 5
++PERM_NONE, PERM_R, PERM_RW, PERM_RX = 0, 1, 3, 5
++
++
++class Obj:
++    """A kernel object a handle names"""
++    kind = 'object'
++    def __init__(self): self.name = ''
++
++
++class Event(Obj):
++    kind = 'event'
++    def __init__(self, signaled=False, auto=False): super().__init__(); self.signaled, self.auto = signaled, auto
++
++
++class Session(Obj):
++    kind = 'session'
++    def __init__(self, service): super().__init__(); self.service = service
++
++
++class Response:
++    def __init__(self, result=OK, raw=b'', copy=(), move=(), objects=()):
++        self.result, self.raw, self.copy, self.move, self.objects = result, raw, list(copy), list(move), list(objects)   # objects: Obj to register and move as handles
++
++
++class Request:
++    """A decoded IPC request: its command id, the raw words after the command id, the handles it carried, its buffers and whether it is a control message"""
++    def __init__(self, kind, cmd, raw, copy, move, pid, bufs):
++        self.kind, self.cmd, self.raw, self.copy, self.move, self.pid, self.bufs = kind, cmd, raw, copy, move, pid, bufs   # bufs: [(kind, addr, size)] of the A/B/W/X/C descriptors
++
++
++class Service:
++    """A named service: command(id, request) -> Response. Subclasses implement cmd_<id>"""
++    name = '?'
++    def __init__(self, hz): self.hz = hz
++    def command(self, cmd, req):
++        f = getattr(self, f'cmd_{cmd}', None)
++        if f is None:
++            self.hz.log(f'unhandled {self.name} command {cmd} (raw {req.raw[:32].hex()})')
++            return Response(R_NOT_IMPLEMENTED)
++        return f(req)
++
++
++class Horizon:
++    HEAP_BASE = 0x2_0000_0000
++    MEM_BASE = 0x3_0000_0000   # MapMemory / transfer / shared memory the game asks for with no fixed address
++    FIRST_HANDLE = 0xD000
++    TLS_PER_THREAD = 0x200
++
++    def __init__(self, ms, out=None, verbose=False):
++        self.ms, self.aot, self.out, self.verbose = ms, ms.aot, out or sys.stderr, verbose
++        self.handles, self._next_handle = {}, self.FIRST_HANDLE
++        self.heap_size = 0
++        self.services = {}      # sm: name -> factory(hz) -> Service
++        self.named_ports = {}   # ConnectToNamedPort names -> factory
++        self.stats, self.unhandled, self.start = {}, {}, time.monotonic()
++        self.stop_reason = None
++        self.process_id, self.thread_id = 0x80, 1
++        self._mem_cursor = self.MEM_BASE
++        self.mem_types = []     # (addr, size, type, perm) of what the process mapped beyond the module regions
++        import horizon_services
++        horizon_services.install(self)
++
++    # ---- plumbing ----
++    def log(self, msg):
++        print(f'[hz {time.monotonic() - self.start:7.3f}] {msg}', file=self.out, flush=True)
++
++    def attach(self):
++        self.aot.set_svc_handler(self.svc)
++        return self
++
++    def new_handle(self, obj):
++        h = self._next_handle; self._next_handle += 1; self.handles[h] = obj; return h
++
++    def rd(self, a, n): return self.aot.peek(a, n)
++    def wr(self, a, data): assert self.aot.lib.aot_poke(a, bytes(data), len(data)) == 0, f'poke {a:#x}+{len(data):#x}'
++    def rd32(self, a): return struct.unpack('<I', self.rd(a, 4))[0]
++    def rd64(self, a): return struct.unpack('<Q', self.rd(a, 8))[0]
++    def wr32(self, a, v): self.wr(a, struct.pack('<I', v & 0xFFFFFFFF))
++    def wr64(self, a, v): self.wr(a, struct.pack('<Q', v & M64))
++
++    def cstring(self, a, limit=256):
++        out = b''
++        while len(out) < limit:
++            try: c = self.rd(a + len(out), 1)
++            except AssertionError: break
++            if c == b'\0': break
++            out += c
++        return out.decode('utf-8', 'replace')
++
++    # ---- boot: nn::init::Start, step by step (host/main.c guest_main does the same on the Mach host) ----
++    ARGV_BASE = 0x1_0000_0000
++
++    def boot(self, argv=('game',), stop_after=None):
++        """Run the SDK's startup in the order nn::init::Start has it, then nnMain. Returns the first step's result that faulted ({'step': name, 'fault': ...}), or the result of nnMain. stop_after: a step name to end on"""
++        ms = self.ms
++        class Thread(Obj): kind = 'thread'
++        main_thread = self.new_handle(Thread())
++        # argv for nn::os::SetHostArgv: the strings, then the pointer array
++        blob = b''.join(a.encode() + b'\0' for a in argv); offs = []; o = 0
++        for a in argv: offs.append(o); o += len(a.encode()) + 1
++        arr = self.ARGV_BASE + len(blob) + (-len(blob) % 8)
++        total = arr + 8 * (len(argv) + 1) - self.ARGV_BASE
++        if not self.aot.try_map(self.ARGV_BASE, (total + PAGE - 1) & ~(PAGE - 1)): raise RuntimeError('argv region overlaps another')
++        self.wr(self.ARGV_BASE, blob + b'\0' * (-len(blob) % 8) + b''.join(struct.pack('<Q', self.ARGV_BASE + x) for x in offs) + b'\0' * 8)
++        def run_inits():
++            for mod in ms.modules:
++                d = mod.m['dynamic']
++                if 'INIT' not in d: continue
++                r = ms.call(mod.base + d['INIT'])
++                if 'fault' in r: return r
++            return {}
++        steps = [('_init_libc0', lambda: ms.call('_init_libc0')),
++                 ('nnosInitialize', lambda: ms.call('nnosInitialize', {'x0': main_thread, 'x1': 0})),
++                 ('_init_libc1', lambda: ms.call('_init_libc1')),
++                 ('nninitInitializeSdkModule', lambda: ms.call('nninitInitializeSdkModule')),
++                 ('SetHostArgc', lambda: ms.call('_ZN2nn2os11SetHostArgcEi', {'x0': len(argv)})),
++                 ('SetHostArgv', lambda: ms.call('_ZN2nn2os11SetHostArgvEPPc', {'x0': arr})),
++                 ('nninitStartup', lambda: ms.call('nninitStartup')),
++                 ('_init_libc2', lambda: ms.call('_init_libc2')),
++                 ('DT_INIT', run_inits),
++                 ('nnMain', lambda: ms.call('nnMain'))]
++        for name, f in steps:
++            self.log(f'>>> {name}')
++            r = f()
++            if 'fault' in r: return dict(r, step=name)
++            if name == stop_after: return dict(r, step=name)
++        return dict(r, step='nnMain')
++
++    # ---- the SVC entry ----
++    def svc(self, num, r, orig):
++        name = SVC_NAMES.get(num, f'svc{num:#x}')
++        self.stats[name] = self.stats.get(name, 0) + 1
++        f = getattr(self, f'svc_{name}', None)
++        if f is None:
++            self.unhandled[name] = self.unhandled.get(name, 0) + 1
++            self.log(f'unhandled svc {name} ({num:#x}) at {orig:#x}: x0={r[0]:#x} x1={r[1]:#x} x2={r[2]:#x} x3={r[3]:#x}')
++            r[0] = R_NOT_IMPLEMENTED
++            return
++        before = list(r[:4])
++        f(r)
++        if self.verbose: self.log(f'{name}({", ".join(hex(x) for x in before)}) -> {r[0]:#x} {r[1]:#x}')
++
++    # ---- memory ----
++    def svc_SetHeapSize(self, r):
++        size = r[1]
++        if size % 0x200000: r[0] = R_INVALID_SIZE; return
++        if size > self.heap_size:
++            if not self.aot.try_map(self.HEAP_BASE + self.heap_size, size - self.heap_size): r[0] = R_INVALID_STATE; return
++            self.mem_types.append((self.HEAP_BASE + self.heap_size, size - self.heap_size, MT_HEAP, PERM_RW))
++        self.heap_size = size
++        r[0], r[1] = OK, self.HEAP_BASE
++
++    def svc_MapMemory(self, r):   # dst, src, size: the guest keeps both views; the host only needs dst to be addressable and alias src
++        dst, src, size = r[0], r[1], r[2]
++        if not self.aot.try_map(dst, size): r[0] = R_INVALID_STATE; return
++        self.wr(dst, self.rd(src, size)); self.mem_types.append((dst, size, MT_STACK, PERM_RW)); r[0] = OK
++
++    def svc_UnmapMemory(self, r): r[0] = OK
++
++    def svc_MapPhysicalMemory(self, r):   # addr, size: zeroed memory inside the alias region (the process's extra memory pool)
++        addr, size = r[0], r[1]
++        if addr % PAGE or size % PAGE: r[0] = R_INVALID_SIZE; return
++        if not self.aot.try_map(addr, size): r[0] = R_INVALID_STATE; return
++        self.mem_types.append((addr, size, MT_NORMAL, PERM_RW)); r[0] = OK
++
++    def svc_UnmapPhysicalMemory(self, r): r[0] = OK
++    def svc_SetMemoryPermission(self, r): r[0] = OK
++    def svc_SetMemoryAttribute(self, r): r[0] = OK
++
++    def _region_of(self, a):
++        for base, size, _ in self.aot.regions:
++            if base <= a < base + size: return base, size
++        return None
++
++    def memory_info(self, a):
++        a &= ~(PAGE - 1)
++        for mod in self.ms.modules:
++            if mod.base <= a < mod.base + mod.size:
++                end = mod.base + mod.size
++                segs = mod.m['segments']
++                for s in segs:
++                    lo, hi = mod.base + s['vaddr'], mod.base + ((s['vaddr'] + s['memsz'] + PAGE - 1) & ~(PAGE - 1))
++                    if lo <= a < hi: return lo, hi - lo, (MT_CODE if s['perms'] == 'r-x' else MT_CODE_DATA), {'r-x': PERM_RX, 'r--': PERM_R}.get(s['perms'], PERM_RW)
++                return mod.base, end - mod.base, MT_CODE_DATA, PERM_RW
++        for base, size, mt, perm in self.mem_types:
++            if base <= a < base + size: return base, size, mt, perm
++        reg = self._region_of(a)
++        if reg: return reg[0], reg[1], MT_NORMAL, PERM_RW
++        return None
++
++    def svc_QueryMemory(self, r):
++        out, addr = r[0], r[2]
++        mi = self.memory_info(addr)
++        if mi is None:   # unmapped: report the hole up to the next mapping, as the kernel does
++            nxt = min([b for b, _, _ in self.aot.regions if b > addr] + [1 << 39])
++            base, size, mt, perm = addr & ~(PAGE - 1), nxt - (addr & ~(PAGE - 1)), MT_UNMAPPED, PERM_NONE
++        else: base, size, mt, perm = mi
++        self.wr(out, struct.pack('<QQIIIIII', base, size, mt, 0, perm, 0, 0, 0))
++        r[0], r[1] = OK, 0
++
++    # ---- information ----
++    def svc_GetInfo(self, r):
++        kind, handle, sub = r[1], r[2], r[3]
++        # the address space layout, one region each: ASLR 0x08000000.., heap 0x2_0000_0000, alias 0x4_0000_0000, stack 0x6_0000_0000
++        v = {0: 0xF, 1: 0xFFFFFFFFFFFFFFFF >> 20, 2: 0x4_0000_0000, 3: 0x1_0000_0000, 4: self.HEAP_BASE, 5: 0x1_0000_0000, 6: 0x1_0000_0000, 7: 0x2000_0000, 8: 0, 9: 0,
++             11: 0, 12: 0x0800_0000, 13: 0x7F_F800_0000, 14: 0x6_0000_0000, 15: 0x1_0000_0000, 16: 0, 17: 0, 18: 0x0100E95004038000, 19: self.heap_size, 20: 0x2000_0000, 21: 0, 22: 0}.get(kind)
++        if kind == 11: v = 0xF
++        if v is None:
++            self.log(f'unhandled GetInfo type {kind} handle {handle:#x} sub {sub}'); r[0] = R_INVALID_ENUM; return
++        r[0], r[1] = OK, v
++
++    def svc_GetSystemTick(self, r): r[0] = int((time.monotonic() - self.start) * 19200000)
++    def svc_GetProcessId(self, r): r[0], r[1] = OK, self.process_id
++    def svc_GetThreadId(self, r): r[0], r[1] = OK, self.thread_id
++
++    def where(self, r, depth=12):
++        """The guest call chain as module+offset: x30, then the saved link registers along the x29 frame chain"""
++        def loc(a):
++            for mod in self.ms.modules:
++                if mod.base <= a < mod.base + mod.size:
++                    sym = next((n for n, x in mod.exports.items() if x == a), '')
++                    return f'{mod.name}+{a - mod.base:#x}'
++            return f'{a:#x}'
++        out, fp = [loc(r[30])], r[29]
++        for _ in range(depth):
++            try: fp, lr = struct.unpack('<QQ', self.rd(fp, 16))
++            except AssertionError: break
++            if not lr: break
++            out.append(loc(lr))
++        return ' <- '.join(out)
++
++    def svc_OutputDebugString(self, r):
++        msg = self.rd(r[0], min(r[1], 512)).decode('utf-8', 'replace').rstrip()
++        self.log('debug: ' + msg)
++        if msg.startswith('Failed assertion'): self.log('  at ' + self.where(r))
++        r[0] = OK
++
++    def svc_Break(self, r):
++        reason, info, size = r[0], r[1], r[2]
++        self.log(f'Break reason {reason:#x} info {info:#x} size {size:#x} at ' + self.where(r))
++        self.stop_reason = f'svcBreak({reason:#x})'
++        self.on_break(reason, info, size)
++
++    def on_break(self, reason, info, size):
++        os._exit(3)   # a ctypes callback cannot unwind the guest: the guest would loop on `b .` after Break
++
++    def svc_ExitProcess(self, r):
++        self.log('ExitProcess'); os._exit(0)
++
++    # ---- handles and synchronisation (one thread: a wait nothing can signal is an error, not a hang) ----
++    def svc_CloseHandle(self, r):
++        if r[0] in self.handles: del self.handles[r[0]]; r[0] = OK
++        else: r[0] = R_INVALID_HANDLE
++
++    def svc_SleepThread(self, r):
++        ns = r[0]
++        if ns > 0: time.sleep(min(ns / 1e9, 0.05))
++        r[0] = OK
++
++    def svc_GetCurrentProcessorNumber(self, r): r[0] = 0
++    def svc_GetThreadPriority(self, r): r[0], r[1] = OK, 44
++    def svc_SetThreadPriority(self, r): r[0] = OK
++    def svc_GetThreadCoreMask(self, r): r[0], r[1], r[2] = OK, 0, 0xF
++    def svc_SetThreadCoreMask(self, r): r[0] = OK
++    def svc_SynchronizePreemptionState(self, r): r[0] = OK
++
++    def svc_ResetSignal(self, r):
++        o = self.handles.get(r[0])
++        if not isinstance(o, Event): r[0] = R_INVALID_HANDLE; return
++        r[0] = OK if o.signaled else R_INVALID_STATE
++        o.signaled = False
++
++    def svc_ClearEvent(self, r): self.svc_ResetSignal(r)
++
++    def svc_SignalEvent(self, r):
++        o = self.handles.get(r[0])
++        if not isinstance(o, Event): r[0] = R_INVALID_HANDLE; return
++        o.signaled = True; r[0] = OK
++
++    def svc_WaitSynchronization(self, r):
++        ptr, n, timeout = r[1], r[2], r[3]
++        hs = struct.unpack(f'<{n}I', self.rd(ptr, 4 * n)) if n else ()
++        for i, h in enumerate(hs):
++            o = self.handles.get(h)
++            if o is None: r[0] = R_INVALID_HANDLE; return
++            if isinstance(o, Event) and o.signaled:
++                if o.auto: o.signaled = False
++                r[0], r[1] = OK, i; return
++            if not isinstance(o, Event): r[0], r[1] = OK, i; return   # sessions and the like: ready
++        if timeout in (0, M64 >> 0) and timeout == 0: r[0] = R_TIMEOUT; return
++        names = [getattr(self.handles.get(h), 'name', '?') for h in hs]
++        self.log(f'WaitSynchronization on {names} would block forever (one guest thread, nothing can signal)')
++        self.stop_reason = 'WaitSynchronization'
++        r[0] = R_TIMEOUT
++
++    # ArbitrateLock / mutex: with one thread, a lock is always free or held by us
++    def svc_ArbitrateLock(self, r):
++        tag_addr = r[2]
++        r[0] = OK
++    def svc_ArbitrateUnlock(self, r): r[0] = OK
++    def svc_WaitProcessWideKeyAtomic(self, r):
++        self.log('WaitProcessWideKeyAtomic would block forever'); self.stop_reason = 'condvar wait'; r[0] = R_TIMEOUT
++    def svc_SignalProcessWideKey(self, r): r[0] = OK
++
++    def svc_CreateThread(self, r):
++        self.log(f'CreateThread entry {r[1]:#x} arg {r[2]:#x} stack {r[3]:#x}: threads are not scheduled yet')
++        self.stop_reason = 'CreateThread'; r[0] = R_NOT_IMPLEMENTED
++
++    def svc_CreateTransferMemory(self, r):
++        class Transfer(Obj): kind = 'transfer'
++        o = Transfer(); o.addr, o.size = r[1], r[2]; r[1] = self.new_handle(o); r[0] = OK
++
++    # ---- services and IPC ----
++    def svc_ConnectToNamedPort(self, r):
++        name = self.cstring(r[1], 12)
++        f = self.named_ports.get(name)
++        if f is None:
++            self.log(f'unhandled named port {name!r}'); r[0] = R_NOT_FOUND; return
++        r[0], r[1] = OK, self.new_handle(Session(f(self)))
++
++    def svc_SendSyncRequest(self, r):
++        h = r[0]; sess = self.handles.get(h)
++        self.ipc(sess, self.ms.TLS, r)   # the command buffer is the first 0x100 bytes of the ThreadLocalRegion
++
++    def svc_SendSyncRequestWithUserBuffer(self, r):
++        self.ipc(self.handles.get(r[2]), r[0], r)
++
++    def decode(self, base):
++        w = struct.unpack('<2I', self.rd(base, 8))
++        kind, nx, na, nb, nw = w[0] & 0xFFFF, w[0] >> 16 & 0xF, w[0] >> 20 & 0xF, w[0] >> 24 & 0xF, w[0] >> 28 & 0xF
++        raw_words, rcflags, has_handles = w[1] & 0x3FF, w[1] >> 10 & 0xF, w[1] >> 31
++        off = 8; pid = None; copy, move = [], []
++        if has_handles:
++            hw = self.rd32(base + off); off += 4
++            if hw & 1: pid = self.rd64(base + off); off += 8
++            ncopy, nmove = hw >> 1 & 0xF, hw >> 5 & 0xF
++            copy = list(struct.unpack_from(f'<{ncopy}I', self.rd(base + off, 4 * ncopy))) if ncopy else []; off += 4 * ncopy
++            move = list(struct.unpack_from(f'<{nmove}I', self.rd(base + off, 4 * nmove))) if nmove else []; off += 4 * nmove
++        bufs = []
++        off += 8 * nx   # X (pointer) descriptors: not used by the services here
++        for k, n in (('A', na), ('B', nb), ('W', nw)):
++            for _ in range(n):
++                size, lo, packed = struct.unpack('<III', self.rd(base + off, 12)); off += 12
++                bufs.append((k, lo | (packed >> 28 & 0xF) << 32 | (packed >> 2 & 7) << 36, size | (packed >> 24 & 0xF) << 32))
++        off = (off + 15) & ~15   # raw data is aligned to 16 bytes from the start of the message
++        raw = self.rd(base + off, raw_words * 4) if raw_words else b''
++        return kind, raw, copy, move, pid, bufs, off
++
++    def ipc(self, sess, base, r):
++        if sess is None or not isinstance(sess, Session): r[0] = R_INVALID_HANDLE; return
++        kind, raw, copy, move, pid, bufs, off = self.decode(base)
++        if kind == 4 or kind == 6:   # Request / RequestWithContext
++            # raw: SFCI magic (8 bytes), command id (4), token (4), then the arguments
++            cmd = struct.unpack_from('<I', raw, 8)[0] if len(raw) >= 12 else -1
++            req = Request('request', cmd, raw[16:], copy, move, pid, bufs)
++            resp = sess.service.command(cmd, req)
++        elif kind == 5 or kind == 7:   # Control / ControlWithContext: ConvertCurrentObjectToDomain (0), CopyFromCurrentDomain (1), CloneCurrentObject (2), QueryPointerBufferSize (3), CloneEx (4)
++            cmd = struct.unpack_from('<I', raw, 8)[0] if len(raw) >= 12 else -1
++            if cmd in (2, 4):
++                s2 = Session(sess.service); resp = Response(OK, b'', move=[], objects=[s2])
++            elif cmd == 3: resp = Response(OK, struct.pack('<I', 0x8000))
++            else: self.log(f'unhandled control command {cmd}'); resp = Response(R_NOT_IMPLEMENTED)
++        elif kind == 2:   # Close
++            r[0] = OK; return
++        else:
++            self.log(f'unhandled IPC message type {kind} on {sess.service.name}: nonzero TLR words {[(hex(o), hex(v)) for o, v in enumerate(struct.unpack('<%dI' % 0x100, self.rd(self.ms.TLS, 0x400))) if v][:20]} lr {self.where(r)}'); r[0] = R_NOT_IMPLEMENTED; return
++        self.reply(base, resp); r[0] = OK
++
++    def reply(self, base, resp):
++        """A Response as an IPC reply at `base`: header, handle descriptor, then (16-byte aligned) SFCO, the result and the raw data"""
++        handles = [self.new_handle(o) for o in resp.objects] + list(resp.move)
++        data = b'SFCO' + struct.pack('<III', 0, resp.result, 0) + resp.raw
++        data = data.ljust((len(data) + 3) & ~3, b'\0')
++        has_h = 1 if (handles or resp.copy) else 0
++        out = struct.pack('<2I', 0, (len(data) // 4 + 4 & 0x3FF) | (has_h << 31))   # +4 words: the slack the 16-byte alignment may take
++        if has_h:
++            out += struct.pack('<I', (len(resp.copy) << 1) | (len(handles) << 5))
++            out += b''.join(struct.pack('<I', c) for c in resp.copy) + b''.join(struct.pack('<I', h) for h in handles)
++        out += b'\0' * (-len(out) % 16)
++        self.wr(base, out + data)
+diff --git a/dm/tools/horizon_services.py b/dm/tools/horizon_services.py
+new file mode 100644
+index 0000000..838c858
+--- /dev/null
++++ b/dm/tools/horizon_services.py
+@@ -0,0 +1,43 @@
++"""The services a game's SDK opens through sm: (NX2Linux S7). Each is a horizon_hle.Service; a command not implemented here is logged by Horizon and answered with an error: nothing is faked.
++install(hz) registers the named ports and the service table."""
++import struct
++from horizon_hle import Service, Response, Session, Event, OK, R_NOT_FOUND
++
++SM_NOT_REGISTERED = 21 | 2 << 9
++
++
++class ServiceManager(Service):
++    name = 'sm:'
++    def cmd_0(self, req): return Response(OK)   # Initialize (the process id travels in the message)
++
++    def cmd_1(self, req):   # GetService(name: 8 bytes, zero padded)
++        name = req.raw[:8].rstrip(b'\0').decode('ascii', 'replace')
++        f = self.hz.services.get(name)
++        if f is None:
++            self.hz.log(f'sm: GetService({name!r}) -> not registered')
++            self.hz.missing_services.add(name)
++            return Response(SM_NOT_REGISTERED)
++        return Response(OK, objects=[Session(f(self.hz))])
++
++
++class Logger(Service):
++    """nn::lm ILogger"""
++    name = 'lm:logger'
++    def cmd_0(self, req):   # Log(buffer): the log packet; the text is in its payload chunks
++        for kind, addr, size in req.bufs:
++            if kind in ('A', 'X') and size:
++                self.hz.log_packets.append(self.hz.rd(addr, min(size, 0x2000)))
++        return Response(OK)
++    def cmd_1(self, req): return Response(OK)   # SetDestination
++
++
++class LogService(Service):
++    name = 'lm'
++    def cmd_0(self, req): return Response(OK, objects=[Session(Logger(self.hz))])   # OpenLogger(pid)
++
++
++def install(hz):
++    hz.named_ports['sm:'] = ServiceManager
++    hz.services.update({'lm': LogService})
++    hz.log_packets = []
++    hz.missing_services = set()
+diff --git a/dm/tools/tests/test_aot_tailcall.py b/dm/tools/tests/test_aot_tailcall.py
+index 75d20c6..38f5c0b 100644
+--- a/dm/tools/tests/test_aot_tailcall.py
++++ b/dm/tools/tests/test_aot_tailcall.py
+@@ -43,5 +43,36 @@ class TailCall(unittest.TestCase):
+         finally: a.close()
+ 
+ 
++@unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++ and unicorn')
++class Traps(unittest.TestCase):
++    """The compilers' unreachable/assert trap (0xe7ffdefe, UDF) inside a function: the function lifts, running the trap stops with its address"""
++    def test_a_function_with_a_trap_after_its_ret_lifts_and_runs(self):
++        a = aot_lift.Aot([(0x1000, words(0xD28000A0, RET, 0xE7FFDEFE))])   # mov x0, #5 ; ret ; <trap>
++        try:
++            r = a.run(0x1000, {'x30': STOP})
++            self.assertEqual((r.get('fault'), r['x0']), (None, 5))
++        finally: a.close()
++
++    def test_executing_the_trap_stops_with_its_address(self):
++        a = aot_lift.Aot([(0x1000, words(0xD28000A0, 0xE7FFDEFE, RET))])
++        try:
++            self.assertIn('undefined instruction executed at 0x1004', a.run(0x1000, {'x30': STOP}).get('fault', ''))
++        finally: a.close()
++
++    def test_a_peek_inside_an_svc_handler_leaves_the_run_able_to_fault(self):
++        """aot_peek/aot_poke used to reset the run's jump buffer to null: a fault after an SVC that read guest memory aborted the process instead of ending the run"""
++        a = aot_lift.Aot([(0x1000, words(0xD4000021, 0xE7FFDEFE, RET))])   # svc #1 ; <trap> ; ret
++        a.map(0x8000, 0x1000)
++        try:
++            a.set_svc_handler(lambda num, regs, orig: a.peek(0x8000, 16))
++            self.assertIn('undefined instruction executed at 0x1004', a.run(0x1000, {'x30': STOP}).get('fault', ''))
++        finally: a.close()
++
++    def test_an_instruction_remill_lacks_but_that_exists_still_makes_the_function_unliftable(self):
++        with self.assertRaises(aot_lift.LiftError):
++            a = aot_lift.Aot([(0x1000, words(0x4E284800, RET, 0xE7FFDEFE))])   # aese v0.16b, v0.16b
++            a.close()
++
++
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/dm/tools/tests/test_elf_module.py b/dm/tools/tests/test_elf_module.py
+index 65c62d0..02dd5de 100644
+--- a/dm/tools/tests/test_elf_module.py
++++ b/dm/tools/tests/test_elf_module.py
+@@ -55,6 +55,22 @@ class Discovery(unittest.TestCase):
+             self.assertEqual((funcs[plt0[0]][0], funcs[plt1[0]][0], funcs[plt1[0]][1]), (plt1[0], plt1[1], 'call'))   # split where mod_calls_missing / mod_entry call the second stub
+         finally: d.cleanup()
+ 
++    def test_an_exported_function_inside_one_unwind_entry_is_an_entry(self):
++        """the SDK's svc wrappers (`svc #n ; ret`, one per exported function) share one unwind entry; each is called through the GOT and must be an entry of its own"""
++        d, paths = make_dir(mf.module_a())
++        try:
++            data = (Path(d.name) / 'a.elf').read_bytes()
++            loads, dyn, _ = em.parse_elf(data); img = em.image_of(data, loads)
++            dynamic = em.read_dynamic(img, dyn); syms, relocs = em.read_symbols(img, dynamic), em.read_relocs(img, dynamic)
++            exported = sorted(v for _, _, typ, defined, v, _ in syms if defined and typ == 2)
++            self.assertGreater(len(exported), 1)
++            real = em.nso_code.fde_ranges
++            em.nso_code.fde_ranges = lambda _: [(exported[0], loads[0]['filesz'])]   # one range over the whole text
++            try: funcs = em.find_functions(img, loads[0]['filesz'], syms, relocs)
++            finally: em.nso_code.fde_ranges = real
++            for v in exported: self.assertIn(v, funcs)
++        finally: d.cleanup()
++
+ 
+ class Manifest(unittest.TestCase):
+     @classmethod
+diff --git a/dm/tools/tests/test_horizon_hle.py b/dm/tools/tests/test_horizon_hle.py
+new file mode 100644
+index 0000000..2d89b19
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_hle.py
+@@ -0,0 +1,114 @@
++"""Horizon on Linux (horizon_hle.py): the SVCs and the IPC framing a retail SDK uses, against a fake guest memory (no Remill, no game data)."""
++import io, struct, sys, types, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE.parent))
++import horizon_hle as hh
++
++
++class FakeLib:
++    def __init__(self, mem): self.mem = mem
++    def aot_poke(self, a, data, n): self.mem[a:a + n] = data[:n]; return 0
++
++
++class FakeAot:
++    def __init__(self):
++        self.mem, self.regions, self.mapped = bytearray(0x4000), [(0, 0x4000, b'')], []
++        self.lib = FakeLib(self.mem)
++    def peek(self, a, n): return bytes(self.mem[a:a + n])
++    def try_map(self, base, size): self.mapped.append((base, size)); return True
++    def set_svc_handler(self, fn): self.handler = fn
++
++
++def make():
++    aot = FakeAot()
++    ms = types.SimpleNamespace(aot=aot, modules=[], TLS=0x1000)
++    ms.modules = []
++    return hh.Horizon(ms, out=io.StringIO()), aot
++
++
++def request(cmd, raw=b'', handles=()):
++    """A libnx-style request: header, optional handle descriptor, SFCI + command + token + arguments, 16-byte aligned"""
++    has_h = 1 if handles else 0
++    out = struct.pack('<2I', 4, ((len(raw) + 16) // 4 + 4) | has_h << 31)
++    if has_h: out += struct.pack('<I', len(handles) << 1) + b''.join(struct.pack('<I', h) for h in handles)
++    out += b'\0' * (-len(out) % 16)
++    return out + b'SFCI' + struct.pack('<III', 0, cmd, 0) + raw
++
++
++class Svc(unittest.TestCase):
++    def test_set_heap_size_maps_the_heap_and_returns_its_base(self):
++        hz, aot = make()
++        r = [0] * 31; r[1] = 0x400000
++        hz.svc(0x01, r, 0)
++        self.assertEqual((r[0], r[1]), (0, hz.HEAP_BASE)); self.assertIn((hz.HEAP_BASE, 0x400000), aot.mapped)
++
++    def test_set_heap_size_wants_a_multiple_of_2_mib(self):
++        hz, _ = make(); r = [0] * 31; r[1] = 0x1000
++        hz.svc(0x01, r, 0); self.assertEqual(r[0], hh.R_INVALID_SIZE)
++
++    def test_an_unimplemented_svc_is_an_error_and_is_counted(self):
++        hz, _ = make(); r = [0] * 31
++        hz.svc(0x3F, r, 0x1234); self.assertEqual(r[0], hh.R_NOT_IMPLEMENTED); self.assertEqual(hz.unhandled, {'svc0x3f': 1})
++
++    def test_get_system_tick_moves(self):
++        hz, _ = make(); a = [0] * 31; hz.svc(0x1e, a, 0)
++        import time; time.sleep(0.01); b = [0] * 31; hz.svc(0x1e, b, 0)
++        self.assertGreater(b[0], a[0])
++
++    def test_wait_on_a_signaled_event_returns_its_index(self):
++        hz, aot = make(); h = hz.new_handle(hh.Event(True))
++        aot.mem[0x100:0x108] = struct.pack('<2I', 0xBAD, h)   # 0xBAD names nothing, so waiting on [h] alone is the case
++        r = [0] * 31; r[1], r[2], r[3] = 0x104, 1, 0
++        hz.svc(0x18, r, 0)
++        self.assertEqual((r[0], r[1]), (0, 0))
++
++    def test_a_wait_on_a_handle_that_names_nothing_is_invalid_handle(self):
++        hz, aot = make(); aot.mem[0x100:0x104] = struct.pack('<I', 0xBAD)
++        r = [0] * 31; r[1], r[2], r[3] = 0x100, 1, 0
++        hz.svc(0x18, r, 0)
++        self.assertEqual(r[0], hh.R_INVALID_HANDLE)
++
++    def test_a_wait_nothing_can_signal_is_reported_not_hung(self):
++        hz, aot = make(); h = hz.new_handle(hh.Event(False))
++        aot.mem[0x100:0x104] = struct.pack('<I', h)
++        r = [0] * 31; r[1], r[2], r[3] = 0x100, 1, (1 << 64) - 1
++        hz.svc(0x18, r, 0)
++        self.assertEqual(hz.stop_reason, 'WaitSynchronization')
++
++
++class Ipc(unittest.TestCase):
++    def connect(self, hz):
++        r = [0] * 31; hz.aot.mem[0x200:0x204] = b'sm:\0'; r[1] = 0x200
++        hz.svc(0x1f, r, 0); self.assertEqual(r[0], 0); return r[1]
++
++    def send(self, hz, handle, msg):
++        hz.aot.mem[0x1000:0x1000 + len(msg)] = msg
++        r = [0] * 31; r[0] = handle; hz.svc(0x21, r, 0)
++        return r[0], bytes(hz.aot.mem[0x1000:0x1100])
++
++    def test_an_unknown_named_port_is_not_found(self):
++        hz, aot = make(); aot.mem[0x200:0x206] = b'nope:\0'; r = [0] * 31; r[1] = 0x200
++        hz.svc(0x1f, r, 0); self.assertEqual(r[0], hh.R_NOT_FOUND)
++
++    def test_sm_initialize_replies_with_a_zero_result(self):
++        hz, _ = make(); h = self.connect(hz)
++        rc, out = self.send(hz, h, request(0))
++        self.assertEqual(rc, 0)
++        self.assertEqual(out[16:20], b'SFCO'); self.assertEqual(struct.unpack_from('<I', out, 24)[0], 0)
++
++    def test_get_service_of_a_missing_service_names_it_and_fails(self):
++        hz, _ = make(); h = self.connect(hz)
++        rc, out = self.send(hz, h, request(1, b'fsp-srv\0'))
++        self.assertEqual(rc, 0)
++        self.assertNotEqual(struct.unpack_from('<I', out, 24)[0], 0)
++        self.assertEqual(hz.missing_services, {'fsp-srv'})
++
++    def test_an_unimplemented_command_is_an_error_reply(self):
++        hz, _ = make(); h = self.connect(hz)
++        _, out = self.send(hz, h, request(99))
++        self.assertEqual(struct.unpack_from('<I', out, 24)[0], hh.R_NOT_IMPLEMENTED)
++
++
++if __name__ == '__main__': unittest.main()

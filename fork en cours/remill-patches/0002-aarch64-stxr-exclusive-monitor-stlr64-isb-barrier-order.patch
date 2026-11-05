@@ -1,0 +1,292 @@
+From 0a68a948cab4e56896e433676728a481af7dfb90 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 14:27:47 +0100
+Subject: [PATCH] AArch64: STXR with a value-tracking exclusive monitor, STLR
+ (64-bit), ISB, and acquire/release barrier order
+
+The exclusive store was approximate: the monitor held only the address, so an STLXR succeeded whatever
+another thread had written in between, and two threads incrementing a counter lost updates. The monitor
+now also keeps the value LDXR/LDAXR read (a second pseudo register, MONITOR_VALUE, next to MONITOR), and
+STXR/STLXR store with __remill_compare_exchange_memory against it: the status is 1 when the location
+changed, as the hardware's is. STXR (32/64-bit), STLR (64-bit) and ISB were not decoded.
+
+Ordering, as the Arm ARM defines it:
+  * LDAR/LDAXR: the barriers follow the load (they preceded it);
+  * STLR: earlier loads and stores are ordered before the store, and a store->load barrier follows it
+    (STLR and LDAR are sequentially consistent with each other); STLXR orders earlier accesses first;
+  * DMB is a full barrier (store->store and store->load), not store->store alone, which a host that
+    reorders a store with a later load (x86) needs;
+  * ISB is a full barrier.
+Byte, halfword and pair exclusives (LDXRB, STXRH, LDXP...) are still not decoded.
+
+Checked against Unicorn's AArch64 core, and with four host threads adding to one counter in an
+ldaxr/stlxr loop (no update lost).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ lib/Arch/AArch64/Arch.cpp               | 26 +++++++++++
+ lib/Arch/AArch64/Decode.cpp             | 16 -------
+ lib/Arch/AArch64/Semantics/DATAXFER.cpp | 59 +++++++++++++++++--------
+ lib/Arch/AArch64/Semantics/SYSTEM.cpp   | 14 ++++--
+ lib/Arch/Arch.cpp                       |  5 +++
+ 5 files changed, 83 insertions(+), 37 deletions(-)
+
+diff --git a/lib/Arch/AArch64/Arch.cpp b/lib/Arch/AArch64/Arch.cpp
+index d11ff51..a8d3c9b 100644
+--- a/lib/Arch/AArch64/Arch.cpp
++++ b/lib/Arch/AArch64/Arch.cpp
+@@ -441,6 +441,10 @@ static void AddMonitorOperand(Instruction &inst) {
+   op.size = 64;
+   op.type = Operand::kTypeRegister;
+   inst.operands.push_back(op);
++
++  // The value the exclusive load read, for the compare-and-swap of the exclusive store
++  op.reg.name = "MONITOR_VALUE";
++  inst.operands.push_back(op);
+ }
+ 
+ static void AddPCRegOp(Instruction &inst, Operand::Action action, int64_t disp,
+@@ -2690,6 +2694,28 @@ bool TryDecodeADCS_64_ADDSUB_CARRY(const InstData &data, Instruction &inst) {
+   return TryDecodeADC_64_ADDSUB_CARRY(data, inst);
+ }
+ 
++// STXR  <Ws>, <Wt>, [<Xn|SP>{,#0}]
++bool TryDecodeSTXR_SR32_LDSTEXCL(const InstData &data, Instruction &inst) {
++  return TryDecodeSTLXR_SR32_LDSTEXCL(data, inst);
++}
++
++// STXR  <Ws>, <Xt>, [<Xn|SP>{,#0}]
++bool TryDecodeSTXR_SR64_LDSTEXCL(const InstData &data, Instruction &inst) {
++  return TryDecodeSTLXR_SR64_LDSTEXCL(data, inst);
++}
++
++// STLR  <Xt>, [<Xn|SP>{,#0}]
++bool TryDecodeSTLR_SL64_LDSTEXCL(const InstData &data, Instruction &inst) {
++  AddRegOperand(inst, kActionRead, kRegX, kUseAsValue, data.Rt);
++  AddBasePlusOffsetMemOp(inst, kActionWrite, 64, data.Rn, 0);
++  return true;
++}
++
++// ISB  {<option>|#<imm>}
++bool TryDecodeISB_BI_SYSTEM(const InstData &, Instruction &) {
++  return true;
++}
++
+ // UCVTF  <Hd>, <Wn>
+ bool TryDecodeUCVTF_H32_FLOAT2INT(const InstData &data, Instruction &inst) {
+   AddRegOperand(inst, kActionWrite, kRegH, kUseAsValue, data.Rd);
+diff --git a/lib/Arch/AArch64/Decode.cpp b/lib/Arch/AArch64/Decode.cpp
+index 4bbeb56..60888ef 100644
+--- a/lib/Arch/AArch64/Decode.cpp
++++ b/lib/Arch/AArch64/Decode.cpp
+@@ -4932,10 +4932,6 @@ bool TryDecodeAESE_B_CRYPTOAES(const InstData &, Instruction &) {
+ //  30 0 size     0
+ //  31 1 size     1
+ // STXR  <Ws>, <Wt>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTXR_SR32_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // STXR STXR_SR64_ldstexcl:
+ //   0 x Rt       0
+ //   1 x Rt       1
+@@ -4970,10 +4966,6 @@ bool TryDecodeSTXR_SR32_LDSTEXCL(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 1 size     1
+ // STXR  <Ws>, <Xt>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTXR_SR64_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // CMLT CMLT_asisdmisc_Z:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -35976,10 +35968,6 @@ bool TryDecodeURECPE_ASIMDMISC_R(const InstData &, Instruction &) {
+ //  30 1
+ //  31 1
+ // ISB  {<option>|#<imm>}
+-bool TryDecodeISB_BI_SYSTEM(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // RSUBHN RSUBHN_asimddiff_N:
+ //   0 x Rd       0
+ //   1 x Rd       1
+@@ -39313,10 +39301,6 @@ bool TryDecodeUSHLL_ASIMDSHF_L(const InstData &, Instruction &) {
+ //  30 1 size     0
+ //  31 1 size     1
+ // STLR  <Xt>, [<Xn|SP>{,#0}]
+-bool TryDecodeSTLR_SL64_LDSTEXCL(const InstData &, Instruction &) {
+-  return false;
+-}
+-
+ // STSMAXB STSMAXB_32S_memop:
+ //   0 1 Rt       0
+ //   1 1 Rt       1
+diff --git a/lib/Arch/AArch64/Semantics/DATAXFER.cpp b/lib/Arch/AArch64/Semantics/DATAXFER.cpp
+index 6175da8..5d992de 100644
+--- a/lib/Arch/AArch64/Semantics/DATAXFER.cpp
++++ b/lib/Arch/AArch64/Semantics/DATAXFER.cpp
+@@ -118,10 +118,14 @@ DEF_SEM(StoreToOffset, S src, D base, ADDR offset) {
+   return memory;
+ }
+ 
++// STLR: every earlier access is ordered before the store, and a later LDAR may not pass it
++// (the release and acquire instructions are sequentially consistent with each other)
+ template <typename S, typename D>
+ DEF_SEM(StoreRelease, S src, D dst) {
+-  WriteTrunc(dst, Read(src));
++  memory = __remill_barrier_load_store(memory);
+   memory = __remill_barrier_store_store(memory);
++  WriteTrunc(dst, Read(src));
++  memory = __remill_barrier_store_load(memory);
+   return memory;
+ }
+ 
+@@ -137,6 +141,7 @@ DEF_ISEL(STR_32_LDST_POS) = Store<R32, M32W>;
+ DEF_ISEL(STR_64_LDST_POS) = Store<R64, M64W>;
+ 
+ DEF_ISEL(STLR_SL32_LDSTEXCL) = StoreRelease<R32, M32W>;
++DEF_ISEL(STLR_SL64_LDSTEXCL) = StoreRelease<R64, M64W>;
+ 
+ DEF_ISEL(STRB_32_LDST_POS) = Store<R32, M8W>;
+ DEF_ISEL(STRB_32_LDST_IMMPOST) = StoreUpdateIndex<R32, M8W>;
+@@ -286,44 +291,61 @@ DEF_ISEL(MOVZ_64_MOVEWIDE) = Load<R64W, I64>;
+ 
+ namespace {
+ 
++// The exclusive monitor keeps the address LDXR loaded from (MONITOR) and the value it read (MONITOR_VALUE). The exclusive store
++// succeeds when the address is the monitored one and a compare-and-swap still finds that value: the store fails, as the hardware's
++// does, when another thread wrote the location in between (a store of the same value goes unseen, as in QEMU).
+ template <typename D, typename S>
+-DEF_SEM(LDXR, D dst, S src, R64W monitor) {
+-  WriteZExt(dst, Read(src));
++DEF_SEM(LDXR, D dst, S src, R64W monitor, R64W monitor_value) {
++  auto val = Read(src);
++  WriteZExt(dst, val);
+   Write(monitor, AddressOf(src));
++  Write(monitor_value, ZExtTo<uint64_t>(val));
+   return memory;
+ }
+ 
+ template <typename D, typename S>
+-DEF_SEM(LDAXR, D dst, S src, R64W monitor) {
+-  memory = __remill_barrier_load_store(memory);
+-  WriteZExt(dst, Read(src));
++DEF_SEM(LDAXR, D dst, S src, R64W monitor, R64W monitor_value) {
++  auto val = Read(src);
++  WriteZExt(dst, val);
+   Write(monitor, AddressOf(src));
++  Write(monitor_value, ZExtTo<uint64_t>(val));
++  memory = __remill_barrier_load_load(memory);
++  memory = __remill_barrier_load_store(memory);
+   return memory;
+ }
+ 
+-template <typename S, typename D>
+-DEF_SEM(STLXR, R32W dst1, S src1, D dst2, R64W monitor) {
+-  auto old_addr = Read(monitor);
+-  if (old_addr == AddressOf(dst2)) {
+-    WriteZExt(dst2, Read(src1));
+-    WriteZExt(dst1, 0_u32);  // Store succeeded.
++template <typename S, typename D, bool kRelease>
++DEF_SEM(STXR, R32W status, S src, D dst, R64W monitor, R64W monitor_value) {
++  using T = typename BaseType<S>::BT;
++  auto addr = AddressOf(dst);
++  if (kRelease) {
++    memory = __remill_barrier_load_store(memory);
++    memory = __remill_barrier_store_store(memory);
++  }
++  if (Read(monitor) == addr) {
++    T expected = TruncTo<T>(Read(monitor_value));
++    if (UCmpXchg(dst, expected, Read(src))) {
++      WriteZExt(status, 0_u32);  // Store succeeded.
++    } else {
++      WriteZExt(status, 1_u32);  // The location changed since the load.
++    }
+   } else {
+-    WriteZExt(dst1, 1_u32);  // Store failed.
++    WriteZExt(status, 1_u32);  // No exclusive load of this address.
+   }
+   Write(monitor, 0_u64);
+-  memory = __remill_barrier_store_store(memory);
+   return memory;
+ }
+ 
+-
+ }  // namespace
+ 
+ DEF_ISEL(LDXR_LR32_LDSTEXCL) = LDXR<R32W, M32>;
+ DEF_ISEL(LDXR_LR64_LDSTEXCL) = LDXR<R64W, M64>;
+ DEF_ISEL(LDAXR_LR32_LDSTEXCL) = LDAXR<R32W, M32>;
+ DEF_ISEL(LDAXR_LR64_LDSTEXCL) = LDAXR<R64W, M64>;
+-DEF_ISEL(STLXR_SR32_LDSTEXCL) = STLXR<R32, M32W>;
+-DEF_ISEL(STLXR_SR64_LDSTEXCL) = STLXR<R64, M64W>;
++DEF_ISEL(STXR_SR32_LDSTEXCL) = STXR<R32, M32W, false>;
++DEF_ISEL(STXR_SR64_LDSTEXCL) = STXR<R64, M64W, false>;
++DEF_ISEL(STLXR_SR32_LDSTEXCL) = STXR<R32, M32W, true>;
++DEF_ISEL(STLXR_SR64_LDSTEXCL) = STXR<R64, M64W, true>;
+ 
+ namespace {
+ 
+@@ -721,8 +743,9 @@ namespace {
+ 
+ template <typename D, typename S>
+ DEF_SEM(LoadAcquire, D dst, S src) {
+-  memory = __remill_barrier_load_store(memory);
+   WriteZExt(dst, Read(src));
++  memory = __remill_barrier_load_load(memory);
++  memory = __remill_barrier_load_store(memory);
+   return memory;
+ }
+ 
+diff --git a/lib/Arch/AArch64/Semantics/SYSTEM.cpp b/lib/Arch/AArch64/Semantics/SYSTEM.cpp
+index 82ba1b0..a5369dc 100644
+--- a/lib/Arch/AArch64/Semantics/SYSTEM.cpp
++++ b/lib/Arch/AArch64/Semantics/SYSTEM.cpp
+@@ -80,11 +80,18 @@ DEF_SEM(DoMSR_SR_SYSTEM_TPIDR_EL0, R64 src) {
+   return memory;
+ }
+ 
++// DMB, whatever its option: a full barrier (stores before stores, and stores before loads, which a
++// host with a store buffer, x86 included, may otherwise reorder)
+ DEF_SEM(DataMemoryBarrier) {
++  memory = __remill_barrier_store_store(memory);
++  return __remill_barrier_store_load(memory);
++}
+ 
+-  // TODO(pag): Full-system data memory barrier probably requires a synchronous
+-  //            hypercall if it behaves kind of like Linux's `sys_membarrier`.
+-  return __remill_barrier_store_store(memory);
++// ISB: flushes the pipeline so that instructions after it see earlier changes to the instruction stream; the code
++// here has no such stream of its own, so it is a full memory barrier (the JIT, which does write code, runs after it)
++DEF_SEM(InstructionSynchronizationBarrier) {
++  memory = __remill_barrier_store_store(memory);
++  return __remill_barrier_store_load(memory);
+ }
+ 
+ }  // namespace
+@@ -102,3 +109,4 @@ DEF_ISEL(MRS_RS_SYSTEM_TPIDR_EL0) = DoMRS_RS_SYSTEM_TPIDR_EL0;
+ DEF_ISEL(MSR_SR_SYSTEM_TPIDR_EL0) = DoMSR_SR_SYSTEM_TPIDR_EL0;
+ 
+ DEF_ISEL(DMB_BO_SYSTEM) = DataMemoryBarrier;
++DEF_ISEL(ISB_BI_SYSTEM) = InstructionSynchronizationBarrier;
+diff --git a/lib/Arch/Arch.cpp b/lib/Arch/Arch.cpp
+index e61d646..245864f 100644
+--- a/lib/Arch/Arch.cpp
++++ b/lib/Arch/Arch.cpp
+@@ -764,6 +764,11 @@ void Arch::InitializeEmptyLiftedFunction(llvm::Function *func) const {
+   auto monitor = ir.CreateAlloca(addr, nullptr, "MONITOR");
+   ir.CreateStore(llvm::ConstantInt::get(addr, 0), monitor);
+ 
++  // The AArch64 exclusive monitor also keeps the value LDXR loaded (zero-extended to
++  // 64 bits), so that STXR can store with a compare-and-swap against it
++  auto monitor_value = ir.CreateAlloca(addr, nullptr, "MONITOR_VALUE");
++  ir.CreateStore(llvm::ConstantInt::get(addr, 0), monitor_value);
++
+   // NOTE(pag): `PC` and `NEXT_PC` are handled by
+   //            `FinishLiftedFunctionInitialization`.
+ 
+-- 
+2.56.0
+

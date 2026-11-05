@@ -31,6 +31,12 @@ frontend Qt, de la CLI, des tests d’intégration et de la distribution.
 - Jalon S7 : premier jeu intégré
 - Jalon S8 : packaging et release
 
+### S6 implementation status
+
+The Qt interface now drives the S5 Linux host demo workflow. See
+[S6 validation](S6-validation.md) for scope, test results and reproduction commands.
+Game-oriented AOT/runtime and graphics integration remains pending for S7.
+
 ### Critères de réussite
 
 - compilation sans Xcode, Metal ou Objective-C

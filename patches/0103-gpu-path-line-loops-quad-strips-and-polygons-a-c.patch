@@ -1,0 +1,1060 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 20:10:44 +0100
+Subject: [PATCH] GPU path: line loops, quad strips and polygons; a control
+ shader for patches without one; texture-to-buffer copies; primitive restart,
+ rasterizer discard, depth clamp, line width; finalized textures stay
+ samplable; coverage report; framediff
+
+nvn_gpu: stand-in textures and ignored state are counted by reason and listed as cases; learn_type retranslates a shader with the texture type the game binds when the translator takes it from the table; texture-to-buffer copy reads the region back; copies between formats of the same texel size are raw copies.
+nvn_spirv: passthrough_tcs makes the control shader the hardware has when a program has none. framediff.py compares frames with references.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux milestone D: every draw the GPU path skipped or made with a stand-in is counted by reason; the primitives, tessellation without a control shader, texture-to-buffer copies and draw state the game sets are done
+Issue: none yet (NX2Linux, branch Téo/jalon-d-graphique)
+
+---
+ dm/tools/framediff.py              |  91 +++++++++++++
+ dm/tools/horizon_gpu.py            |  13 +-
+ dm/tools/horizon_nvn.py            |  12 +-
+ dm/tools/horizon_run.py            |   1 +
+ dm/tools/nvn_gpu.py                | 202 +++++++++++++++++++++++++---
+ dm/tools/nvn_replay.py             |  10 +-
+ dm/tools/nvn_spirv.py              | 102 ++++++++++++++-
+ dm/tools/tests/test_framediff.py   |  48 +++++++
+ dm/tools/tests/test_horizon_gpu.py | 203 ++++++++++++++++++++++++++++-
+ 9 files changed, 653 insertions(+), 29 deletions(-)
+ create mode 100644 dm/tools/framediff.py
+ create mode 100644 dm/tools/tests/test_framediff.py
+
+diff --git a/dm/tools/framediff.py b/dm/tools/framediff.py
+new file mode 100644
+index 0000000..18ffed4
+--- /dev/null
++++ b/dm/tools/framediff.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""Compares rendered frames with reference frames (NX2Linux S7bis, milestone D): two PNG files, or two folders whose files are matched by name (NX2LINUX_DUMP_FRAME=<dir> writes the frames of a run). For each pair: the size,
++the mean and the largest difference per channel, the share of pixels that differ by more than a tolerance, and the PSNR; --diff writes a PNG of the differences. The reference is yours (a frame of the same scene from another
++renderer, or an earlier run you judged right): none comes with the repository, since a frame of a game is the game's data.
++Usage: framediff.py <frame or folder> <reference frame or folder> [--tolerance N] [--max-different PERCENT] [--diff DIR]
++Exit status: 0 when every pair is within --max-different (default 1.0 %), 1 when one is not, 2 for an unreadable or missing file."""
++import argparse, math, struct, sys, zlib
++from pathlib import Path
++
++
++def read_png(path):
++    """(width, height, rgba bytes) of an 8-bit RGB, RGBA, gray or gray+alpha PNG that is not interlaced"""
++    data = Path(path).read_bytes()
++    if data[:8] != b'\x89PNG\r\n\x1a\n': raise ValueError(f'{path}: not a PNG file')
++    pos, idat, head = 8, [], None
++    while pos < len(data):
++        n, kind = struct.unpack_from('>I4s', data, pos)
++        body = data[pos + 8:pos + 8 + n]
++        if kind == b'IHDR': head = struct.unpack('>IIBBBBB', body)
++        elif kind == b'IDAT': idat.append(body)
++        pos += 12 + n
++    if not head: raise ValueError(f'{path}: no header')
++    w, h, depth, ctype, _, _, interlace = head
++    if depth != 8 or interlace or ctype not in (0, 2, 4, 6): raise ValueError(f'{path}: only 8-bit PNGs that are not interlaced are read (depth {depth}, colour type {ctype}, interlace {interlace})')
++    bpp = {0: 1, 2: 3, 4: 2, 6: 4}[ctype]
++    raw, stride = zlib.decompress(b''.join(idat)), w * bpp
++    rows, prev = [], bytearray(stride)
++    for y in range(h):
++        f, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
++        for i in range(stride):
++            a = line[i - bpp] if i >= bpp else 0
++            b = prev[i]
++            c = prev[i - bpp] if i >= bpp else 0
++            if f == 1: line[i] = (line[i] + a) & 255
++            elif f == 2: line[i] = (line[i] + b) & 255
++            elif f == 3: line[i] = (line[i] + (a + b) // 2) & 255
++            elif f == 4:
++                p = a + b - c; pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
++                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
++            elif f: raise ValueError(f'{path}: filter {f}')
++        rows.append(bytes(line)); prev = line
++    out = bytearray()
++    for r in rows:
++        for x in range(w):
++            px = r[x * bpp:(x + 1) * bpp]
++            out += bytes((px[0], px[0], px[0], 255)) if ctype == 0 else bytes((px[0], px[0], px[0], px[1])) if ctype == 4 else bytes((*px, 255)) if ctype == 2 else px
++    return w, h, bytes(out)
++
++
++def write_png(path, w, h, rgba):
++    def chunk(kind, body): return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
++    raw = b''.join(b'\0' + rgba[y * w * 4:(y + 1) * w * 4] for y in range(h))
++    Path(path).write_bytes(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
++
++
++def compare(a, b, tolerance=0):
++    """{'size': ..., 'mean': [r, g, b, a], 'max': [...], 'different': share of pixels over the tolerance in percent, 'psnr': dB or inf, 'diff': rgba bytes of the differences} for two (w, h, rgba) images"""
++    (wa, ha, pa), (wb, hb, pb) = a, b
++    if (wa, ha) != (wb, hb): return {'size': f'{wa}x{ha} against {wb}x{hb}', 'different': 100.0, 'mean': None, 'max': None, 'psnr': 0.0, 'diff': None}
++    n = wa * ha; sums, mx, bad, sq = [0] * 4, [0] * 4, 0, 0
++    diff = bytearray(n * 4)
++    for i in range(n):
++        d = [abs(pa[4 * i + c] - pb[4 * i + c]) for c in range(4)]
++        for c in range(4):
++            sums[c] += d[c]; sq += d[c] * d[c]
++            if d[c] > mx[c]: mx[c] = d[c]
++        if max(d) > tolerance: bad += 1; diff[4 * i:4 * i + 4] = bytes((min(255, d[0] * 4), min(255, d[1] * 4), min(255, d[2] * 4), 255))
++        else: diff[4 * i + 3] = 255
++    mse = sq / (n * 4) if n else 0
++    return {'size': f'{wa}x{ha}', 'mean': [round(s / n, 3) for s in sums], 'max': mx, 'different': round(100.0 * bad / n, 3) if n else 0.0, 'psnr': math.inf if mse == 0 else round(10 * math.log10(255 * 255 / mse), 2), 'diff': bytes(diff)}
++
++
++def main(argv=None):
++    p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
++    p.add_argument('frame'); p.add_argument('reference'); p.add_argument('--tolerance', type=int, default=0, help='a pixel differs when a channel is off by more than this (0..255)')
++    p.add_argument('--max-different', type=float, default=1.0, help='the share of differing pixels (percent) a pair may have'); p.add_argument('--diff', help='write the difference images here')
++    a = p.parse_args(argv)
++    fa, fb = Path(a.frame), Path(a.reference)
++    pairs = [(fa, fb)] if fa.is_file() else [(f, fb / f.name) for f in sorted(fa.glob('*.png'))]
++    if not pairs: print('no frame to compare', file=sys.stderr); return 2
++    worst = 0
++    for x, y in pairs:
++        try: r = compare(read_png(x), read_png(y), a.tolerance)
++        except (OSError, ValueError, zlib.error) as e: print(f'{x.name}: {e}', file=sys.stderr); return 2
++        print(f"{x.name}: {r['size']}  different {r['different']} %  mean {r['mean']}  max {r['max']}  PSNR {r['psnr']} dB")
++        if a.diff and r['diff']: Path(a.diff).mkdir(parents=True, exist_ok=True); write_png(Path(a.diff) / x.name, *map(int, r['size'].split('x')), r['diff'])
++        worst = max(worst, r['different'])
++    return 0 if worst <= a.max_different else 1
++
++
++if __name__ == '__main__': sys.exit(main())
+diff --git a/dm/tools/horizon_gpu.py b/dm/tools/horizon_gpu.py
+index 5733397..082264b 100644
+--- a/dm/tools/horizon_gpu.py
++++ b/dm/tools/horizon_gpu.py
+@@ -44,14 +44,14 @@ class Target(C.Structure):
+ class Draw(C.Structure):
+     _fields_ = [('vs', C.c_uint32), ('ps', C.c_uint32), ('tcs', C.c_uint32), ('tes', C.c_uint32), ('gs', C.c_uint32), ('patch_points', C.c_uint32), ('ntargets', C.c_uint32), ('targets', Target * MAX_TARGETS), ('depth', Target),
+                 ('nattrs', C.c_uint32), ('attrs', Attr * 16), ('nstreams', C.c_uint32), ('streams', Stream * 16),
+-                ('topology', C.c_uint32), ('index_type', C.c_uint32), ('pad0', C.c_uint32), ('pad1', C.c_uint32), ('index_data', C.c_void_p), ('index_size', C.c_uint64),
+-                ('first', C.c_int32), ('count', C.c_int32), ('base_vertex', C.c_int32), ('base_instance', C.c_int32), ('instances', C.c_uint32), ('pad2', C.c_uint32),
++                ('topology', C.c_uint32), ('index_type', C.c_uint32), ('restart_enable', C.c_uint32), ('restart_index', C.c_uint32), ('index_data', C.c_void_p), ('index_size', C.c_uint64),
++                ('first', C.c_int32), ('count', C.c_int32), ('base_vertex', C.c_int32), ('base_instance', C.c_int32), ('instances', C.c_uint32), ('rasterizer_discard', C.c_uint32),
+                 ('blend', Blend * MAX_TARGETS),
+                 ('cull', C.c_uint32), ('front_face', C.c_uint32), ('polygon_mode', C.c_uint32), ('depth_test', C.c_uint32), ('depth_write', C.c_uint32), ('depth_func', C.c_uint32),
+                 ('depth_clamp', C.c_uint32), ('depth_neg_one', C.c_uint32),
+                 ('stencil_test', C.c_uint32), ('depth_bias_on', C.c_uint32), ('pad4', C.c_uint32), ('pad5', C.c_uint32),
+                 ('stencil_front', C.c_uint32 * 4), ('stencil_back', C.c_uint32 * 4), ('stencil_masks', C.c_uint32 * 6),
+-                ('blend_color', C.c_float * 4), ('depth_bias', C.c_float * 3), ('pad6', C.c_float),
++                ('blend_color', C.c_float * 4), ('depth_bias', C.c_float * 3), ('line_width', C.c_float),
+                 ('viewport', C.c_float * 4), ('depth_range', C.c_float * 2), ('scissor', C.c_int32 * 4),
+                 ('nbufs', C.c_uint32), ('bufs', Buf * 32), ('ntex', C.c_uint32), ('tex', Tex * 32), ('nimgs', C.c_uint32), ('pad7', C.c_uint32), ('imgs', Img * 8)]
+ 
+@@ -78,6 +78,7 @@ class Gpu:
+         L.nx2gpu_upload.argtypes = [C.c_uint32, C.c_char_p, C.c_uint64] + [C.c_uint32] * 8
+         L.nx2gpu_copy_image.argtypes = [C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32, C.POINTER(C.c_int32), C.POINTER(C.c_int32), C.POINTER(C.c_uint32)]
+         L.nx2gpu_read.argtypes = [C.c_uint32, C.c_void_p, C.c_uint64]
++        L.nx2gpu_read_region.argtypes = [C.c_uint32, C.c_void_p, C.c_uint64, C.c_uint32, C.c_uint32, C.c_int32, C.c_int32, C.c_int32, C.c_uint32, C.c_uint32, C.c_uint32]
+         L.nx2gpu_deswizzle.argtypes = [C.c_char_p, C.c_void_p] + [C.c_uint32] * 6
+         L.nx2gpu_clear_color.argtypes = [C.c_uint32, C.POINTER(C.c_float)] + [C.c_uint32] * 4
+         L.nx2gpu_clear_depth.argtypes = [C.c_uint32, C.c_float, C.c_uint32]
+@@ -126,6 +127,12 @@ class Gpu:
+         self._check(self.lib.nx2gpu_read(i, out, nbytes), 'read')
+         return out.raw
+ 
++    def read_region(self, i, nbytes, w, h, d=1, level=0, layer=0, x=0, y=0, z=0):
++        """The w x h x d region at (x, y, z) of one level of one layer, tightly packed"""
++        out = C.create_string_buffer(nbytes)
++        self._check(self.lib.nx2gpu_read_region(i, out, nbytes, level, layer, x, y, z, w, h, d), 'read region')
++        return out.raw
++
+     def clear_color(self, i, rgba, level=0, nlevels=0, layer=0, nlayers=0, bits=None):
+         """rgba as floats, or bits: 16 bytes copied as they are (the integer clears of integer formats)"""
+         v = (C.c_float * 4).from_buffer_copy(bits) if bits is not None else (C.c_float * 4)(*rgba)
+diff --git a/dm/tools/horizon_nvn.py b/dm/tools/horizon_nvn.py
+index 40d2538..df01db2 100644
+--- a/dm/tools/horizon_nvn.py
++++ b/dm/tools/horizon_nvn.py
+@@ -34,6 +34,7 @@ class Nvn:
+         self.known = set(self.names)
+         self.addr = {}       # name -> import address
+         self.o = {}          # guest address -> Obj
++        self.ghost = {}      # guest address -> the description of a texture object that was finalized (a texture pool still names it)
+         self.cmdlists = {}   # command handle -> recorded commands
+         self._handle = 0x1000
+         self.unimpl, self.calls, self.clear_colors = {}, {}, {}
+@@ -564,10 +565,15 @@ for _name, _key in (('Target', 'target'), ('Width', 'width'), ('Height', 'height
+ def _(n, r):
+     b = n.get(r[1])
+     d = desc_of(b)
++    n.ghost.pop(r[0], None)
++    if n.gpu: n.gpu.forget(r[0])   # a texture object initialised again at this address: the image of the last one is not this texture's
+     n.o[r[0]] = Obj(kind='texture', w=max(1, d.width), h=max(1, d.height) if d.target != 0 else 1, d=d, pool=b.get('pool', 0), off=b.get('off', 0), flags=d.flags, swz=b.get('swz', (2, 3, 4, 5)), dsmode=b.get('dsmode', 0))
+     ret(r, 1)
+ @nvn('nvnTextureFinalize')
+-def _(n, r): n.o.pop(r[0], None)
++def _(n, r):
++    # the object is only the CPU side of a texture: a pool that registered it keeps its descriptor, and the game may sample through the pool after it finalized the object. The description stays (ghost) for that
++    t = n.o.pop(r[0], None)
++    if t is not None and t.get('kind') == 'texture': n.ghost[r[0]] = t
+ for _name, _get in (('Width', lambda t: t['d'].width), ('Height', lambda t: t['d'].height), ('Depth', lambda t: t['d'].depth), ('Levels', lambda t: t['d'].levels), ('Samples', lambda t: t['d'].samples),
+                     ('Format', lambda t: t['d'].format), ('Target', lambda t: t['d'].target), ('Flags', lambda t: t['d'].flags), ('Stride', lambda t: t['d'].stride),
+                     ('StorageSize', lambda t: nvn_layout.layout(t['d']).size), ('MemoryPool', lambda t: t['pool']), ('MemoryOffset', lambda t: t['off'])):
+@@ -908,6 +914,10 @@ def _(n, r): rec(n, r, 'cleards', f32(r, 0), r[1] & 0xFF, s32(r[2]), r[3] & M32)
+ def _(n, r): rec(n, r, 'misc', {'depth_clamp': r[1] & 0xFF})
+ @nvn('nvnCommandBufferSetPrimitiveRestart')
+ def _(n, r): rec(n, r, 'misc', {'primitive_restart': (r[1] & 0xFF, r[2] & M32)})
++@nvn('nvnCommandBufferSetOuterTessellationLevels')
++def _(n, r): rec(n, r, 'misc', {'tess_outer': struct.unpack('<4f', n.hz.rd(r[1], 16))})
++@nvn('nvnCommandBufferSetInnerTessellationLevels')
++def _(n, r): rec(n, r, 'misc', {'tess_inner': struct.unpack('<2f', n.hz.rd(r[1], 8))})
+ @nvn('nvnCommandBufferSetPatchSize')
+ def _(n, r): rec(n, r, 'misc', {'patch_size': r[1] & M32})
+ @nvn('nvnCommandBufferSetRasterizerDiscard')
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 7c45beb..009b912 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -48,6 +48,7 @@ def main():
+         print('frames presented:', getattr(hz, 'frames_presented', 0), '| svc calls:', hz.stats, '| not translated functions called:', hz.aot.stat('unlifted_calls'))
+         if hasattr(hz, 'nvn'): hz.nvn.pull_stats()
+         hz.svc_profile_report()
++        if getattr(getattr(hz, 'nvn', None), 'gpu', None): print(hz.nvn.gpu.coverage_text())
+         if hasattr(hz, 'nvn'): print('nvn:', hz.nvn.stats, '| not implemented NVN calls:', sorted(hz.nvn.unimpl)[:60])
+         if hasattr(hz, 'nvn'): print('NVN calls (most frequent):', sorted(hz.nvn.all_calls().items(), key=lambda kv: -kv[1])[:30])
+         if hasattr(hz, 'nvn'): print('NVN queue/window/recording calls:', {k: v for k, v in hz.nvn.all_calls().items() if any(x in k for x in ('Queue', 'Window', 'Recording', 'Commands', 'Sync'))})
+diff --git a/dm/tools/nvn_gpu.py b/dm/tools/nvn_gpu.py
+index 358269e..54acfc7 100644
+--- a/dm/tools/nvn_gpu.py
++++ b/dm/tools/nvn_gpu.py
+@@ -3,7 +3,7 @@ textures are read from the game's memory (block-linear, deswizzled by the GPU li
+ What is converted: formats (NVN to Vulkan, nvn_layout.py for sizes), blend, depth, cull and winding, samplers, vertex streams and indices (quads become triangles in the library), the constant
+ buffers, the textures named by the shader's handle slots. What is not yet: tessellation and geometry stages, compute, cube / array / 3D textures (the draw is skipped and counted), mip levels
+ above 0, stencil, multisampling, transform feedback. A draw it cannot make is counted in stats['skipped'] by reason, never faked."""
+-import ctypes, os, struct, time, zlib
++import ctypes, hashlib, json, os, struct, time, zlib
+ from array import array
+ 
+ import horizon_gpu as hg
+@@ -41,7 +41,7 @@ NVN_TO_VK.update({0x51: 11, 0x52: 12, 0x53: 72, 0x54: 73, 0x57: 18, 0x58: 19, 0x
+ NO_ALPHA = {0x38, 0x41, 0x45, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x99, 0x9B}   # RGBX, BGRX and RGB_DXT1: alpha reads 1
+ DEPTH_FORMATS = {0x32, 0x33, 0x34, 0x35, 0x36}
+ TARGET_2D, TARGET_RECTANGLE = 1, 7
+-QUADS = 100
++QUADS, LINE_LOOP, QUAD_STRIP = 100, 101, 102   # the primitives the library generates indices for (gpu.c)
+ WRAP = {0: 2, 1: 0, 2: 4, 3: 4, 4: 4, 5: 3, 6: 1, 7: 2}   # NVN wrap mode -> VkSamplerAddressMode (clamp = to edge)
+ NVN_STAGE = {'vs': 0, 'ps': 1, 'gs': 2, 'tcs': 3, 'tes': 4}   # NVNshaderStage (uniform buffer and texture bindings are per stage)
+ BINDING_BASE = {'vs': 0, 'tcs': 32, 'tes': 64, 'gs': 96, 'ps': 128}   # every stage numbers its resources from 1, a pipeline has one descriptor set: each stage gets a range of its own
+@@ -86,18 +86,31 @@ class Skip(Exception):
+     """A draw this backend cannot make yet: the reason is counted"""
+ 
+ 
++class Retry(Exception):
++    """The shader of the draw was replaced while its resources were bound: start the draw again"""
++
++
++class TypeMismatch(Exception):
++    """A shader samples a slot as one texture type and the game bound another: the shader is translated again with the type the game uses (learn_type) and the draw is made again"""
++    def __init__(self, actual): super().__init__(actual); self.actual = actual
++
++
+ class GpuBackend:
+     def __init__(self, nvn, gpu=None, software=False):
+         self.nvn, self.gpu = nvn, gpu or hg.Gpu(software=software)
+         self.shaders = {}    # shader key -> (id, stage, resources) once translated
+         self.failed = {}     # shader key -> why it did not translate
+         self.spirv = {}      # shader key -> its SPIR-V as loaded (for the variants)
++        self.unlearnable = set()   # (shader key, slot) whose type the translator takes from the shader's own instruction
++        self.tex_facts = {}  # shader key -> {texture slot: type} learned from what the game binds
++        self.tcs_cache = {}  # (evaluation shader key, patch size, outer, inner) -> module id of the control shader generated for it
+         self.alpha = {}      # pixel shader key -> module id of its alpha-test variant (0: it has none)
+         self.c1 = {}         # shader key -> its constant buffer 1
+         self.drivers = {}    # (stage kind, draw values) -> the c0 segment
+         self.images = {}     # texture pointer -> dict(id, w, h, fmt, uploaded, target)
+         self.dummies = {}
+         self.draw_texture_modules = None
++        self.alias_at = {}   # memory address -> the first alias key seen there
+         self.alias = {}      # (memory address, format, target, size...) -> the image of the first texture there
+         self.target_draws = {}   # texture pointer -> draws made into it (diagnostics)
+         self.stats = {'draws': 0, 'skipped': {}, 'uploads': 0, 'translated': 0}
+@@ -127,6 +140,48 @@ class GpuBackend:
+             if k not in self.failed and len(self.failed) < 400: self.nvn.hz.log(f'[nvn] shader {k} not translated: {str(why)[:160]}')
+         self.failed.update(errors)
+ 
++    # ---- texture types the translator was not told ----
++    TARGET_TYPE = {1: '2d', 2: '3d', 4: '2darray', 8: 'cube', 9: 'cubearray'}   # NVN texture target -> the translator's sampler type
++    DECLARED_TYPE = {3: '2d', 4: '3d', 5: 'cube'}                               # the kind a shader texture declares (tx['type'] & 0xFF), 'array' added by bit 0x100
++
++    def learn_type(self, key, tx, actual):
++        """A shader declares a 2D texture (the translator's default: nothing tells it more, a game without a PC version has no answer table) and the game binds a texture of another type to the slot. The shader is translated
++        again with that slot's type and takes the place of the first one: the draws that follow sample the right kind. False when nothing was learned (bindless handle, or this slot already has that type)"""
++        if tx['cbuf_slot'] >= 3: return False   # the slot a bindless handle stands for is not known
++        w = tx['handle']; slot = (w - 8) // 2 if w < 90 else 128 + (w - 90) // 2
++        if (key, slot) in self.unlearnable: return False
++        facts = self.tex_facts.setdefault(key, {})
++        if facts.get(str(slot)) == actual: return False
++        old = dict(facts); facts[str(slot)] = actual
++        vkey = key + '.t' + hashlib.sha1(json.dumps(facts, sort_keys=True).encode()).hexdigest()[:10]
++        ctl, code = self.nvn.shader_bytes[key]
++        out, errors = nvn_spirv.translate([(vkey, ctl, code, dict(facts))])
++        if vkey not in out:
++            self.tex_facts[key] = old; self.count('dummy: retranslation for a texture type failed'); return False
++        want_kind = {'2d': 3, '2darray': 3, '3d': 4, 'cube': 5, 'cubearray': 5}.get(actual)
++        if not any(t['handle'] == tx['handle'] and t['type'] & 0xFF == want_kind for t in out[vkey][1]['textures']):
++            # the instruction names the dimension itself (a 2D fetch on a 3D texture: the hardware reads slice 0): the translator keeps what the code says
++            self.tex_facts[key] = old; self.unlearnable.add((key, slot)); return False
++        before = self.shaders.get(vkey)
++        self.translate_variant(key, vkey, out[vkey])
++        if key not in self.shaders or self.shaders[key] is before: self.tex_facts[key] = old; return False
++        self.alpha.pop(key, None)
++        if getattr(self.nvn, 'creplay', None): self.nvn.creplay.bump(0)   # C holds the module ids of the programs it resolved
++        self.count(f'learned: a shader reads slot {slot} as {actual}, not 2D')
++        return True
++
++    def translate_variant(self, key, vkey, result):
++        spv, res = result
++        stage = res['stage']; spv = nvn_spirv.fix_capabilities(spv)
++        base = BINDING_BASE.get(stage, 0)
++        if base:
++            spv = nvn_spirv.rebind(spv, base)
++            for group in ('cbufs', 'sbufs', 'textures', 'images'):
++                for e in res[group]:
++                    if e['binding'] > 0: e['binding'] += base
++        try: self.shaders[key] = (self.gpu.shader(spv), stage, res); self.spirv[key] = spv; self.stats['translated'] += 1
++        except hg.GpuError as e: self.count('dummy: variant module failed: ' + str(e)[:60])
++
+     def constant_segment(self, key, stage_name):
+         """Constant buffer 1 of a shader: its constant segment, padded (an empty one reads as zeros)"""
+         c1 = self.c1.get(key)
+@@ -161,12 +216,32 @@ class GpuBackend:
+             except hg.GpuError: self.alpha[key] = 0
+         return self.alpha[key]
+ 
++    def passthrough_tcs(self, tes_key, patch_size, outer, inner):
++        """The module of the control shader a program without one gets (nvn_spirv.passthrough_tcs), made once for the evaluation shader, the patch size and the levels"""
++        k = (tes_key, patch_size, tuple(outer), tuple(inner))
++        if k not in self.tcs_cache:
++            try: self.tcs_cache[k] = self.gpu.shader(nvn_spirv.passthrough_tcs(self.spirv[tes_key], patch_size, outer, inner))
++            except (nvn_spirv.TranslateError, hg.GpuError) as e: raise Skip('tessellation without a control shader: ' + str(e)[:80])
++        return self.tcs_cache[k]
++
+     def shader_of(self, key):
+         self.translate_pending([key])
+         if key not in self.shaders: raise Skip('shader ' + (self.failed.get(key) or 'not translated')[:60])
+         return self.shaders[key]
+ 
+     # ---- images ----
++    def texture(self, ptr):
++        """The description of the texture object at ptr, or of the one that was finalized there (a texture pool still names it)"""
++        n = self.nvn
++        return n.o.get(ptr) or getattr(n, 'ghost', {}).get(ptr)
++
++    def forget(self, ptr):
++        """A texture object is initialised again at ptr: the image of the last one is looked for by memory and description again. An image that nothing else names is freed"""
++        im = self.images.pop(ptr, None)
++        if im is None or im in self.alias.values() or any(v is im for v in self.images.values()): return
++        self.gpu.image_free(im['id'])
++
++
+     def vk_format(self, fmt, what='texture'):
+         f = NVN_TO_VK.get(fmt)
+         if f is None: raise Skip(f'{what} format {fmt:#x}')
+@@ -175,7 +250,7 @@ class GpuBackend:
+     def image_of(self, ptr, target=False):
+         """The GPU image of an NVN texture (created on first use, with all its levels and layers; sampled textures are read from the game's memory then)"""
+         n = self.nvn
+-        t = n.o.get(ptr)
++        t = self.texture(ptr)
+         if not t or 'd' not in t: raise Skip('unknown texture')
+         d = t['d']
+         im = self.images.get(ptr)
+@@ -197,6 +272,11 @@ class GpuBackend:
+             if alias and alias in self.alias:
+                 self.images[ptr] = self.alias[alias]; self.count('texture sharing the image of another')
+                 return self.image_of(ptr, target)
++            if alias:
++                other = self.alias_at.setdefault(alias[0], alias)
++                if other != alias:   # the same memory holds two textures that differ in format or size: each gets an image of its own, and what one draws the other does not see
++                    self.count('alias: a texture of the same memory with another format or size is not shared')
++                    self.case(f'memory {alias[0]:#x} holds format {other[1]:#x} {other[3]}x{other[4]} and format {alias[1]:#x} {alias[3]}x{alias[4]}')
+             im = self.images[ptr] = dict(id=self.gpu.image(w, h, vkf, dep, layers, levels, kind), w=w, h=h, fmt=vkf, depth=depth, kind=kind, layers=layers, levels=levels, uploaded=False, written=False)
+             if alias: self.alias[alias] = im
+         if target: im['written'] = True
+@@ -207,7 +287,7 @@ class GpuBackend:
+                 im['epoch'] = self.nvn.stats['presents']
+                 h = self.memory_hash(t, d)
+                 if h and h != im['hash']:
+-                    im['hash'] = h; self.upload(ptr, t, d, im); self.stats['reuploads'] = self.stats.get('reuploads', 0) + 1
++                    im['hash'] = h; t['dynamic'] = True; self.upload(ptr, t, d, im); self.stats['reuploads'] = self.stats.get('reuploads', 0) + 1
+         return im
+ 
+     HASH_BLOCKS = 24   # a texture above 96 KB is judged on this many 4 KB blocks spread over it
+@@ -218,7 +298,10 @@ class GpuBackend:
+         size = t.get('storage_size')
+         if size is None: size = t['storage_size'] = nvn_layout.layout(d).size
+         if not addr or not size: return 0
+-        try: return self.nvn.hz.aot.lib.aot_hash64(addr, size, self.HASH_BLOCKS)
++        if size > self.HASH_BLOCKS * 4096 and not t.get('sampled_hash'):
++            t['sampled_hash'] = True; self.count('rewrite detection: a texture above 96 KB is judged rewritten by a sample of its memory (24 blocks of 4 KB)')
++        blocks = min(size // 4096 + 1, 4096) if t.get('dynamic') else self.HASH_BLOCKS   # a texture the game was seen to rewrite is hashed whole (up to 16 MB): it will be rewritten again, anywhere in it
++        try: return self.nvn.hz.aot.lib.aot_hash64(addr, size, blocks)
+         except AttributeError: return zlib.crc32(self.nvn.hz.rd(addr, min(size, 1 << 16)))   # a fake memory (the tests)
+ 
+     def upload(self, ptr, t, d, im):
+@@ -289,14 +372,41 @@ class GpuBackend:
+         return self.gpu.read(im['id'], im['w'] * im['h'] * 4)
+ 
+     # ---- draws ----
++    # what a count means, by its prefix: the report separates the draws that were not made from the placeholders that stood in, the state that was not applied, and the plain notes
++    NOTES = ('texture sharing the image', 'stencil-mode texture sampled', 'upload: empty at first use', 'learned:', 'alias:', 'rewrite detection:')
++
++    def coverage(self):
++        """{'draws', 'skipped': {why: n}, 'dummies': {...}, 'not_applied': {...}, 'notes': {...}, 'cases': [...]} of this run: every draw the backend did not make or made with a stand-in is here with its reason"""
++        out = dict(draws=self.stats.get('draws', 0), skipped={}, dummies={}, not_applied={}, notes={}, cases=list(self.stats.get('cases', [])))
++        for why, n in self.stats['skipped'].items():
++            kind = 'dummies' if why.startswith('dummy:') else 'not_applied' if why.startswith('state not applied') else 'notes' if why.startswith(self.NOTES) else 'skipped'
++            out[kind][why] = n
++        return out
++
++    def coverage_text(self):
++        c = self.coverage()
++        lines = [f"graphics: {c['draws']} draws made; skipped {sum(c['skipped'].values())}, with a stand-in texture {sum(c['dummies'].values())}, state not applied {sum(c['not_applied'].values())}"]
++        for title, key in (('draws skipped', 'skipped'), ('stand-in textures', 'dummies'), ('state not applied', 'not_applied'), ('notes', 'notes')):
++            for why, n in sorted(c[key].items(), key=lambda kv: -kv[1]): lines.append(f'  {title}: {n:>8}  {why}')
++        for case in c['cases']: lines.append(f'  case: {case}')
++        return '\n'.join(lines)
++
++    def case(self, text):
++        """One concrete case of something the backend does not do, said once (at most 60 are kept): the report lists them"""
++        cases = self.stats.setdefault('cases', [])
++        if text not in cases and len(cases) < 60: cases.append(text)
++
+     def count(self, why): self.stats['skipped'][why] = self.stats['skipped'].get(why, 0) + 1
+ 
+     def skip(self, why):
+         self.stats['skipped'][why] = self.stats['skipped'].get(why, 0) + 1
+ 
+     def draw(self, state, call):
+-        try: self._draw(state, call)
+-        except Skip as e: self.skip(str(e))
++        for _ in range(3):   # a shader replaced by the one that reads its textures as the game binds them: the draw is made again with it
++            try: self._draw(state, call); return
++            except Retry: continue
++            except Skip as e: self.skip(str(e)); return
++        self.skip('draw: shaders replaced three times')
+ 
+     def copy_guarded(self, state, c):
+         try: self.copy(state, c)
+@@ -389,9 +499,12 @@ class GpuBackend:
+         for st in n.program_stages(prog[0]):
+             if st.get('key') in n.shader_bytes: by_stage[nvn_spirv.stage_of(n.shader_bytes[st['key']][1], n.shader_bytes[st['key']][0])] = st['key']
+         if 'vs' not in by_stage or (set(by_stage) - set(NVN_STAGE)): raise Skip('stages ' + '+'.join(sorted(by_stage)))
+-        if ('tcs' in by_stage) != ('tes' in by_stage): raise Skip('tessellation without both stages')
++        if 'tcs' in by_stage and 'tes' not in by_stage: raise Skip('tessellation control without an evaluation shader')
+         if call['prim'] == NVN_PRIM_PATCHES and 'tes' not in by_stage: raise Skip('patches without tessellation shaders')
+         loaded = {st: self.shader_of(key) for st, key in by_stage.items()}   # stage -> (module id, stage, resources)
++        misc0 = state.get('misc', {})
++        # an evaluation shader with no control shader: the hardware passes the patch on and tessellates with the levels the game set (NVN's default is 1)
++        gen_tcs = self.passthrough_tcs(by_stage['tes'], misc0.get('patch_size', 3), misc0.get('tess_outer', (1.0,) * 4), misc0.get('tess_inner', (1.0,) * 2)) if 'tes' in by_stage and 'tcs' not in by_stage else 0
+         vs_id, ps_id = loaded['vs'][0], loaded['ps'][0] if 'ps' in loaded else 0
+         support = SUPPORT
+         func = state.get('states', {}).get('color', {}).get('alpha_func', 8)
+@@ -407,6 +520,7 @@ class GpuBackend:
+         d.vs, d.ps, d.ntargets = vs_id, ps_id, len(rts)
+         if 'gs' in loaded: d.gs = loaded['gs'][0]
+         if 'tcs' in loaded: d.tcs, d.tes = loaded['tcs'][0], loaded['tes'][0]
++        elif gen_tcs: d.tcs, d.tes = gen_tcs, loaded['tes'][0]
+         d.patch_points = state.get('misc', {}).get('patch_size', 3)
+         views = state.get('rt_views', [])
+         extent = None
+@@ -438,6 +552,7 @@ class GpuBackend:
+         dev = n.o.get(getattr(n, 'device', 0), {})
+         d.depth_neg_one = int(dev.get('depth', 0) == 0)   # NVN_DEPTH_MODE_NEAR_IS_MINUS_W: clip z runs from -w to w
+         misc = state.get('misc', {})
++        d.depth_clamp, d.line_width, d.rasterizer_discard = misc.get('depth_clamp', 0) & 1, misc.get('line_width', 1.0), misc.get('rasterizer_discard', 0) & 1
+         if ds:
+             d.stencil_test = ds.get('st', 0)
+             for arr, face in ((d.stencil_front, 'f'), (d.stencil_back, 'b')):
+@@ -464,7 +579,10 @@ class GpuBackend:
+             if len(raw) < call['count'] * isz: raise Skip('index buffer')
+             if isz == 1: raw = array('H', array('B', raw)).tobytes(); isz = 2
+             idx = array('H' if isz == 2 else 'I'); idx.frombytes(raw)
+-            indices = (raw, 1 if isz == 2 else 2, max(idx) if len(idx) else 0)
++            rs_on, rs_idx = misc.get('primitive_restart', (0, 0)); rs_on &= 1
++            rs_idx &= (0xFF, 0xFFFF, 0xFFFFFFFF)[call['index_type']] if call['index_type'] < 3 else 0xFFFFFFFF   # a byte index was widened to 16 bits above: its restart value is the byte's
++            used = [i for i in idx if not (rs_on and i == rs_idx)]   # the restart index names no vertex
++            indices = (raw, 1 if isz == 2 else 2, max(used) if used else 0)
+         used = {}
+         for loc, a in enumerate(vattr):
+             if not a['fmt']: continue
+@@ -482,12 +600,14 @@ class GpuBackend:
+             keep.append(ctypes.create_string_buffer(data, max(1, len(data))))
+             d.streams[d.nstreams] = hg.Stream(s, stride, div, 0, ctypes.addressof(keep[-1]), len(data)); d.nstreams += 1
+         prim = call['prim']
+-        if prim in (2, 8, 9): raise Skip(f'primitive {prim}')
+-        d.topology = QUADS if prim == 7 else prim
++        # the primitives Vulkan has no name for: quads, line loops and quad strips are drawn through indices the library generates, a polygon is a triangle fan
++        d.topology = {7: QUADS, 2: LINE_LOOP, 8: QUAD_STRIP, 9: 6}.get(prim, prim)
+         d.first, d.count, d.base_vertex, d.base_instance, d.instances = call.get('first', 0), call['count'], call.get('base_vertex', 0), call.get('base_instance', 0), call.get('instances', 1)
+         if indices:
+             keep.append(ctypes.create_string_buffer(indices[0], max(1, len(indices[0]))))
+             d.index_type, d.index_data, d.index_size = indices[1], ctypes.addressof(keep[-1]), len(indices[0])
++            d.restart_enable, d.restart_index = rs_on, rs_idx
++        if prim == 0 and misc.get('point_size', 1.0) != 1.0: self.count('state not applied: point size of a point draw')
+ 
+         # resources
+         writeback = self.bind_resources(state, d, keep, [(NVN_STAGE[st], st, loaded[st][2], by_stage[st]) for st in loaded], support)
+@@ -538,11 +658,16 @@ class GpuBackend:
+                 if tx['binding'] in seen: continue
+                 seen.add(tx['binding'])
+                 t = hg.Tex(); t.binding = tx['binding']
+-                self.fill_texture(t, state.get('texpool', 0), state.get('samppool', 0), self.handle_of(state, stage, tx), tx['type'])
++                try: self.fill_texture(t, state.get('texpool', 0), state.get('samppool', 0), self.handle_of(state, stage, tx), tx['type'])
++                except TypeMismatch as e:
++                    if self.learn_type(key, tx, e.actual): raise Retry()
++                    self.count('dummy: ' + ('bindless texture of type ' if tx['cbuf_slot'] >= 3 else 'the shader samples it as 2D by its own instruction; the texture is ') + e.actual)
++                    self.case(f'shader {key} samples a {e.actual} texture (c2 word {tx["handle"]}) with a 2D instruction: a placeholder is bound')
++                    self.fill_texture(t, state.get('texpool', 0), state.get('samppool', 0), self.handle_of(state, stage, tx), tx['type'], dummy_ok=True)
+                 d.tex[d.ntex] = t; d.ntex += 1
+         return writeback
+ 
+-    def fill_texture(self, t, texpool, samppool, handle, tx_type):
++    def fill_texture(self, t, texpool, samppool, handle, tx_type, dummy_ok=False):
+         """Fills the hg.Tex t (all of it but its binding) for a shader texture of type tx_type that reads handle through the pools; raises Skip for a type that cannot be sampled"""
+         n = self.nvn
+         kind, array = tx_type & 0xFF, bool(tx_type & 0x100)
+@@ -557,16 +682,24 @@ class GpuBackend:
+             try:
+                 im = self.image_of(ptr)
+                 if self.view_fits(im, view_type): image = im['id']
+-                else: self.count(f'dummy: view type {view_type} of a {"3D" if im["kind"] else str(im["layers"]) + "-layer"} image')
+-            except Skip as e: self.count('dummy: ' + str(e))
++                else:
++                    actual = self.TARGET_TYPE.get(self.texture(ptr)['d'].target)
++                    if not dummy_ok and actual and actual != self.DECLARED_TYPE.get(kind, '2d') + ('array' if array else '') and not (actual.startswith('2d') and kind == 3): raise TypeMismatch(actual)
++                    self.count(f'dummy: view type {view_type} of a {"3D" if im["kind"] else str(im["layers"]) + "-layer"} image')
++            except Skip as e:
++                self.count('dummy: ' + str(e))
++                o = n.o.get(ptr)
++                self.case(f'texture id {tex_id:#x} of the pool names {ptr:#x}: {e} ({"an object without a texture description: " + ",".join(sorted(o)[:6]) if o is not None else "no NVN object at that address"})')
+             if image and view:
+                 if view['set_levels']: base_level, nlevels = view['base_level'], view['nlevels']
+                 if view['set_layers']: base_layer, nlayers = view['min_layer'], view['nlayers']
+-        else: self.count('dummy: texture id not in the pool')
++        else:
++            self.count('dummy: texture id not in the pool')
++            self.case(f'texture id {tex_id:#x} (sampler {samp_id:#x}) is not in the texture pool {texpool:#x}')
+         if image is None: image, view_type, base_level, nlevels, base_layer, nlayers = self.dummy_image(view_type), view_type, 0, 0, 0, 0
+         sp = n.o.get(samppool, {}).get('samplers', {}).get(samp_id, {})
+         t.image = image
+-        if image is not None and ptr and (view['dsmode'] == 1 if view and view['set_dsmode'] else (n.o.get(ptr) or {}).get('dsmode') == 1) and self.images.get(ptr, {}).get('depth'): t.aspect = 1; self.count('stencil-mode texture sampled')   # NVN's STENCIL mode: the stencil is read where a shader samples the depth-stencil texture
++        if image is not None and ptr and (view['dsmode'] == 1 if view and view['set_dsmode'] else (self.texture(ptr) or {}).get('dsmode') == 1) and self.images.get(ptr, {}).get('depth'): t.aspect = 1; self.count('stencil-mode texture sampled')   # NVN's STENCIL mode: the stencil is read where a shader samples the depth-stencil texture
+         t.view_type, t.base_level, t.nlevels, t.base_layer, t.nlayers = view_type, base_level, nlevels, base_layer, nlayers
+         t.swz[:] = self.swizzle_of(ptr, view)
+         mn = sp.get('min_filter', 0)
+@@ -580,7 +713,7 @@ class GpuBackend:
+ 
+     def swizzle_of(self, ptr, view):
+         """The VkComponentSwizzle of r, g, b, a for sampling a texture: the texture builder's swizzle, the view's over it, a format without alpha reading 1 (0: identity)"""
+-        t = self.nvn.o.get(ptr) if ptr else None
++        t = self.texture(ptr) if ptr else None
+         if not t or 'd' not in t: return (0, 0, 0, 0)
+         swz = (view['swz_r'], view['swz_g'], view['swz_b'], view['swz_a']) if view and view['set_swizzle'] else t.get('swz', (2, 3, 4, 5))
+         no_alpha = t['d'].format in NO_ALPHA
+@@ -603,7 +736,7 @@ class GpuBackend:
+         n = self.nvn
+         if c['kind'] == 'b2t':
+             im = self.image_of(c['tex'], target=True)
+-            d = n.o[c['tex']]['d']
++            d = self.texture(c['tex'])['d']
+             bpb, bw, bh = nvn_layout.fmt_of(d.format)
+             x, y, z, w, h, dep = c['region']
+             view = c['view']
+@@ -632,12 +765,41 @@ class GpuBackend:
+             sv, dv = c['src_view'], c['dst_view']
+             slevel, slayer = (sv['base_level'] if sv and sv['set_levels'] else 0), (sv['min_layer'] if sv and sv['set_layers'] else 0)
+             dlevel, dlayer = (dv['base_level'] if dv and dv['set_levels'] else 0), (dv['min_layer'] if dv and dv['set_layers'] else 0)
+-            if si['fmt'] != di['fmt']: raise Skip('copy between formats')
++            sfmt, dfmt = self.texture(c['src'])['d'].format, self.texture(c['dst'])['d'].format
++            if sfmt != dfmt and nvn_layout.fmt_of(sfmt) != nvn_layout.fmt_of(dfmt): raise Skip('copy between formats of different texel sizes')   # equal texel sizes copy as raw texels, as the hardware does
+             if si['kind'] or di['kind']: self.gpu.copy_image(si['id'], di['id'], (w, h, max(1, dep)), (sx, sy, sz), (dx, dy, dz), slevel, 0, dlevel, 0)
+             else:
+                 for k in range(max(1, dep)): self.gpu.copy_image(si['id'], di['id'], (w, h, 1), (sx, sy, 0), (dx, dy, 0), slevel, slayer + sz + k, dlevel, dlayer + dz + k)
++        elif c['kind'] == 't2b':
++            im = self.image_of(c['tex'])
++            d = self.texture(c['tex'])['d']
++            bpb, bw, bh = nvn_layout.fmt_of(d.format)
++            x, y, z, w, h, dep = c['region']
++            view = c['view']
++            level = view['base_level'] if view and view['set_levels'] else 0
++            layer0 = view['min_layer'] if view and view['set_layers'] else 0
++            row_bytes, rows, slices = nvn_layout.blk(w, bw) * bpb, nvn_layout.blk(h, bh), max(1, dep)
++            misc = state.get('misc', {})
++            row_stride = misc.get('copy_row_stride') or row_bytes
++            img_stride = misc.get('copy_image_stride') or row_stride * rows
++            if im['kind']:
++                if row_bytes * rows * slices > self.MAX_READ: raise Skip('texture to buffer: region too large')
++                parts = [self.gpu.read_region(im['id'], row_bytes * rows * slices, w, h, slices, level, 0, x, y, z)]
++            else:
++                if row_bytes * rows > self.MAX_READ: raise Skip('texture to buffer: region too large')
++                parts = [self.gpu.read_region(im['id'], row_bytes * rows, w, h, 1, level, layer0 + z + k, x, y, 0) for k in range(slices)]
++            raw = b''.join(parts)
++            for k in range(slices):
++                base = c['dst'] + k * img_stride
++                chunk = raw[k * row_bytes * rows:(k + 1) * row_bytes * rows]
++                if row_stride == row_bytes: n.hz.wr(base, chunk)
++                else:
++                    for r in range(rows): n.hz.wr(base + r * row_stride, chunk[r * row_bytes:(r + 1) * row_bytes])
++            self.stats['texture_to_buffer'] = self.stats.get('texture_to_buffer', 0) + 1
+         else: self.count('copy: ' + c['kind'])
+ 
++    MAX_READ = 64 << 20   # the library's staging buffer (STAGING_BYTES in gpu.c)
++
+     SSBO_BASE = {'vs': 0x110, 'cs': 0x310, 'gs': 0x410, 'ps': 0x510}   # the storage buffer tables in c0 (engine/dm/gfx/nvn/dmsh_abi.h): slot r at base + 0x10 r
+     CS_UBO_BASE = 0x210                                                # a compute shader reads its uniform buffers through addresses in c0 at 0x210 + 0x10 r
+ 
+diff --git a/dm/tools/nvn_replay.py b/dm/tools/nvn_replay.py
+index d08f4ce..3b923da 100644
+--- a/dm/tools/nvn_replay.py
++++ b/dm/tools/nvn_replay.py
+@@ -13,10 +13,10 @@ import nvn_state
+ 
+ U32, U64 = C.c_uint32, C.c_uint64
+ KIND = {'vs': 0, 'ps': 1, 'gs': 2, 'tcs': 3, 'tes': 4}
+-MISC_BLEND_COLOR, MISC_DEPTH_RANGE, MISC_ALPHA_REF, MISC_POLY_OFFSET, MISC_PATCH_SIZE = range(1, 6)
++MISC_BLEND_COLOR, MISC_DEPTH_RANGE, MISC_ALPHA_REF, MISC_POLY_OFFSET, MISC_PATCH_SIZE, MISC_LINE_WIDTH, MISC_DEPTH_CLAMP, MISC_RESTART, MISC_DISCARD, MISC_POINT_SIZE = range(1, 11)   # the tessellation levels stay in Python's state: the draws that need them are Python's
+ # the skip reasons the C code finds, in the order of its enum (nvnreplay.inc SK_*)
+ SKIPS = ('no program', 'targets', 'no target', 'vertex stream not bound', 'vertex format', 'unreadable buffer', 'index buffer', 'primitive', 'patches without tessellation shaders',
+-         'tessellation without both stages', 'too many buffers', 'alpha test: no variant', 'texture slot', 'program skipped', 'image skipped', 'texture skipped', 'empty draw')
++         'tessellation control without an evaluation shader', 'too many buffers', 'alpha test: no variant', 'texture slot', 'program skipped', 'image skipped', 'texture skipped', 'empty draw', 'state not applied: point size of a point draw')
+ STAT_NAMES = ('draws', 'lib_errors', 'write_backs', 'prog_callbacks', 'image_callbacks', 'texture_callbacks', 'fallbacks')
+ 
+ 
+@@ -142,6 +142,11 @@ class CReplay:
+                 elif k == 'alpha_ref': out.append(record(nvn_rec.OP_MISC, MISC_ALPHA_REF, fbits(v), 0, 0, 0))
+                 elif k == 'polygon_offset': out.append(record(nvn_rec.OP_MISC, MISC_POLY_OFFSET, *[fbits(x) for x in v], 0))
+                 elif k == 'patch_size': out.append(record(nvn_rec.OP_MISC, MISC_PATCH_SIZE, v, 0, 0, 0))
++                elif k == 'line_width': out.append(record(nvn_rec.OP_MISC, MISC_LINE_WIDTH, fbits(v), 0, 0, 0))
++                elif k == 'point_size': out.append(record(nvn_rec.OP_MISC, MISC_POINT_SIZE, fbits(v), 0, 0, 0))
++                elif k == 'depth_clamp': out.append(record(nvn_rec.OP_MISC, MISC_DEPTH_CLAMP, v, 0, 0, 0))
++                elif k == 'primitive_restart': out.append(record(nvn_rec.OP_MISC, MISC_RESTART, v[0], v[1], 0, 0))
++                elif k == 'rasterizer_discard': out.append(record(nvn_rec.OP_MISC, MISC_DISCARD, v, 0, 0, 0))
+                 elif k.startswith('stencil_'):
+                     which, face = next((i, int(k[len(p):])) for i, p in enumerate(nvn_rec.STENCIL_KEYS) if k.startswith(p))
+                     out.append(record(nvn_rec.OP_STENCIL, which, face, v))
+@@ -199,6 +204,7 @@ class CReplay:
+     def tex_cb(self, texpool, samppool, handle, tx_type, out):
+         try:
+             self.b.fill_texture(out[0], texpool, samppool, handle, tx_type); return 0
++        except nvn_gpu.TypeMismatch: return 3   # the game binds another type of texture than the shader samples: C hands the draw to Python, which retranslates the shader
+         except nvn_gpu.Skip as e: self.b.skip(str(e)); return 1
+         except Exception as e: self.nvn.hz.log(f'[nvn] replay: texture callback failed: {type(e).__name__}: {e}'); return 1
+ 
+diff --git a/dm/tools/nvn_spirv.py b/dm/tools/nvn_spirv.py
+index 7e4eea5..20acf1c 100644
+--- a/dm/tools/nvn_spirv.py
++++ b/dm/tools/nvn_spirv.py
+@@ -103,12 +103,17 @@ def translate(shaders):
+     out, errors, jobs = {}, {}, []
+     work = tempfile.mkdtemp(prefix='nvn_spirv_')
+     try:
+-        for key, ctl, code in shaders:
++        for item in shaders:
++            key, ctl, code = item[:3]
++            tex = item[3] if len(item) > 3 else None   # {texture slot: type} the translator is told instead of its default (2D): a variant of a shader, under a key of its own
+             spv, res = CACHE / f'{key}.spv', CACHE / f'{key}.res.json'
+             if spv.exists() and res.exists(): out[key] = (spv.read_bytes(), json.loads(res.read_text())); continue
+             stage = stage_of(code, ctl)
+             if stage not in ('vs', 'ps', 'gs', 'tcs', 'tes', 'cs'): errors[key] = f'stage {stage!r} is not translated yet'; continue
+-            try: jobs.append(make_job(key, stage, ctl, code, work))
++            try:
++                job = make_job(key, stage, ctl, code, work)
++                if tex: job['tex'] = dict(tex)
++                jobs.append(job)
+             except TranslateError as e: errors[key] = str(e)
+         if jobs:
+             ensure_translator()
+@@ -252,3 +257,96 @@ def fix_capabilities(spirv):
+     out = ins[:first] + add + ins[first:]
+     flat = head + [v for x in out for v in x]
+     return struct.pack(f'<{len(flat)}I', *flat)
++
++
++def tes_inputs(spirv):
++    """The per-vertex inputs of a tessellation evaluation shader's SPIR-V that come from the previous stage through a location: [(location, components)] of float vectors. Raises TranslateError for any other kind
++    of input (an integer or double attribute, a per-patch input the missing control stage would have to write): a passthrough control stage cannot stand for what the game's does not exist"""
++    _, ins = _instructions(spirv)
++    types = {x[1]: x for x in ins if x[0] & 0xFFFF in (21, 22, 23, 28, 29, 30, 32)}
++    loc, builtin, patch = {}, set(), set()
++    for x in ins:
++        if x[0] & 0xFFFF == 71 and len(x) >= 4:
++            if x[2] == 30: loc[x[1]] = x[3]
++            elif x[2] == 11: builtin.add(x[1])
++            elif x[2] == 15: patch.add(x[1])
++    out = []
++    for x in ins:
++        if x[0] & 0xFFFF != 59 or x[3] != 1 or x[2] in builtin: continue   # OpVariable, Input, not a built-in
++        if x[2] in patch: raise TranslateError('tessellation evaluation shader reads a per-patch input and the draw has no control shader to write it')
++        if x[2] not in loc:   # a block of built-ins (gl_in) has no location: it is the position, which the passthrough copies
++            continue
++        t = types.get(types[x[1]][3])   # pointee of the pointer
++        if t is not None and t[0] & 0xFFFF in (28, 29): t = types.get(t[2])   # per-vertex array: its element
++        v = t if t is not None and t[0] & 0xFFFF == 23 else None
++        f = types.get(v[2]) if v else None
++        if not f or f[0] & 0xFFFF != 22 or f[2] != 32: raise TranslateError(f'tessellation evaluation shader input at location {loc[x[2]]} is not a vector of 32-bit floats')
++        out.append((loc[x[2]], v[3]))
++    return sorted(set(out))
++
++
++def passthrough_tcs(tes_spirv, patch_points, outer, inner):
++    """A tessellation control shader that does what the hardware does when a program has none: every patch vertex is passed on as it came (position and the locations the evaluation shader reads), and the tessellation
++    levels are the ones the game set (outer: 4 floats, inner: 2). The levels are constants of the module, so a module per set of levels"""
++    inputs = tes_inputs(tes_spirv)
++    words, nid = [], [0]
++    def new():
++        nid[0] += 1; return nid[0]
++    def op(code, *ops): words.append([code | (len(ops) + 1) << 16, *ops])
++    def string(s): return _string_words(s)
++    def f32(x): return struct.unpack('<I', struct.pack('<f', x))[0]
++    void, fnv, flt, uint, sint, v4 = (new() for _ in range(6))
++    c_in, c_out, c4, c2 = (new() for _ in range(4))
++    gpv, a_in, a_out, p_in, p_out, p_ins, p_outs = (new() for _ in range(7))   # gl_PerVertex struct; its arrays; the pointers to them
++    arr4, arr2, p_arr4, p_arr2, p_f, p_i, p_v4i, p_v4o = (new() for _ in range(8))
++    v_in, v_out, v_inv, v_outer, v_inner = (new() for _ in range(5))
++    main, label = new(), new()
++    c0 = new(); consts = {i: new() for i in range(1, 4)}   # int 0..3
++    fconst = {}
++    for val in list(outer) + list(inner):
++        if val not in fconst: fconst[val] = new()
++    vt_of, pei_of, peo_of = {4: v4}, {4: p_v4i}, {4: p_v4o}   # one vector type and one pointer per component count: SPIR-V has no duplicate non-aggregate types
++    for _, comps in inputs:
++        if comps not in vt_of: vt_of[comps], pei_of[comps], peo_of[comps] = new(), new(), new()
++    plan = [dict(loc=location, comps=comps, vt=vt_of[comps], ai=new(), ao=new(), vi=new(), pi=new(), po=new(), vo=new(), pe_i=pei_of[comps], pe_o=peo_of[comps]) for location, comps in inputs]
++    iface = [v_in, v_out, v_inv, v_outer, v_inner] + [p['vi'] for p in plan] + [p['vo'] for p in plan]
++    op(17, 1); op(17, 3)   # Shader, Tessellation
++    op(14, 0, 1)   # Logical, GLSL450
++    op(15, 1, main, *string('main'), *iface)   # TessellationControl
++    op(16, main, 26, patch_points)   # OutputVertices
++    op(71, gpv, 2)   # Block
++    op(72, gpv, 0, 11, 0)   # member 0: BuiltIn Position
++    op(71, v_inv, 11, 8); op(71, v_outer, 11, 11); op(71, v_inner, 11, 12); op(71, v_outer, 15); op(71, v_inner, 15)
++    for p in plan: op(71, p['vi'], 30, p['loc']); op(71, p['vo'], 30, p['loc'])
++    op(19, void); op(33, fnv, void); op(22, flt, 32); op(21, uint, 32, 0); op(21, sint, 32, 1); op(23, v4, flt, 4)
++    op(43, uint, c_in, 32); op(43, uint, c_out, patch_points); op(43, uint, c4, 4); op(43, uint, c2, 2)
++    op(30, gpv, v4)
++    op(28, a_in, gpv, c_in); op(28, a_out, gpv, c_out)
++    op(32, p_in, 1, a_in); op(32, p_out, 3, a_out)
++    op(28, arr4, flt, c4); op(28, arr2, flt, c2); op(32, p_arr4, 3, arr4); op(32, p_arr2, 3, arr2)
++    op(32, p_f, 3, flt); op(32, p_i, 1, sint); op(32, p_v4i, 1, v4); op(32, p_v4o, 3, v4)
++    op(43, sint, c0, 0)
++    for i, c in consts.items(): op(43, sint, c, i)
++    for val, c in fconst.items(): op(43, flt, c, f32(val))
++    op(59, p_in, v_in, 1); op(59, p_out, v_out, 3); op(59, p_i, v_inv, 1); op(59, p_arr4, v_outer, 3); op(59, p_arr2, v_inner, 3)
++    for comps, vt in vt_of.items():
++        if comps != 4: op(23, vt, flt, comps); op(32, pei_of[comps], 1, vt); op(32, peo_of[comps], 3, vt)
++    for p in plan:
++        vt = p['vt']
++        op(28, p['ai'], vt, c_in); op(28, p['ao'], vt, c_out); op(32, p['pi'], 1, p['ai']); op(32, p['po'], 3, p['ao'])
++        op(59, p['pi'], p['vi'], 1); op(59, p['po'], p['vo'], 3)
++    op(54, void, main, 0, fnv); op(248, label)
++    inv = new(); op(61, sint, inv, v_inv)
++    src, dst = new(), new(); op(65, p_v4i, src, v_in, inv, c0); op(65, p_v4o, dst, v_out, inv, c0)
++    val = new(); op(61, v4, val, src); op(62, dst, val)
++    for p in plan:
++        s, d_, x = new(), new(), new()
++        op(65, p['pe_i'], s, p['vi'], inv); op(65, p['pe_o'], d_, p['vo'], inv); op(61, p['vt'], x, s); op(62, d_, x)
++    for k, val_ in enumerate(outer):
++        a = new(); op(65, p_f, a, v_outer, c0 if k == 0 else consts[k]); op(62, a, fconst[val_])
++    for k, val_ in enumerate(inner):
++        a = new(); op(65, p_f, a, v_inner, c0 if k == 0 else consts[k]); op(62, a, fconst[val_])
++    op(253); op(56)
++    # the module: the header, then the instructions in the order the specification asks for (the sections above were emitted in it)
++    flat = [w for ins in words for w in ins]
++    return struct.pack(f'<{5 + len(flat)}I', 0x07230203, 0x00010300, 0, nid[0] + 1, 0, *flat)
+diff --git a/dm/tools/tests/test_framediff.py b/dm/tools/tests/test_framediff.py
+new file mode 100644
+index 0000000..79a3ca3
+--- /dev/null
++++ b/dm/tools/tests/test_framediff.py
+@@ -0,0 +1,48 @@
++"""framediff.py: reads PNGs and measures the difference between two frames (synthetic frames only)"""
++import sys, tempfile, unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++import framediff as fd
++
++
++def frame(w, h, f): return b''.join(bytes(f(x, y)) + b'\xff' for y in range(h) for x in range(w))
++
++
++class Diff(unittest.TestCase):
++    def test_a_png_round_trips_and_identical_frames_have_no_difference(self):
++        with tempfile.TemporaryDirectory() as d:
++            px = frame(4, 3, lambda x, y: (x * 60, y * 90, 7))
++            fd.write_png(Path(d) / 'a.png', 4, 3, px)
++            self.assertEqual(fd.read_png(Path(d) / 'a.png'), (4, 3, px))
++            r = fd.compare(fd.read_png(Path(d) / 'a.png'), (4, 3, px))
++            self.assertEqual((r['different'], r['max'], r['psnr']), (0.0, [0, 0, 0, 0], float('inf')))
++
++    def test_a_changed_pixel_is_counted_and_a_tolerance_forgives_small_errors(self):
++        a = frame(4, 4, lambda x, y: (100, 100, 100)); b = bytearray(a); b[0] = 110; b[4] = 160
++        r = fd.compare((4, 4, a), (4, 4, bytes(b)))
++        self.assertEqual((r['different'], r['max']), (12.5, [60, 0, 0, 0]))
++        self.assertEqual(fd.compare((4, 4, a), (4, 4, bytes(b)), tolerance=20)['different'], 6.25)   # only the large one is left
++
++    def test_frames_of_another_size_never_match(self):
++        r = fd.compare((2, 2, frame(2, 2, lambda x, y: (0, 0, 0))), (3, 2, frame(3, 2, lambda x, y: (0, 0, 0))))
++        self.assertEqual((r['different'], r['size']), (100.0, '2x2 against 3x2'))
++
++    def test_the_command_matches_folders_by_name_and_sets_its_exit_status(self):
++        with tempfile.TemporaryDirectory() as d:
++            a, b = Path(d) / 'a', Path(d) / 'b'; a.mkdir(); b.mkdir()
++            same = frame(8, 8, lambda x, y: (x * 30, 0, 0)); other = frame(8, 8, lambda x, y: (x * 30, 255, 0))
++            fd.write_png(a / '1.png', 8, 8, same); fd.write_png(b / '1.png', 8, 8, same)
++            self.assertEqual(fd.main([str(a), str(b)]), 0)
++            fd.write_png(a / '2.png', 8, 8, same); fd.write_png(b / '2.png', 8, 8, other)
++            self.assertEqual(fd.main([str(a), str(b), '--diff', str(Path(d) / 'out')]), 1)
++            self.assertTrue((Path(d) / 'out' / '2.png').exists())
++            self.assertEqual(fd.main([str(a / '1.png'), str(Path(d) / 'missing.png')]), 2)
++
++    def test_a_png_that_is_not_one_is_refused(self):
++        with tempfile.TemporaryDirectory() as d:
++            (Path(d) / 'x.png').write_bytes(b'nope')
++            with self.assertRaises(ValueError): fd.read_png(Path(d) / 'x.png')
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_horizon_gpu.py b/dm/tools/tests/test_horizon_gpu.py
+index 49be01d..7b0791d 100644
+--- a/dm/tools/tests/test_horizon_gpu.py
++++ b/dm/tools/tests/test_horizon_gpu.py
+@@ -86,6 +86,30 @@ R8G8B8A8_UNORM, TRIANGLE_LIST = 37, 3
+ VIEW_2D, VIEW_3D, VIEW_2D_ARRAY = 1, 2, 5
+ 
+ 
++TESE_LEVELS = """#version 450
++layout(triangles, equal_spacing, ccw) in;
++layout(location=0) in vec4 vin[];
++layout(location=0) out vec4 v;
++void main() {
++    gl_Position = gl_in[0].gl_Position * gl_TessCoord.x + gl_in[1].gl_Position * gl_TessCoord.y + gl_in[2].gl_Position * gl_TessCoord.z;
++    v = vec4(gl_TessLevelOuter[0] / 8.0, gl_TessLevelInner[0] / 8.0, gl_TessLevelOuter[2] / 8.0, 1.0);
++}
++"""
++TESE_VEC3 = """#version 450
++layout(triangles, equal_spacing, ccw) in;
++layout(location=0) in vec4 vin[];
++layout(location=1) in vec3 extra[];
++layout(location=0) out vec4 v;
++void main() {
++    gl_Position = gl_in[0].gl_Position * gl_TessCoord.x + gl_in[1].gl_Position * gl_TessCoord.y + gl_in[2].gl_Position * gl_TessCoord.z;
++    v = vec4(extra[0].x, vin[0].y, 0.0, 1.0);
++}
++"""
++
++
++VERT_Z = VERT.replace('vec4(pos, 0.0, 1.0)', 'vec4(pos, 2.0, 1.0)')   # beyond the far plane
++
++
+ def spirv(src, stage):
+     d = tempfile.mkdtemp()
+     try:
+@@ -146,7 +170,7 @@ class Gpu(unittest.TestCase):
+         keep = ctypes.create_string_buffer(verts); tint = ctypes.create_string_buffer(struct.pack('<4f', 1, 1, 1, 1))
+         out = g.image(16, 16, R8G8B8A8_UNORM)
+         d = hg.Draw(); d.vs, d.ps, d.ntargets = g.shader(spirv(VERT, 'vert')), g.shader(spirv(FRAG, 'frag')), 1; d.targets[0].image = out
+-        for name, (src, st) in stages.items(): setattr(d, name, g.shader(spirv(src, st)))
++        for name, (src, st) in stages.items(): setattr(d, name, g.shader(src if isinstance(src, bytes) else spirv(src, st)))
+         d.nattrs = 2; d.attrs[0] = hg.Attr(0, 0, 103, 0); d.attrs[1] = hg.Attr(1, 0, 109, 8)
+         d.nstreams = 1; d.streams[0] = hg.Stream(0, 24, 0, 0, ctypes.addressof(keep), len(verts))
+         d.topology, d.count, d.instances, d.patch_points = topology, 3, 1, 3
+@@ -157,6 +181,167 @@ class Gpu(unittest.TestCase):
+         px = g.read(out, 16 * 16 * 4)
+         return tuple(px[(8 * 16 + 8) * 4:(8 * 16 + 8) * 4 + 4])
+ 
++    def prim_draw(self, topology, points, count=None, indices=None, first=0, vert=VERT, **fields):
++        """Draws the points (x, y), red, with FRAG's tint white, in a 64x64 image with no culling; the pixels read back"""
++        g = self.gpu
++        vs, ps = g.shader(spirv(vert, 'vert')), g.shader(spirv(FRAG, 'frag'))
++        img = g.image(64, 64, R8G8B8A8_UNORM)
++        g.clear_color(img, (0, 0, 0, 1))
++        verts = b''.join(struct.pack('<6f', x, y, 1, 0, 0, 1) for x, y in points)
++        keep = ctypes.create_string_buffer(verts); tint = ctypes.create_string_buffer(struct.pack('<4f', 1, 1, 1, 1))
++        d = hg.Draw(); d.vs, d.ps, d.ntargets = vs, ps, 1; d.targets[0].image = img
++        d.nattrs = 2; d.attrs[0] = hg.Attr(0, 0, 103, 0); d.attrs[1] = hg.Attr(1, 0, 109, 8)
++        d.nstreams = 1; d.streams[0] = hg.Stream(0, 24, 0, 0, ctypes.addressof(keep), len(verts))
++        d.topology, d.count, d.instances, d.first = topology, count if count is not None else len(indices if indices is not None else points), 1, first
++        if indices is not None:
++            raw = struct.pack(f'<{len(indices)}H', *indices); ib = ctypes.create_string_buffer(raw)
++            d.index_type, d.index_data, d.index_size = 1, ctypes.addressof(ib), len(raw)
++        d.blend[0].mask = 0xF
++        d.cull, d.front_face, d.polygon_mode = 0, 0, 0
++        d.depth_func = 1
++        d.viewport[:] = (0, 0, 64, 64); d.depth_range[:] = (0, 1); d.scissor[:] = (0, 0, 64, 64)
++        d.nbufs = 1; d.bufs[0] = hg.Buf(1, 0, 0, 0, ctypes.addressof(tint), 16)
++        for k, v in fields.items(): setattr(d, k, v)
++        self.assertEqual(self.gpu.draw(d), 0)
++        px = g.read(img, 64 * 64 * 4)
++        return lambda x, y: tuple(px[(y * 64 + x) * 4:(y * 64 + x) * 4 + 3])
++
++    STRIP = [(-1, -1), (-1, 1), (-0.5, -1), (-0.5, 1), (0, -1), (0, 1)]   # two quads side by side: the left half of the target
++
++    def test_a_quad_strip_is_drawn_as_its_quads(self):
++        for name, kwargs in (('plain', {}), ('indexed', {'indices': [0, 1, 2, 3, 4, 5]}), ('reversed', {'indices': [5, 4, 3, 2, 1, 0]})):
++            at = self.prim_draw(102, self.STRIP, **kwargs)
++            self.assertEqual((at(8, 32), at(24, 32)), ((255, 0, 0), (255, 0, 0)), name)   # both quads
++            self.assertEqual(at(48, 32), (0, 0, 0), name)   # nothing on the right
++
++    def test_a_quad_strip_with_too_few_vertices_draws_nothing(self):
++        at = self.prim_draw(102, self.STRIP, count=3)
++        self.assertEqual(at(8, 32), (0, 0, 0))
++
++    def test_a_line_loop_closes_on_its_first_vertex(self):
++        square = [(-0.49, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.49, 0.5)]   # the closing edge is the last one back to the first: the left side
++        self.assertEqual(self.prim_draw(101, square)(16, 32), (255, 0, 0))
++        self.assertEqual(self.prim_draw(3, square)(16, 32), (0, 0, 0))   # a line strip does not close
++        self.assertEqual(self.prim_draw(101, square, indices=[0, 1, 2, 3])(16, 32), (255, 0, 0))
++
++    def test_primitive_restart_ends_a_strip_at_the_games_own_index(self):
++        pts = [(-1, -1), (-0.1, -1), (-1, 0), (0.1, -1), (1, -1), (1, 0), (0, 0), (1, 1)]   # two triangles along the top edge of the target; vertex 7 is the far corner
++        strip = [0, 1, 2, 7, 3, 4, 5]
++        with_restart = self.prim_draw(5, pts, indices=strip, restart_enable=1, restart_index=7)
++        self.assertEqual((with_restart(8, 8), with_restart(56, 8), with_restart(32, 40)), ((255, 0, 0), (255, 0, 0), (0, 0, 0)))   # both triangles, nothing joining them
++        no_restart = self.prim_draw(5, pts, indices=strip)
++        self.assertNotEqual(no_restart(32, 40), (0, 0, 0))   # without it the far vertex drags triangles across the target
++
++    def test_the_all_ones_index_restarts_by_itself(self):
++        pts = [(-1, -1), (-0.1, -1), (-1, 0), (0.1, -1), (1, -1), (1, 0)]
++        at = self.prim_draw(5, pts, indices=[0, 1, 2, 0xFFFF, 3, 4, 5], restart_enable=1, restart_index=0xFFFF)
++        self.assertEqual((at(8, 8), at(56, 8)), ((255, 0, 0), (255, 0, 0)))
++
++    def test_rasterizer_discard_draws_nothing(self):
++        tri = [(-1, -1), (3, -1), (-1, 3)]
++        self.assertEqual(self.prim_draw(4, tri)(32, 32), (255, 0, 0))
++        self.assertEqual(self.prim_draw(4, tri, rasterizer_discard=1)(32, 32), (0, 0, 0))
++
++    def test_depth_clamp_keeps_a_fragment_beyond_the_far_plane(self):
++        tri = [(-1, -1), (3, -1), (-1, 3)]
++        self.assertEqual(self.prim_draw(4, tri, vert=VERT_Z)(32, 32), (0, 0, 0))   # clipped: z = 2 > w = 1
++        clamped = self.prim_draw(4, tri, vert=VERT_Z, depth_clamp=1)(32, 32)
++        if clamped == (0, 0, 0): self.skipTest('the device has no depth clamp')
++        self.assertEqual(clamped, (255, 0, 0))
++
++    def test_a_wide_line_is_wider(self):
++        seg = [(-0.9, 0.0), (0.9, 0.0)]
++        thin = self.prim_draw(1, seg)
++        wide = self.prim_draw(1, seg, line_width=6.0)
++        if wide(32, 35) == (0, 0, 0): self.skipTest('the device has no wide lines')
++        self.assertEqual(thin(32, 35), (0, 0, 0)); self.assertEqual(wide(32, 35), (255, 0, 0))
++
++    def backend(self, textures):
++        """An nvn_gpu backend on the real library with a fake NVN (textures: pointer -> description) and a guest memory of 64 KB"""
++        import types, nvn_gpu
++        mem = bytearray(0x10000)
++        hz = types.SimpleNamespace(rd=lambda a, n: bytes(mem[a:a + n]), wr=lambda a, data: mem.__setitem__(slice(a, a + len(data)), data))
++        nvn = types.SimpleNamespace(o={p: {'d': types.SimpleNamespace(**d)} for p, d in textures.items()}, hz=hz, stats={'presents': 0}, pool_addr=lambda *a: 0)
++        return nvn_gpu.GpuBackend(nvn, gpu=self.gpu), mem
++
++    RGBA8 = dict(format=0x25, width=8, height=4, depth=1, levels=1, samples=1, target=1, flags=0, stride=0)
++
++    def test_a_texture_to_buffer_copy_writes_the_region_into_the_games_memory_with_its_strides(self):
++        b, mem = self.backend({1: self.RGBA8})
++        im = b.image_of(1, target=True)
++        pixels = bytes(range(128)); self.gpu.upload(im['id'], pixels, 8, 4)
++        region = (2, 1, 0, 4, 2, 1)   # x, y, z, w, h, d
++        b.copy({}, {'kind': 't2b', 'tex': 1, 'view': None, 'region': region, 'dst': 0x100, 'flags': 0})
++        self.assertEqual(bytes(mem[0x100:0x120]), pixels[1 * 32 + 8:1 * 32 + 24] + pixels[2 * 32 + 8:2 * 32 + 24])   # tightly packed rows
++        b.copy({'misc': {'copy_row_stride': 40}}, {'kind': 't2b', 'tex': 1, 'view': None, 'region': region, 'dst': 0x200, 'flags': 0})
++        self.assertEqual((bytes(mem[0x200:0x210]), bytes(mem[0x210:0x228]), bytes(mem[0x228:0x238])), (pixels[40:56], bytes(24), pixels[72:88]))   # rows 40 bytes apart, the gap untouched
++
++    def test_a_copy_between_textures_of_the_same_texel_size_is_a_raw_copy_and_another_size_is_refused(self):
++        import nvn_gpu
++        b, mem = self.backend({1: self.RGBA8, 2: self.RGBA8, 3: dict(self.RGBA8, format=0x01)})   # 0x01: one byte per texel
++        src, dst = b.image_of(1, target=True), b.image_of(2, target=True)
++        self.gpu.upload(src['id'], bytes(range(128)), 8, 4)
++        b.copy({}, {'kind': 't2t', 'src': 1, 'src_view': None, 'src_region': (0, 0, 0, 8, 4, 1), 'dst': 2, 'dst_view': None, 'dst_region': (0, 0, 0), 'flags': 0})
++        self.assertEqual(self.gpu.read(dst['id'], 128), bytes(range(128)))
++        b.image_of(3, target=True)
++        with self.assertRaises(nvn_gpu.Skip):
++            b.copy({}, {'kind': 't2t', 'src': 1, 'src_view': None, 'src_region': (0, 0, 0, 8, 4, 1), 'dst': 3, 'dst_view': None, 'dst_region': (0, 0, 0), 'flags': 0})
++
++    def test_a_shader_that_samples_a_3d_texture_as_2d_is_translated_again_with_the_type_the_game_binds(self):
++        import nvn_gpu, nvn_spirv, types
++        tex3d = dict(self.RGBA8, target=2, depth=4)   # NVN_TEXTURE_TARGET_3D
++        b, mem = self.backend({7: tex3d})
++        b.image_of(7, target=True)   # a texture the GPU wrote: no upload from the fake memory
++        b.nvn.o[100] = {'tex': {5: 7}}; b.nvn.shader_bytes = {'k': (b'ctl', b'code')}; b.nvn.creplay = None
++        b.shaders['k'] = (b.gpu.shader(spirv(FRAG_2D, 'frag')), 'ps', {'cbufs': [], 'sbufs': [], 'textures': [], 'images': []})
++        first = b.shaders['k']
++        t = hg.Tex()
++        with self.assertRaises(nvn_gpu.TypeMismatch) as cm: b.fill_texture(t, 100, 0, 5, 3)   # a shader that declares a 2D texture
++        self.assertEqual(cm.exception.actual, '3d')
++        b.fill_texture(t, 100, 0, 5, 4)    # one that declares 3D fits
++        asked, answer = [], {'type': 4}
++        def fake_translate(items):
++            asked.extend(items)
++            kind = answer['type']
++            return {items[0][0]: (spirv(FRAG_3D, 'frag'), {'stage': 'ps', 'cbufs': [], 'sbufs': [], 'textures': [{'binding': 160, 'type': kind, 'cbuf_slot': -1, 'handle': 14}], 'images': []})}, {}
++        real, nvn_spirv.translate = nvn_spirv.translate, fake_translate
++        try:
++            tx = {'cbuf_slot': -1, 'handle': 14, 'type': 3, 'binding': 160}   # c2 word 14: texture slot 3
++            self.assertTrue(b.learn_type('k', tx, '3d'))
++            self.assertFalse(b.learn_type('k', tx, '3d'), 'a slot that was told its type is not told again')
++            self.assertFalse(b.learn_type('k', dict(tx, cbuf_slot=3), '3d'), 'a bindless handle names no slot')
++            answer['type'] = 3   # the translator keeps the 2D its instruction names: nothing is learned, and the slot is not asked again
++            tx5 = dict(tx, handle=8 + 2 * 5); n_asked = len(asked)
++            self.assertFalse(b.learn_type('k', tx5, '3d')); self.assertFalse(b.learn_type('k', tx5, '3d'))
++            self.assertEqual(len(asked), n_asked + 1)
++        finally: nvn_spirv.translate = real
++        self.assertEqual(asked[0][3], {'3': '3d'}); self.assertEqual(asked[0][1:3], (b'ctl', b'code'))
++        self.assertIsNot(b.shaders['k'], first)   # the shader of the key is the variant now
++        self.assertEqual(b.tex_facts, {'k': {'3': '3d'}}); self.assertIn(('k', 5), b.unlearnable)
++
++    def test_the_coverage_report_sorts_every_count_by_what_it_means(self):
++        b, _ = self.backend({})
++        for why, n in (('shader not translated', 3), ('dummy: unknown texture', 2), ('state not applied: point size of a point draw', 5), ('texture sharing the image of another', 7), ('learned: a shader reads slot 1 as 3d, not 2D', 1)): b.stats['skipped'][why] = n
++        b.case('one case'); b.stats['draws'] = 100
++        c = b.coverage()
++        self.assertEqual((c['skipped'], c['dummies'], c['not_applied'], c['cases'], c['draws']), ({'shader not translated': 3}, {'dummy: unknown texture': 2}, {'state not applied: point size of a point draw': 5}, ['one case'], 100))
++        self.assertEqual(sorted(c['notes']), ['learned: a shader reads slot 1 as 3d, not 2D', 'texture sharing the image of another'])
++        text = b.coverage_text()
++        self.assertIn('skipped 3, with a stand-in texture 2, state not applied 5', text); self.assertIn('case: one case', text)
++
++    def test_a_texture_finalized_after_it_was_registered_in_a_pool_is_still_sampled_through_its_description(self):
++        import types
++        b, _ = self.backend({})
++        b.nvn.ghost = {7: {'d': types.SimpleNamespace(**self.RGBA8)}}   # nvnTextureFinalize moved it here
++        im = b.image_of(7, target=True)
++        self.assertEqual((im['w'], im['h']), (8, 4))
++        b.forget(7)   # initialised again at that address: the image is looked for afresh, and freed since nothing else names it
++        self.assertNotIn(7, b.images)
++
++    def test_a_triangle_fan_covers_a_convex_polygon(self):
++        at = self.prim_draw(6, [(-1, -1), (1, -1), (1, 1), (-1, 1)])   # a polygon is drawn as a fan
++        self.assertEqual((at(10, 10), at(50, 50), at(10, 50), at(50, 10)), ((255, 0, 0),) * 4)
++
+     def test_the_alpha_test_variant_kills_a_failing_fragment(self):
+         import nvn_spirv
+         g = self.gpu
+@@ -256,6 +441,22 @@ class Gpu(unittest.TestCase):
+     def test_tessellation_shaders_run(self):
+         self.assertEqual(self.stage_draw(14, tcs=(TESC, 'tesc'), tes=(TESE, 'tese')), (0, 0, 255, 255))
+ 
++    def test_a_patch_draw_without_a_control_shader_gets_the_generated_one_with_the_games_levels(self):
++        import nvn_spirv
++        tes = spirv(TESE_LEVELS, 'tese')
++        for outer, inner, want in (((8.0, 8.0, 8.0, 8.0), (4.0, 4.0), (255, 128, 255)), ((4.0, 1.0, 2.0, 1.0), (8.0, 1.0), (128, 255, 64))):
++            tcs = nvn_spirv.passthrough_tcs(tes, 3, outer, inner)
++            got = self.stage_draw(14, tcs=(tcs, None), tes=(tes, None))
++            self.assertTrue(all(abs(a - b) <= 1 for a, b in zip(got[:3], want)), (outer, inner, got))   # the evaluation shader prints the levels it was given
++
++    def test_the_generated_control_shader_carries_a_vector_of_any_width_and_refuses_what_it_cannot(self):
++        import nvn_spirv
++        tes = spirv(TESE_VEC3, 'tese')
++        self.assertEqual(nvn_spirv.tes_inputs(tes), [(0, 4), (1, 3)])
++        self.assertEqual(self.stage_draw(14, tcs=(nvn_spirv.passthrough_tcs(tes, 3, (1,) * 4, (1,) * 2), None), tes=(tes, None))[3], 255)
++        flat = spirv(TESE_LEVELS.replace('layout(location=0) in vec4 vin[];', 'layout(location=0) flat in ivec4 vin[];'), 'tese')
++        with self.assertRaises(nvn_spirv.TranslateError): nvn_spirv.passthrough_tcs(flat, 3, (1,) * 4, (1,) * 2)
++
+     def test_an_image_is_presented_to_a_window_without_a_readback(self):
+         g = self.gpu
+         try: win = hg.GpuWindow(g, 'test', 320, 180, hidden=True)

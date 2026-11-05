@@ -1,0 +1,1173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 20:41:59 +0100
+Subject: [PATCH] Linux host: nn::audio is mixed and played (voices, ADPCM,
+ sink, audio out), save data has a journal (commit and rollback), movie
+ openings are refused explicitly
+
+horizon_audio mixes the voices into buses and the sink's channels through libnx2linux_audio.so (SDL3 device, WAV file or nothing); ADPCM is decoded when a buffer is queued. horizon_fs: SaveDir keeps a working copy and commits atomically, with Commit, Unmount and restart semantics of the console, plus rename, set size, delete directory, free space, more mount overloads. horizon_movie: the SDK's Extractor openings fail with its own no-implementation code, counted and named, instead of a decoder that answers 0.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NX2Linux milestone E: the game's audio is played, its saves are written with commit and rollback, and a movie it cannot play fails explicitly
+Issue: none yet (NX2Linux, branch Téo/jalon-e-audio-saves-video)
+
+---
+ dm/tools/horizon_audio.py            | 205 +++++++++++++++++++----
+ dm/tools/horizon_fs.py               | 238 ++++++++++++++++++++++++---
+ dm/tools/horizon_mix.py              |  68 ++++++++
+ dm/tools/horizon_movie.py            |  38 +++++
+ dm/tools/horizon_overrides.py        |   1 +
+ dm/tools/horizon_run.py              |   6 +-
+ dm/tools/tests/test_horizon_audio.py | 160 ++++++++++++++++++
+ dm/tools/tests/test_horizon_fs.py    | 133 +++++++++++++++
+ dm/tools/tests/test_horizon_movie.py |  40 +++++
+ 9 files changed, 834 insertions(+), 55 deletions(-)
+ create mode 100644 dm/tools/horizon_mix.py
+ create mode 100644 dm/tools/horizon_movie.py
+ create mode 100644 dm/tools/tests/test_horizon_audio.py
+ create mode 100644 dm/tools/tests/test_horizon_fs.py
+ create mode 100644 dm/tools/tests/test_horizon_movie.py
+
+diff --git a/dm/tools/horizon_audio.py b/dm/tools/horizon_audio.py
+index d2d68bc..8f528b1 100644
+--- a/dm/tools/horizon_audio.py
++++ b/dm/tools/horizon_audio.py
+@@ -1,9 +1,9 @@
+-"""nn::audio on the Linux host, silent (NX2Linux S7bis): the audio renderer and the audio output as the game's client API sees them, with nothing behind them but bookkeeping. The Mach host runs the SDK's own
+-renderer server on the CPU (hle_audren.c); here every call that would reach the audio services is replaced, the objects are tracked by the guest address of their opaque struct, and time passes as it would:
+-the renderer's system event is signalled every `sampleCount / sampleRate` seconds (the game's audio thread waits on it), a started voice consumes its wave buffers at the sample rate and releases them, memory pools
+-attach at once, an audio-out buffer is released after the time its samples would take. No sound is produced. Layouts used: AudioRendererParameter {u32 sampleRate; u32 sampleCount}, WaveBuffer {ptr; size;
+-s32 startSampleOffset; s32 endSampleOffset; bool loop}, AudioOutBuffer {ptr; capacity; size} (the SDK keeps nothing else in the first 24 bytes)."""
+-import os, struct, threading, time
++"""nn::audio on the Linux host (NX2Linux S7bis): the audio renderer and the audio output as the game's client API sees them. Every call that would reach the audio services is replaced; the objects are tracked by the guest
++address of their opaque struct. The renderer's system event is signalled every `sampleCount / sampleRate` seconds (the game's audio thread waits on it), memory pools attach at once, and what the game plays is MIXED:
++each tick a started voice resamples its wave buffers (linear, the voice's rate and pitch) into the buses its mix volumes name, the device sink's inputs make the output channels (a 5.1 sink is downmixed to stereo), and the
++block goes to libnx2linux_audio.so (an SDL3 device, or the file NX2LINUX_AUDIO=wav:<file> names, see horizon_mix.py). A wave buffer is released when the voice has played it. PCM 8-bit, 16-bit and float voices are mixed; ADPCM (Nintendo's DSP-ADPCM, 16 predictor coefficients from the parameter given when the voice is acquired) is decoded when a wave buffer is queued; a format that is not decoded leaves the voice silent, counted and logged once. Audio-out buffers (PCM 16-bit stereo) are mixed in the same output and released as they are played. Layouts used: AudioRendererParameter {u32 sampleRate;
++u32 sampleCount}, WaveBuffer {ptr; size; s32 startSampleOffset; s32 endSampleOffset; bool loop} (the SDK keeps nothing else in the first 25 bytes), AudioOutBuffer {ptr; capacity; size}."""
++import ctypes, os, struct, threading, time
+ 
+ from horizon_overrides import hle
+ 
+@@ -13,8 +13,24 @@ PLAY_START = 0
+ M32 = 0xFFFFFFFF
+ 
+ 
++FMT_BYTES = {1: 1, 2: 2, 5: 4}   # SampleFormat PcmInt8, PcmInt16, PcmFloat: bytes per sample
++FMT_ADPCM = 6                     # SampleFormat_Adpcm: decoded when the wave buffer is queued
++
++
+ class Voice:
+-    def __init__(self, rate): self.rate, self.playing, self.waves, self.released, self.consumed, self.played = rate, False, [], [], 0, 0
++    def __init__(self, rate, channels=1, fmt=2):
++        self.rate, self.channels, self.fmt = rate, channels, fmt
++        self.playing, self.waves, self.released, self.played = False, [], [], 0
++        self.pitch, self.volume, self.mixvol = 1.0, 1.0, {}   # mixvol: (source channel, destination bus) -> volume
++        self.coef, self.h1, self.h2 = (0,) * 16, 0, 0         # ADPCM: the predictor coefficients the game gave, and the last two samples decoded
++
++
++class Wave:
++    def __init__(self, addr, data, frames, start, end, loop, fmt): self.addr, self.data, self.frames, self.start, self.end, self.loop, self.fmt, self.pos = addr, data, frames, start, end, loop, fmt, float(start)
++
++
++class Out:
++    def __init__(self): self.queue, self.released, self.started, self.off = [], [], False, 0   # queue: [struct address, PCM16 stereo bytes]; off: the bytes of the first one played
+ 
+ 
+ class Audio:
+@@ -22,10 +38,32 @@ class Audio:
+         self.hz, self.lock = hz, threading.Lock()
+         self.voices, self.pools, self.delays, self.outs = {}, {}, {}, {}
+         self.event_wh, self.ticker, self.tick_samples, self.rate, self.running = 0, None, 240, RATE, False
++        self.sink = [0, 1]   # the device sink's inputs: the bus each output channel reads
++        self.mixer, self.mixer_error, self.unsupported = None, None, {}
++        self.ticks = 0
++
++    def report(self):
++        """One line for the end of a run: whether the game's audio reached an output, and how much of it was sound"""
++        if not self.ticker and not self.voices and not self.outs: return 'audio: the game opened no audio renderer or output'
++        voices = f'{len(self.voices)} voices, {sum(self.unsupported.values())} wave buffers of a format that is not decoded {dict(self.unsupported) or ""}'
++        if not self.mixer: return f'audio: silent ({self.mixer_error}); {voices}'
++        st = self.mixer.stats()
++        return f"audio: {self.mixer.device}: {st['frames'] / self.rate:.1f} s sent, {100.0 * st['loud_frames'] / max(1, st['frames']):.1f} % of it not silent, peak {st['peak']:.2f}, {st['dropped']} frames dropped (device behind); {voices}"
++
++    def open_mixer(self):
++        mode = os.environ.get('NX2LINUX_AUDIO', 'auto')
++        if mode == 'off': self.mixer_error = 'NX2LINUX_AUDIO=off'; return
++        try:
++            import horizon_mix
++            self.mixer = horizon_mix.Mixer(self.rate, '' if mode == 'auto' else mode)
++            self.hz.log(f'[audio] output: {self.mixer.device}')
++        except Exception as e:
++            self.mixer_error = str(e); self.hz.log(f'[audio] no output ({e}): the game runs silent')
+ 
+     def start_ticker(self):
+         if self.ticker: return
+         self.running = True
++        self.open_mixer()
+         self.ticker = threading.Thread(target=self.run, name='audren-tick', daemon=True); self.ticker.start()
+ 
+     def run(self):
+@@ -37,18 +75,75 @@ class Audio:
+             delay = nxt - time.monotonic()
+             if delay > 0: time.sleep(delay)
+             else: nxt = time.monotonic()
++        if self.mixer: self.mixer.close()
++
++    def walk(self, v, n, entries, buses):
++        """The voice's next n output samples: its wave buffers resampled into the buses of its mix volumes (entries: (source channel, bus, gain)). A finished buffer is released; a looping one starts again"""
++        remaining, out_at = n, 0
++        step = v.rate / self.rate * v.pitch
++        while remaining and v.waves:
++            w = v.waves[0]; made, pos = 0, w.pos
++            if self.mixer:
++                for ch, bus, gain in entries or ((0, None, 0.0),):
++                    b = buses.setdefault(bus, (ctypes.c_float * n)()) if bus is not None else self.scratch(n)
++                    dst = ctypes.byref(b, 4 * out_at)
++                    made, pos = self.mixer.mix(dst, remaining, w.data, w.fmt, min(w.end, w.frames), v.channels, min(ch, v.channels - 1), w.pos, step, gain)
++            else: made, pos = remaining, w.pos + remaining * step if not w.loop or w.pos + remaining * step < w.end else w.pos + remaining * step
++            w.pos = pos; v.played += int(made * step); remaining -= made; out_at += made
++            if w.pos >= min(w.end, w.frames) or not made and remaining:   # the buffer is played
++                if w.loop and w.end > w.start and made: w.pos = float(w.start)
++                else: v.waves.pop(0); v.released.append(w.addr)
++
++    def scratch(self, n):
++        if getattr(self, '_scratch', None) is None or len(self._scratch) < n: self._scratch = (ctypes.c_float * n)()
++        return self._scratch
+ 
+     def tick(self):
++        n = self.tick_samples; buses = {}
+         with self.lock:
++            self.ticks += 1
+             for v in self.voices.values():
+                 if not v.playing or not v.waves: continue
+-                v.consumed += self.tick_samples; v.played += self.tick_samples
+-                while v.waves and v.waves[0][1] is not None and v.consumed >= v.waves[0][1]:
+-                    wb, dur = v.waves.pop(0); v.consumed -= dur; v.released.append(wb)
++                entries = [(src, dst, vol * v.volume) for (src, dst), vol in v.mixvol.items() if vol * v.volume != 0.0]
++                self.walk(v, n, entries, buses)
++            left, right = ((ctypes.c_float * n)() for _ in range(2))
++            self.master(buses, left, right, n)
++            self.mix_outs(left, right, n)
++            if self.mixer:
++                lr = (ctypes.c_float * (2 * n))()
++                lr[0::2], lr[1::2] = left[:], right[:]
++                self.mixer.submit(lr, n)
+         ev = self.hz.handles.get(self.event_wh)
+         if ev is not None:
+             self.hz.signal_event(ev)
+ 
++    def master(self, buses, left, right, n):
++        """The device sink's inputs make the output channels: one is mono, two are stereo, six are 5.1 (front left, front right, centre, low frequency, rear left, rear right: downmixed to stereo)"""
++        ins = self.sink
++        def bus(i): return buses.get(ins[i]) if i < len(ins) else None
++        def add(dst, src, g):
++            if src is not None:
++                for k in range(n): dst[k] += src[k] * g
++        if len(ins) == 1: add(left, bus(0), 1.0); add(right, bus(0), 1.0)
++        elif len(ins) >= 6:
++            add(left, bus(0), 1.0); add(right, bus(1), 1.0); add(left, bus(2), 0.7071); add(right, bus(2), 0.7071); add(left, bus(4), 0.7071); add(right, bus(5), 0.7071)
++        else: add(left, bus(0), 1.0); add(right, bus(1), 1.0)
++
++    def mix_outs(self, left, right, n):
++        """The audio-out buffers (PCM 16-bit stereo) the game queued: played into the same output, released when played"""
++        for o in self.outs.values():
++            if not o.started: continue
++            need = n
++            while need and o.queue:
++                addr, data = o.queue[0]
++                frames = min(need, (len(data) - o.off) // 4)
++                for k in range(frames):
++                    l, r = struct.unpack_from('<hh', data, o.off + 4 * k)
++                    left[n - need + k] += l / 32768.0; right[n - need + k] += r / 32768.0
++                o.off += frames * 4; need -= frames
++                if o.off >= len(data): o.queue.pop(0); o.released.append(addr); o.off = 0
++                elif frames == 0: break
++
+ 
+ def state(hz):
+     if not hasattr(hz, 'audio'): hz.audio = Audio(hz)
+@@ -104,8 +199,7 @@ def close_renderer(hz, r): state(hz).running = False; state(hz).ticker = None
+ 
+ # ---- mixing graph: accepted, nothing is mixed ----
+ reg('_ZN2nn5audio15AcquireFinalMixEPNS0_19AudioRendererConfigEPNS0_12FinalMixTypeEi', 'bool: acquired')(lambda hz, r: ret(r, 1))
+-for _s in ('_ZN2nn5audio13AddDeviceSinkEPNS0_19AudioRendererConfigEPNS0_14DeviceSinkTypeEPNS0_12FinalMixTypeEPKaiPKc',
+-           '_ZN2nn5audio14AddBufferMixerEPNS0_19AudioRendererConfigEPNS0_15BufferMixerTypeEPNS0_12FinalMixTypeE',
++for _s in ('_ZN2nn5audio14AddBufferMixerEPNS0_19AudioRendererConfigEPNS0_15BufferMixerTypeEPNS0_12FinalMixTypeE',
+            ):
+     reg(_s, 'Result: success')(lambda hz, r: ret(r))
+ 
+@@ -129,8 +223,8 @@ _SETTERS = ('SetDelayTimeEPNS0_9DelayTypeENS_8TimeSpanE', 'SetDelayInGainEPNS0_9
+            'SetI3dl2ReverbRoomGainEPNS0_15I3dl2ReverbTypeEf', 'SetI3dl2ReverbReverbGainEPNS0_15I3dl2ReverbTypeEf', 'SetI3dl2ReverbRoomHfGainEPNS0_15I3dl2ReverbTypeEf', 'SetI3dl2ReverbHfReferenceEPNS0_15I3dl2ReverbTypeEf',
+            'SetI3dl2ReverbInputOutputEPNS0_15I3dl2ReverbTypeEPKaS4_i', 'SetI3dl2ReverbReflectionsGainEPNS0_15I3dl2ReverbTypeEf', 'SetI3dl2ReverbLateReverbDensityEPNS0_15I3dl2ReverbTypeEf',
+            'SetI3dl2ReverbLateReverbDecayTimeEPNS0_15I3dl2ReverbTypeENS_8TimeSpanE', 'SetI3dl2ReverbLateReverbDelayTimeEPNS0_15I3dl2ReverbTypeENS_8TimeSpanE', 'SetI3dl2ReverbLateReverbDiffusionEPNS0_15I3dl2ReverbTypeEf',
+-           'SetI3dl2ReverbReflectionDelayTimeEPNS0_15I3dl2ReverbTypeENS_8TimeSpanE', 'SetI3dl2ReverbLateReverbHfDecayRatioEPNS0_15I3dl2ReverbTypeEf', 'SetVoicePitchEPNS0_9VoiceTypeEf',
+-           'SetVoiceMixVolumeEPNS0_9VoiceTypeEPNS0_12FinalMixTypeEfii', 'SetVoiceDestinationEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEPNS0_12FinalMixTypeE')
++           'SetI3dl2ReverbReflectionDelayTimeEPNS0_15I3dl2ReverbTypeENS_8TimeSpanE', 'SetI3dl2ReverbLateReverbHfDecayRatioEPNS0_15I3dl2ReverbTypeEf', 
++            'SetVoiceDestinationEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEPNS0_12FinalMixTypeE')
+ for _s in _SETTERS:
+     _name, _rest = _s.split('EPNS0_', 1)   # the name ends where the first parameter type (a pointer to an nn::audio type) begins
+     reg(f'_ZN2nn5audio{len(_name)}{_name}EPNS0_' + _rest, 'an effect or voice setting: nothing is mixed')(lambda hz, r: ret(r))
+@@ -157,10 +251,13 @@ reg('_ZN2nn5audio18GetMemoryPoolStateEPKNS0_14MemoryPoolTypeE', 'the state the r
+ 
+ 
+ # ---- voices ----
+-@reg('_ZN2nn5audio16AcquireVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEiiNS0_12SampleFormatEiPKvm', 'bool: acquired')
++@reg('_ZN2nn5audio16AcquireVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEiiNS0_12SampleFormatEiPKvm', 'bool: acquired; the voice keeps its sample rate, channel count and format for the mixer')
+ def acquire_voice(hz, r):
+     a = state(hz)
+-    with a.lock: a.voices[r[1]] = Voice(r[2] & M32 or RATE)
++    v = Voice(r[2] & M32 or RATE, max(1, r[3] & M32), r[4] & M32)
++    if v.fmt == FMT_ADPCM and r[6] and (r[7] & M32) >= 32: v.coef = struct.unpack('<16h', hz.rd(r[6], 32))   # the predictor coefficients: the parameter the game gives for this format
++    with a.lock: a.voices[r[1]] = v
++    if os.environ.get('NX2LINUX_AUDIO_LOG'): hz.log(f'[audio] voice {r[1]:#x}: {r[2] & M32} Hz, {r[3] & M32} channels, format {r[4] & M32}')
+     ret(r, 1)
+ 
+ 
+@@ -179,13 +276,28 @@ def set_play_state(hz, r):
+     if v: v.playing = (r[1] & M32) == PLAY_START
+ 
+ 
+-@reg('_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE', 'queued; released when the voice has played its samples')
++@reg('_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE', 'queued with a copy of its samples; released when the voice has played it')
+ def append_wave(hz, r):
+     a = state(hz); v = a.voices.get(r[0])
+     if v is None: ret(r, 0); return
+-    start, end = struct.unpack('<ii', hz.rd(r[1] + 0x10, 8)); loop = hz.rd(r[1] + 0x18, 1)[0]
+-    dur = None if loop else max(1, end - start)   # a looping buffer is never released
+-    with a.lock: v.waves.append((r[1], dur))
++    ptr, size = struct.unpack('<QQ', hz.rd(r[1], 16)); start, end = struct.unpack('<ii', hz.rd(r[1] + 0x10, 8)); loop = hz.rd(r[1] + 0x18, 1)[0]
++    width, fmt, decoded = FMT_BYTES.get(v.fmt), v.fmt, None
++    if v.fmt == FMT_ADPCM:
++        try: raw = hz.rd(ptr, size)
++        except AssertionError: raw = b''
++        import horizon_mix
++        decoded = horizon_mix.adpcm_decode(raw, v.coef, v.h1, v.h2)
++        if decoded: data, frames, v.h1, v.h2 = decoded[0], decoded[1], decoded[2], decoded[3]; fmt = 2
++    if decoded is None and width is None:   # a format that is not decoded: the buffer is played out silently (its duration comes from the offsets) so the game's streaming goes on
++        if v.fmt not in a.unsupported: hz.log(f'[audio] sample format {v.fmt} is not decoded: a voice with it is silent')
++        a.unsupported[v.fmt] = a.unsupported.get(v.fmt, 0) + 1
++        data, frames = b'', max(end, 1)
++    elif decoded is None:
++        try: data = hz.rd(ptr, size)
++        except AssertionError: data = b''
++        frames = len(data) // (width * v.channels)
++    if end <= start: end = frames   # no range given: all of it
++    with a.lock: v.waves.append(Wave(r[1], data, frames, max(0, start), end, bool(loop), fmt))
+     ret(r, 1)
+ 
+ 
+@@ -195,15 +307,39 @@ def released_wave(hz, r):
+     with a.lock: ret(r, v.released.pop(0) if v and v.released else 0)
+ 
+ 
+-reg('_ZN2nn5audio18GetWaveBufferCountEPKNS0_9VoiceTypeE', 'buffers queued or playing')(lambda hz, r: ret(r, len(state(hz).voices[r[0]].waves) if r[0] in state(hz).voices else 0))
+-reg('_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE', 'samples consumed while playing')(lambda hz, r: ret(r, state(hz).voices[r[0]].played if r[0] in state(hz).voices else 0))
++def f32(r, i=0): return struct.unpack('<f', struct.pack('<I', r[31 + i] & M32))[0]   # float argument i: the SDK passes it in s_i, which the import block carries in r[31 + i]
+ 
+ 
+-# ---- the audio output: a buffer is released after the time its samples take ----
+-class Out:
+-    def __init__(self): self.queue, self.free_at, self.started = [], 0.0, False
++@reg('_ZN2nn5audio13SetVoicePitchEPNS0_9VoiceTypeEf', 'the playback rate factor (1.0: the voice\'s own rate)')
++def set_pitch(hz, r):
++    v = state(hz).voices.get(r[0])
++    if v: v.pitch = f32(r)
+ 
+ 
++@reg('_ZN2nn5audio14SetVoiceVolumeEPNS0_9VoiceTypeEf', 'the voice\'s own volume, before the mix volumes')
++def set_voice_volume(hz, r):
++    v = state(hz).voices.get(r[0])
++    if v: v.volume = f32(r)
++
++
++@reg('_ZN2nn5audio17SetVoiceMixVolumeEPNS0_9VoiceTypeEPNS0_12FinalMixTypeEfii', 'the volume at which a source channel of the voice goes to a bus')
++def set_mix_volume(hz, r):
++    v = state(hz).voices.get(r[0])
++    if v: v.mixvol[(r[2] & M32, r[3] & M32)] = f32(r)
++
++
++@reg('_ZN2nn5audio13AddDeviceSinkEPNS0_19AudioRendererConfigEPNS0_14DeviceSinkTypeEPNS0_12FinalMixTypeEPKaiPKc', 'the sink\'s inputs say which bus each output channel reads')
++def add_device_sink(hz, r):
++    n = r[4] & M32
++    if r[3] and 0 < n <= 24: state(hz).sink = [b for b in hz.rd(r[3], n)]
++    ret(r)
++
++
++reg('_ZN2nn5audio18GetWaveBufferCountEPKNS0_9VoiceTypeE', 'buffers queued or playing')(lambda hz, r: ret(r, len(state(hz).voices[r[0]].waves) if r[0] in state(hz).voices else 0))
++reg('_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE', 'samples consumed while playing')(lambda hz, r: ret(r, state(hz).voices[r[0]].played if r[0] in state(hz).voices else 0))
++
++
++# ---- the audio output: the queued buffers are mixed into the output and released as they are played ----
+ def out_of(hz, addr):
+     a = state(hz)
+     if addr not in a.outs: a.outs[addr] = Out()
+@@ -214,13 +350,13 @@ reg('_ZN2nn5audio27InitializeAudioOutParameterEPNS0_17AudioOutParameterE', 'defa
+ 
+ 
+ @reg('_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutERKNS0_17AudioOutParameterE', 'a token; 48 kHz stereo PCM16')
+-def open_out(hz, r): out_of(hz, r[0]); hz.wr(r[0], struct.pack('<Q', 0xA0D20000)); ret(r)
++def open_out(hz, r): out_of(hz, r[0]); hz.wr(r[0], struct.pack('<Q', 0xA0D20000)); state(hz).start_ticker(); ret(r)
+ 
+ 
+ reg('_ZN2nn5audio21GetAudioOutSampleRateEPKNS0_8AudioOutE', '48 kHz')(lambda hz, r: ret(r, RATE))
+ reg('_ZN2nn5audio23GetAudioOutChannelCountEPKNS0_8AudioOutE', 'stereo')(lambda hz, r: ret(r, 2))
+ reg('_ZN2nn5audio23GetAudioOutSampleFormatEPKNS0_8AudioOutE', 'PCM16')(lambda hz, r: ret(r, 2))
+-reg('_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE', 'plays (silently)')(lambda hz, r: (setattr(out_of(hz, r[0]), 'started', True), ret(r)))
++reg('_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE', 'plays: its buffers are mixed into the output')(lambda hz, r: (setattr(out_of(hz, r[0]), 'started', True), ret(r)))
+ reg('_ZN2nn5audio12StopAudioOutEPNS0_8AudioOutE', 'stops')(lambda hz, r: setattr(out_of(hz, r[0]), 'started', False))
+ reg('_ZN2nn5audio13CloseAudioOutEPNS0_8AudioOutE', 'closes')(lambda hz, r: state(hz).outs.pop(r[0], None))
+ 
+@@ -233,18 +369,19 @@ reg('_ZN2nn5audio28GetAudioOutBufferDataPointerEPKNS0_14AudioOutBufferE', 'point
+ reg('_ZN2nn5audio25GetAudioOutBufferDataSizeEPKNS0_14AudioOutBufferE', 'size')(lambda hz, r: ret(r, hz.rd64(r[0] + 16)))
+ 
+ 
+-@reg('_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE', 'queued; playing takes the time of its samples (4 bytes a frame)')
++@reg('_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE', 'queued with a copy of its samples (PCM 16-bit stereo: 4 bytes a frame); released when played')
+ def append_out(hz, r):
+-    o = out_of(hz, r[0]); size = hz.rd64(r[1] + 16)
+-    now = time.monotonic(); o.free_at = max(o.free_at, now) + size / 4 / RATE
+-    o.queue.append((r[1], o.free_at)); ret(r, 1)
++    o = out_of(hz, r[0]); ptr, size = hz.rd64(r[1]), hz.rd64(r[1] + 16)
++    try: data = hz.rd(ptr, size) if ptr and size else b''
++    except AssertionError: data = b''
++    with state(hz).lock: o.queue.append((r[1], data)) if data else o.released.append(r[1])   # nothing to play: handed back at once
++    ret(r, 1)
+ 
+ 
+-@reg('_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE', 'the oldest buffer whose time has passed, or null')
++@reg('_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE', 'the oldest buffer that was played, or null')
+ def released_out(hz, r):
+     o = out_of(hz, r[0])
+-    if o.queue and o.queue[0][1] <= time.monotonic(): ret(r, o.queue.pop(0)[0])
+-    else: ret(r, 0)
++    with state(hz).lock: ret(r, o.released.pop(0) if o.released else 0)
+ 
+ 
+ # ---- device names ----
+diff --git a/dm/tools/horizon_fs.py b/dm/tools/horizon_fs.py
+index 94e3e77..8d424fd 100644
+--- a/dm/tools/horizon_fs.py
++++ b/dm/tools/horizon_fs.py
+@@ -1,7 +1,8 @@
+ """nn::fs on the Linux host (NX2Linux S7bis): the Python side of engine/dm/host/hle_fs.c. On a Switch every call goes through the fsp-srv service; here the SDK's functions are replaced (horizon_overrides.py)
+ and read the host's files. Mount name -> backend:
+   rom   the RomFS image romfs_image.py packs (read-only, one descriptor, pread)
+-  save  a folder under $XDG_DATA_HOME/nx2linux/saves/<title id> (writable)
++  save  a folder under $XDG_DATA_HOME/nx2linux/saves/<title id> with a journal (writable): changes go to a working copy and become the saved state at nn::fs::CommitSaveData (atomically); what was not committed when the
++        process ends, or at Unmount, is lost, as on the console (SaveDir)
+   temp  a folder under $XDG_CACHE_HOME/nx2linux/temp/<title id> (writable)
+ Paths are "name:/dir/file". A FileHandle / DirectoryHandle is 8 bytes the guest passes by value: here a number shifted left by 4, so the low bits are clear as a heap pointer's are (a game may mask them).
+ Results follow Horizon: 0 is success, 0x202 path not found, 0x402 path already exists."""
+@@ -68,12 +69,72 @@ class HostDir:
+         return [(c.name, (c.is_dir(), 0, 0 if c.is_dir() else c.stat().st_size)) for c in sorted(h.iterdir())] if h.is_dir() else []
+ 
+ 
++class SaveDir(HostDir):
++    """Save data with a journal. Under <root>: `committed/` is the saved state, `work/` the copy the game reads and writes. Commit() makes the work copy the saved state in steps a crash cannot leave half done (the new state is
++    built beside the old, then two renames); Rollback() throws the work copy away. A mount starts from the committed state, so a run that ends without committing leaves the saves as they were. A save folder from before the
++    journal (files straight under <root>) is taken as the committed state the first time"""
++    def __init__(self, root, readonly=False):
++        self.base = Path(root); self.base.mkdir(parents=True, exist_ok=True)
++        self.committed, self.new, self.old, work = self.base / 'committed', self.base / 'committed.new', self.base / 'committed.old', self.base / 'work'
++        if self.new.exists(): shutil.rmtree(self.new)               # a commit that did not finish: the old state stands
++        if not self.committed.exists() and self.old.exists(): self.old.rename(self.committed)   # ... or died between its two renames: the old state comes back
++        elif self.old.exists(): shutil.rmtree(self.old)
++        if not self.committed.exists():
++            legacy = [c for c in self.base.iterdir() if c.name not in ('work',)]
++            self.committed.mkdir()
++            for c in legacy:
++                if c != self.committed: shutil.move(str(c), str(self.committed / c.name))
++        self.readonly, self.dirty, self.commits = readonly, 0, 0
++        if readonly: super().__init__(self.committed); return
++        if work.exists(): shutil.rmtree(work)
++        shutil.copytree(self.committed, work)
++        super().__init__(work)
++
++    def touch(self): self.dirty += 1
++
++    def commit(self):
++        """The work copy becomes the saved state; True when there was something to save"""
++        if self.readonly or not self.dirty: return False
++        for dirpath, _, names in os.walk(self.root):
++            for n in names:
++                fd = os.open(os.path.join(dirpath, n), os.O_RDONLY)
++                try: os.fsync(fd)
++                finally: os.close(fd)
++        if self.new.exists(): shutil.rmtree(self.new)
++        shutil.copytree(self.root, self.new)
++        self.committed.rename(self.old); self.new.rename(self.committed); shutil.rmtree(self.old)
++        self.dirty, self.commits = 0, self.commits + 1
++        return True
++
++    def rollback(self):
++        """Throws the changes since the last commit away; how many there were"""
++        lost, self.dirty = self.dirty, 0
++        if not self.readonly:
++            shutil.rmtree(self.root); shutil.copytree(self.committed, self.root)
++        return lost
++
++    def used(self): return sum(f.stat().st_size for f in self.root.rglob('*') if f.is_file())
++
++
++def writable(m): return not isinstance(m, RomImage) and not getattr(m, 'readonly', False)
++def touch(m):
++    t = getattr(m, 'touch', None)
++    if t: t()
++
++
+ class FileSystem:
+     def __init__(self, hz, romfs_img, title_id):
+         self.hz, self.mounts, self.files, self.dirs, self._next = hz, {}, {}, {}, 1
+         self.romfs_img = romfs_img
+         self.save_root = xdg('XDG_DATA_HOME', '.local/share') / 'nx2linux/saves' / title_id
+         self.temp_root = xdg('XDG_CACHE_HOME', '.cache') / 'nx2linux/temp' / title_id
++        self.cache_root = xdg('XDG_DATA_HOME', '.local/share') / 'nx2linux/cache-storage' / title_id
++
++    def report(self):
++        """One line for the end of a run: what was committed and what was not (it is lost)"""
++        saves = [(n, m) for n, m in self.mounts.items() if isinstance(m, SaveDir) and not m.readonly]
++        if not saves: return 'fs: no save data was mounted'
++        return 'fs: ' + '; '.join(f'save {n!r}: {m.commits} commits, {m.dirty} changes not committed (lost)' for n, m in saves)
+ 
+     def split(self, path):
+         name, sep, rest = path.partition(':')
+@@ -113,8 +174,12 @@ def mount_rom1(hz, r): r[0] = hz.fs.mount_rom(cstr(hz, r[0]))
+ def rom_cache_size(hz, r): hz.wr64(r[0], 0x10000); r[0] = RES_OK
+ 
+ 
+-@hle('_ZN2nn2fs7UnmountEPKc', 'fsp-srv; the mount table is permanent, unmounting is a no-op')
+-def unmount(hz, r): pass
++@hle('_ZN2nn2fs7UnmountEPKc', 'fsp-srv; the mount goes; save data that was not committed is lost, as on the console')
++def unmount(hz, r):
++    m = hz.fs.mounts.pop(cstr(hz, r[0]), None)
++    if isinstance(m, SaveDir):
++        lost = m.rollback() if not m.readonly else 0
++        if lost: hz.log(f'[fs] unmounted save data with {lost} uncommitted changes: they are lost')
+ 
+ 
+ @hle('_ZN2nn2fs9IsMountedEPKc', 'fsp-srv; looks up the host mount table')
+@@ -130,8 +195,8 @@ def mount_temp(hz, r):
+     hz.fs.mounts[cstr(hz, r[0])] = HostDir(hz.fs.temp_root); r[0] = RES_OK
+ 
+ 
+-def _mount_save(hz, name):
+-    hz.fs.mounts[name] = HostDir(hz.fs.save_root)
++def _mount_save(hz, name, readonly=False):
++    hz.fs.mounts[name] = SaveDir(hz.fs.save_root, readonly)
+     return RES_OK
+ 
+ 
+@@ -151,8 +216,32 @@ returns('_ZN2nn2fs6detail18IsEnabledAccessLogEv', 'fsp-srv; access log always of
+ noop('_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE', 'fsp-srv; file read priority is ignored by the host')
+ noop('_ZN2nn2fs25EnableGlobalFileDataCacheEPvm', 'fsp-srv global read cache; unused by the host')
+ noop('_ZN2nn2fs26DisableGlobalFileDataCacheEv', 'fsp-srv global read cache; unused by the host')
+-returns('_ZN2nn2fs6CommitEPKc', 'fsp-srv; the host directory is written in place')
+-returns('_ZN2nn2fs14CommitSaveDataEPKc', 'fsp-srv; same as Commit')
++def _commit(hz, name):
++    m = hz.fs.mounts.get(name.partition(':')[0])
++    if m is None: return RES_NOT_FOUND
++    if isinstance(m, SaveDir) and m.commit(): hz.log(f'[fs] committed save data {name!r} (commit {m.commits})')
++    return RES_OK
++
++
++@hle('_ZN2nn2fs6CommitEPKc', 'fsp-srv; the work copy of save data becomes the saved state')
++def commit(hz, r): r[0] = _commit(hz, cstr(hz, r[0]))
++
++
++@hle('_ZN2nn2fs14CommitSaveDataEPKc', 'fsp-srv; same as Commit')
++def commit_save_data(hz, r): r[0] = _commit(hz, cstr(hz, r[0]))
++
++
++@hle('_ZN2nn2fs6CommitEPKcRKNS0_12CommitOptionE', 'fsp-srv; Commit with its option (none changes what the host does)')
++def commit_option(hz, r): r[0] = _commit(hz, cstr(hz, r[0]))
++
++
++@hle('_ZN2nn2fs6CommitEPKPKci', 'fsp-srv; Commit of several mounts: each one, the first failure is the result')
++def commit_many(hz, r):
++    res = RES_OK
++    for i in range(r[1] & 0xFFFFFFFF):
++        c = _commit(hz, cstr(hz, hz.rd64(r[0] + 8 * i)))
++        res = res or c
++    r[0] = res
+ 
+ 
+ def _sizes(hz, r):   # (int64 *size, int64 *journal, ...): 256 MB of data and 256 MB of journal, the host directory has no limit
+@@ -170,7 +259,7 @@ def open_file(hz, r):
+     if m is None: r[0] = RES_NOT_FOUND; return
+     st = m.stat(rest)
+     if mode & (MODE_WRITE | MODE_APPEND):
+-        if isinstance(m, RomImage): r[0] = RES_READ_ONLY; return
++        if not writable(m): r[0] = RES_READ_ONLY; return
+         if st is None: r[0] = RES_NOT_FOUND; return
+     elif st is None or st[0] != ENT_FILE: r[0] = RES_NOT_FOUND; return
+     hz.wr64(out, hz.fs.handle(hz.fs.files, (m, rest, mode))); r[0] = RES_OK
+@@ -220,10 +309,10 @@ def write_file(hz, r):
+     ent = hz.fs.files.get(r[0] >> 4)
+     if ent is None: r[0] = RES_INVALID_PATH; return
+     m, rest, _ = ent
+-    if isinstance(m, RomImage): r[0] = RES_READ_ONLY; return
++    if not writable(m): r[0] = RES_READ_ONLY; return
+     data = hz.rd(r[2], r[3])
+     with open(m._p(rest), 'r+b') as f: f.seek(r[1]); f.write(data)
+-    r[0] = RES_OK
++    touch(m); r[0] = RES_OK
+ 
+ 
+ noop('_ZN2nn2fs9FlushFileENS0_10FileHandleE', 'fsp-srv; host writes are already in the page cache')
+@@ -231,31 +320,40 @@ noop('_ZN2nn2fs9FlushFileENS0_10FileHandleE', 'fsp-srv; host writes are already
+ 
+ @hle('_ZN2nn2fs10CreateFileEPKcl', 'fsp-srv -> create + truncate')
+ def create_file(hz, r):
+-    m, rest, _ = hz.fs.resolve(cstr(hz, r[0]))
+-    if m is None: r[0] = RES_NOT_FOUND; return
+-    if isinstance(m, RomImage): r[0] = RES_READ_ONLY; return
++    r[0] = _create_file(hz, cstr(hz, r[0]), r[1])
++
++
++def _create_file(hz, path, size):
++    m, rest, _ = hz.fs.resolve(path)
++    if m is None: return RES_NOT_FOUND
++    if not writable(m): return RES_READ_ONLY
+     p = m._p(rest)
+-    if p.exists(): r[0] = RES_EXISTS; return
++    if p.exists(): return RES_EXISTS
+     p.parent.mkdir(parents=True, exist_ok=True)
+-    with open(p, 'wb') as f: f.truncate(r[1])
+-    r[0] = RES_OK
++    with open(p, 'wb') as f: f.truncate(size)
++    touch(m); return RES_OK
++
++
++@hle('_ZN2nn2fs10CreateFileEPKcli', 'fsp-srv -> create + truncate (the overload with the create option, which changes nothing here)')
++def create_file_option(hz, r): r[0] = _create_file(hz, cstr(hz, r[0]), r[1])
+ 
+ 
+ @hle('_ZN2nn2fs15CreateDirectoryEPKc', 'fsp-srv -> mkdir')
+ def create_dir(hz, r):
+     m, rest, _ = hz.fs.resolve(cstr(hz, r[0]))
+     if m is None: r[0] = RES_NOT_FOUND; return
+-    if isinstance(m, RomImage): r[0] = RES_READ_ONLY; return
++    if not writable(m): r[0] = RES_READ_ONLY; return
+     p = m._p(rest)
+     if p.exists(): r[0] = RES_EXISTS; return
+-    p.mkdir(parents=True); r[0] = RES_OK
++    p.mkdir(parents=True); touch(m); r[0] = RES_OK
+ 
+ 
+ @hle('_ZN2nn2fs10DeleteFileEPKc', 'fsp-srv -> unlink')
+ def delete_file(hz, r):
+     m, rest, _ = hz.fs.resolve(cstr(hz, r[0]))
+-    if m is None or isinstance(m, RomImage) or not m._p(rest).is_file(): r[0] = RES_NOT_FOUND; return
+-    m._p(rest).unlink(); r[0] = RES_OK
++    if m is None or not m._p(rest).is_file(): r[0] = RES_NOT_FOUND; return
++    if not writable(m): r[0] = RES_READ_ONLY; return
++    m._p(rest).unlink(); touch(m); r[0] = RES_OK
+ 
+ 
+ @hle('_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc', 'fsp-srv -> stat')
+@@ -299,3 +397,103 @@ def dir_count(hz, r):
+     d = hz.fs.dirs.get(r[1] >> 4)
+     if d is None: r[0] = RES_INVALID_PATH; return
+     hz.wr64(r[0], len(d[0])); r[0] = RES_OK
++
++
++# ---- the rest of the file and directory operations a game uses on its saves ----
++RES_DIR_NOT_EMPTY = 0x1002   # nn::fs::ResultDirectoryNotEmpty (module 2, description 8)
++
++
++def _target(hz, path, need_exists=True):
++    """(mount, host path) of a path on a writable mount, or an error result"""
++    m, rest, _ = hz.fs.resolve(path)
++    if m is None: return RES_NOT_FOUND, None
++    if not writable(m): return RES_READ_ONLY, None
++    return m, m._p(rest)
++
++
++@hle('_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl', 'fsp-srv -> ftruncate')
++def set_file_size(hz, r):
++    ent = hz.fs.files.get(r[0] >> 4)
++    if ent is None: r[0] = RES_INVALID_PATH; return
++    m, rest, _ = ent
++    if not writable(m): r[0] = RES_READ_ONLY; return
++    os.truncate(m._p(rest), max(0, r[1])); touch(m); r[0] = RES_OK
++
++
++def _rename(hz, old, new, want_dir):
++    m, p = _target(hz, old)
++    if p is None: return m
++    m2, q = _target(hz, new)
++    if q is None: return m2
++    if m2 is not m: return RES_INVALID_PATH   # across mounts
++    if not p.exists() or p.is_dir() != want_dir: return RES_NOT_FOUND
++    if q.exists(): return RES_EXISTS
++    p.rename(q); touch(m); return RES_OK
++
++
++@hle('_ZN2nn2fs10RenameFileEPKcS2_', 'fsp-srv -> rename')
++def rename_file(hz, r): r[0] = _rename(hz, cstr(hz, r[0]), cstr(hz, r[1]), False)
++
++
++@hle('_ZN2nn2fs15RenameDirectoryEPKcS2_', 'fsp-srv -> rename')
++def rename_dir(hz, r): r[0] = _rename(hz, cstr(hz, r[0]), cstr(hz, r[1]), True)
++
++
++@hle('_ZN2nn2fs15DeleteDirectoryEPKc', 'fsp-srv -> rmdir (the directory must be empty)')
++def delete_dir(hz, r):
++    m, p = _target(hz, cstr(hz, r[0]))
++    if p is None: r[0] = m; return
++    if not p.is_dir(): r[0] = RES_NOT_FOUND; return
++    if any(p.iterdir()): r[0] = RES_DIR_NOT_EMPTY; return
++    p.rmdir(); touch(m); r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc', 'fsp-srv -> rm -r')
++def delete_dir_rec(hz, r):
++    m, p = _target(hz, cstr(hz, r[0]))
++    if p is None: r[0] = m; return
++    if not p.is_dir(): r[0] = RES_NOT_FOUND; return
++    shutil.rmtree(p); touch(m); r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs25CleanDirectoryRecursivelyEPKc', 'fsp-srv -> empty a directory')
++def clean_dir_rec(hz, r):
++    m, p = _target(hz, cstr(hz, r[0]))
++    if p is None: r[0] = m; return
++    if not p.is_dir(): r[0] = RES_NOT_FOUND; return
++    for c in list(p.iterdir()): shutil.rmtree(c) if c.is_dir() else c.unlink()
++    touch(m); r[0] = RES_OK
++
++
++SAVE_BYTES = 256 << 20   # what GetSaveDataSize says (data) and what a save mount offers
++
++
++@hle('_ZN2nn2fs16GetFreeSpaceSizeEPlPKc', 'fsp-srv; save data has the 256 MB the sizes report, less what the files use; other mounts the host disk')
++def free_space(hz, r):
++    m, _, _ = hz.fs.resolve(cstr(hz, r[1]))
++    if m is None: r[0] = RES_NOT_FOUND; return
++    hz.wr64(r[0], max(0, SAVE_BYTES - m.used()) if isinstance(m, SaveDir) else shutil.disk_usage(m.root if isinstance(m, HostDir) else '/').free if not isinstance(m, RomImage) else 0); r[0] = RES_OK
++
++
++@hle('_ZN2nn2fs17GetTotalSpaceSizeEPlPKc', 'fsp-srv; save data has the 256 MB the sizes report; other mounts the host disk')
++def total_space(hz, r):
++    m, _, _ = hz.fs.resolve(cstr(hz, r[1]))
++    if m is None: r[0] = RES_NOT_FOUND; return
++    hz.wr64(r[0], SAVE_BYTES if isinstance(m, SaveDir) else shutil.disk_usage(m.root if isinstance(m, HostDir) else '/').total if not isinstance(m, RomImage) else 0); r[0] = RES_OK
++
++
++# the other ways a game names its save data (SDK 3.x has a user id of its own beside the account's uid): the same save folder
++for _sym in ('_ZN2nn2fs13MountSaveDataEPKcNS0_6UserIdE', '_ZN2nn2fs13MountSaveDataEPKcNS_3ncm13ApplicationIdENS0_6UserIdE', '_ZN2nn2fs13MountSaveDataEPKcNS_3ncm13ApplicationIdERKNS_7account3UidE',
++             '_ZN2nn2fs21MountSaveDataForDebugEPKc'):
++    hle(_sym, 'fsp-srv; save data is a host directory with a journal (single user)')(lambda hz, r: r.__setitem__(0, _mount_save(hz, cstr(hz, r[0]))))
++for _sym in ('_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE', '_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_3ncm13ApplicationIdENS0_6UserIdE'):
++    hle(_sym, 'fsp-srv; the committed save data, read only')(lambda hz, r: r.__setitem__(0, _mount_save(hz, cstr(hz, r[0]), readonly=True)))
++returns('_ZN2nn2fs14CreateSaveDataENS_3ncm13ApplicationIdENS0_6UserIdEmllj', 'fsp-srv; the save folder is created at mount time')
++
++
++def _mount_cache(hz, r):
++    hz.fs.mounts[cstr(hz, r[0])] = HostDir(hz.fs.cache_root); r[0] = RES_OK
++
++
++for _sym in ('_ZN2nn2fs17MountCacheStorageEPKc', '_ZN2nn2fs17MountCacheStorageEPKcNS_3ncm13ApplicationIdE'):
++    hle(_sym, 'fsp-srv; cache storage is a host directory that stays between runs')(_mount_cache)
+diff --git a/dm/tools/horizon_mix.py b/dm/tools/horizon_mix.py
+new file mode 100644
+index 0000000..e32c99a
+--- /dev/null
++++ b/dm/tools/horizon_mix.py
+@@ -0,0 +1,68 @@
++"""The audio mixer library (linux/host/audio.c, libnx2linux_audio.so) for horizon_audio.py: resampling one channel of a wave buffer into a bus, and the output (an SDL3 stream, a WAV file, or nothing).
++NX2LINUX_AUDIO selects the output: unset or `auto` the default device, `off` no mixer at all (the game's audio runs silent, as before), `null` a mixer that only counts, `wav:<file>` a 16-bit stereo WAV file.
++NX2LINUX_AUDIO_LIB names the library (default ~/.cache/nx2linux/build-host/libnx2linux_audio.so)."""
++import ctypes as C, os
++from pathlib import Path
++
++FMT_PCM8, FMT_PCM16, FMT_FLOAT = 1, 2, 5   # nn::audio::SampleFormat values the mixer reads
++
++
++def library_path():
++    p = os.environ.get('NX2LINUX_AUDIO_LIB') or str(Path.home() / '.cache/nx2linux/build-host/libnx2linux_audio.so')
++    return p if os.path.exists(p) else None
++
++
++class MixError(Exception):
++    pass
++
++
++_lib = None
++
++
++def library():
++    """The library, loaded once (the ADPCM decoder needs it whether or not an output is open); None when it is not built"""
++    global _lib
++    if _lib is None:
++        path = library_path()
++        if not path: return None
++        _lib = C.CDLL(path)
++        _lib.nx2audio_adpcm.argtypes = [C.c_char_p, C.c_uint32, C.c_void_p, C.c_void_p, C.POINTER(C.c_int32), C.POINTER(C.c_int32)]; _lib.nx2audio_adpcm.restype = C.c_uint32
++    return _lib
++
++
++def adpcm_decode(data, coef, h1=0, h2=0):
++    """(PCM 16-bit samples as a ctypes array, the samples' number, h1, h2) of DSP-ADPCM data (coef: the 16 predictor coefficients); None when the library is missing"""
++    L = library()
++    if L is None: return None
++    n = len(data) // 8 * 14
++    out = (C.c_int16 * max(1, n))(); c = (C.c_int16 * 16)(*coef); a, b = C.c_int32(h1), C.c_int32(h2)
++    got = L.nx2audio_adpcm(data, len(data), c, out, C.byref(a), C.byref(b))
++    return out, got, a.value, b.value
++
++
++class Mixer:
++    def __init__(self, rate, mode=''):
++        path = library_path()
++        if not path: raise MixError('libnx2linux_audio.so is not built (cmake --build ~/.cache/nx2linux/build-host)')
++        L = self.lib = library()
++        L.nx2audio_open.argtypes = [C.c_uint32, C.c_char_p]; L.nx2audio_open.restype = C.c_int
++        L.nx2audio_error.restype = C.c_char_p; L.nx2audio_device.restype = C.c_char_p
++        L.nx2audio_submit.argtypes = [C.c_void_p, C.c_uint32]; L.nx2audio_submit.restype = C.c_uint32
++        L.nx2audio_stats.argtypes = [C.POINTER(C.c_uint64)]
++        L.nx2audio_mix.argtypes = [C.c_void_p, C.c_uint32, C.c_void_p, C.c_uint32, C.c_uint32, C.c_uint32, C.c_uint32, C.POINTER(C.c_double), C.c_double, C.c_float]; L.nx2audio_mix.restype = C.c_uint32
++        if L.nx2audio_open(rate, mode.encode()): raise MixError(L.nx2audio_error().decode())
++        self.device = L.nx2audio_device().decode()
++
++    def mix(self, dst, n_out, data, fmt, frames, channels, ch, pos, step, gain):
++        """Adds channel ch of the wave data (frames frames of `channels`) into dst (a float array), from fractional frame pos, step frames per output sample; (output samples made, the new pos)"""
++        p = C.c_double(pos)
++        n = self.lib.nx2audio_mix(dst, n_out, data, fmt, frames, channels, ch, C.byref(p), step, gain)
++        return n, p.value
++
++    def submit(self, lr, frames): return self.lib.nx2audio_submit(lr, frames)
++
++    def stats(self):
++        a = (C.c_uint64 * 4)(); self.lib.nx2audio_stats(a)
++        return dict(frames=a[0], loud_frames=a[1], dropped=a[2], peak=a[3] / 1000.0)
++
++    def close(self): self.lib.nx2audio_close()
+diff --git a/dm/tools/horizon_movie.py b/dm/tools/horizon_movie.py
+new file mode 100644
+index 0000000..76c5945
+--- /dev/null
++++ b/dm/tools/horizon_movie.py
+@@ -0,0 +1,38 @@
++"""The SDK's movie library on the Linux host (NX2Linux S7bis, milestone E). A game plays a movie by opening it with a movie::Extractor (SetDataSource: the SDK's own demuxer), then feeding the packets to a movie::Decoder, which on the
++Switch is NVIDIA's hardware decoder. The host has no decoder behind that interface yet (the Mach host's hle_movie.c decodes VP8 / VP9 with libvpx and Vorbis with stb_vorbis; it has not been ported), and a Decoder that answers 0
++to everything would let the player wait for pictures that never come. So the opening of a movie fails here, explicitly and with the code the SDK itself returns when it has no implementation object (0x1000): the game's own
++player reports that it could not open the movie, and goes on without it. Every refusal is counted and named, and the end of the run says how many movies the game asked for."""
++from horizon_overrides import hle
++
++NO_IMPLEMENTATION = 0x1000   # what the SDK returns for a data source it has no implementation object for (engine/dm/host/hle_movie.c)
++
++
++def refused(hz): return hz.__dict__.setdefault('movies_refused', [])
++
++
++def refuse(hz, what):
++    """Records the refusal and says so (the first four in full, every later one only counted)"""
++    n = refused(hz); n.append(what)
++    if len(n) <= 4: hz.log(f'[movie] opening refused: {what}: the host has no movie decoder yet (the game goes on without the movie)')
++    return NO_IMPLEMENTATION
++
++
++def report(hz):
++    n = refused(hz)
++    if not n: return 'movie: the game opened no movie'
++    return f'movie: {len(n)} openings refused, no decoder on the Linux host (first: {n[0]})'
++
++
++def _install():
++    for sym, who in (('_ZN5movie9Extractor13SetDataSourceEPKc', 'movie::Extractor::SetDataSource(path)'),
++                     ('_ZN5movie11NnExtractor13SetDataSourceEPKc', 'movie::NnExtractor::SetDataSource(path)')):
++        hle(sym, 'the host has no movie decoder: opening fails with the SDK\'s own "no implementation" code')(lambda hz, r, who=who: r.__setitem__(0, refuse(hz, f'{who} {hz.cstring(r[1], 0x200)!r}')))
++    for sym, who in (('_ZN5movie9Extractor13SetDataSourceEPKvi', 'movie::Extractor::SetDataSource(memory)'),
++                     ('_ZN5movie11NnExtractor13SetDataSourceEPKvi', 'movie::NnExtractor::SetDataSource(memory)')):
++        hle(sym, 'the host has no movie decoder: opening fails with the SDK\'s own "no implementation" code')(lambda hz, r, who=who: r.__setitem__(0, refuse(hz, f'{who} {r[2] & 0xFFFFFFFF} bytes')))
++    for sym, who in (('_ZN5movie9Extractor13SetDataSourceEPNS_18ClientStreamReaderEPKc', 'movie::Extractor::SetDataSource(stream reader)'),
++                     ('_ZN5movie11NnExtractor13SetDataSourceEPNS_18ClientStreamReaderEPKc', 'movie::NnExtractor::SetDataSource(stream reader)')):
++        hle(sym, 'the host has no movie decoder: opening fails with the SDK\'s own "no implementation" code')(lambda hz, r, who=who: r.__setitem__(0, refuse(hz, f'{who} {hz.cstring(r[2], 0x200)!r}' if r[2] else who)))
++
++
++_install()
+diff --git a/dm/tools/horizon_overrides.py b/dm/tools/horizon_overrides.py
+index 3f90bac..749a0a5 100644
+--- a/dm/tools/horizon_overrides.py
++++ b/dm/tools/horizon_overrides.py
+@@ -55,6 +55,7 @@ def install_profile(horizon, profile):
+ def install(horizon):
+     """The table as {symbol: fn(regs)} for ModuleSet.build(overrides=...); symbols the loaded modules do not export are left out (the game may not use them)"""
+     import horizon_fs, horizon_account, horizon_oe, horizon_vi, horizon_nvn, horizon_hid, horizon_fiber, horizon_audio, horizon_time   # register the nn::fs, nn::account, nn::oe, nn::vi/nv and NVN entries
++    import horizon_movie   # the movie library: openings are refused, named and counted
+     import horizon_trivial
+     for sym, value, why, src in horizon_trivial.TRIVIAL:   # generated from the Mach host: entries that do nothing or return a constant; a hand-written port of the same symbol wins
+         if sym in TABLE: continue
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 009b912..2ac8c23 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -54,9 +54,13 @@ def main():
+         if hasattr(hz, 'nvn'): print('NVN queue/window/recording calls:', {k: v for k, v in hz.nvn.all_calls().items() if any(x in k for x in ('Queue', 'Window', 'Recording', 'Commands', 'Sync'))})
+         if hasattr(hz, 'nvn'): print('NVN functions the game looked up:', len(hz.nvn.addr), '| Submit looked up:', 'nvnQueueSubmitCommands' in hz.nvn.addr, '| command lists recorded:', len(hz.nvn.cmdlists))
+         if hasattr(hz, 'nvn'): print('clear colors (on a window texture?, rgba): count:', sorted(hz.nvn.clear_colors.items(), key=lambda kv: -kv[1])[:12])
++        if hasattr(hz, 'audio'): print(hz.audio.report())
++        print(hz.fs.report()); import horizon_movie; print(horizon_movie.report(hz))
+         print('stubbed overrides called:', sorted(hz.stub_calls)); print('where the guest threads are:\n' + hz.thread_report()); print(hz.ring_report(1)); print('threads that stopped:', hz.thread_faults, flush=True)
+     def stop():
+-        print(f'[run] {a.seconds:.0f} s elapsed: stopping', flush=True); report(); os._exit(0)
++        print(f'[run] {a.seconds:.0f} s elapsed: stopping', flush=True); report()
++        if hasattr(hz, 'audio') and hz.audio.mixer: hz.audio.mixer.close()   # a WAV file gets its final header
++        os._exit(0)
+     threading.Timer(a.seconds, stop).start()
+     r = hz.boot()
+     print('result', {k: (hex(v) if isinstance(v, int) else v) for k, v in r.items() if k in ('fault', 'x0', 'step')})
+diff --git a/dm/tools/tests/test_horizon_audio.py b/dm/tools/tests/test_horizon_audio.py
+new file mode 100644
+index 0000000..94d13e8
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_audio.py
+@@ -0,0 +1,160 @@
++"""horizon_audio.py: the voices, wave buffers and audio-out buffers a game queues are mixed into the output (a WAV file here), at the right level, rate and pitch, and released when played. A fake guest memory; the mixer
++library (libnx2linux_audio.so) is needed, the test is skipped without it."""
++import math, os, struct, sys, tempfile, unittest, wave
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++import horizon_audio as ha
++import horizon_mix
++from horizon_overrides import TABLE
++
++S = '_ZN2nn5audio'
++SYMS = dict(acquire=S + '16AcquireVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEiiNS0_12SampleFormatEiPKvm', append=S + '16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE',
++            play=S + '17SetVoicePlayStateEPNS0_9VoiceTypeENS1_9PlayStateE', pitch=S + '13SetVoicePitchEPNS0_9VoiceTypeEf', mixvol=S + '17SetVoiceMixVolumeEPNS0_9VoiceTypeEPNS0_12FinalMixTypeEfii',
++            released=S + '21GetReleasedWaveBufferEPNS0_9VoiceTypeE', sink=S + '13AddDeviceSinkEPNS0_19AudioRendererConfigEPNS0_14DeviceSinkTypeEPNS0_12FinalMixTypeEPKaiPKc',
++            openout=S + '19OpenDefaultAudioOutEPNS0_8AudioOutERKNS0_17AudioOutParameterE', startout=S + '13StartAudioOutEPNS0_8AudioOutE',
++            appendout=S + '20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE', releasedout=S + '25GetReleasedAudioOutBufferEPNS0_8AudioOutE',
++            volume=S + '14SetVoiceVolumeEPNS0_9VoiceTypeEf')
++
++
++class FakeHz:
++    def __init__(self): self.mem, self.logs, self.handles = bytearray(0x100000), [], {}
++    def rd(self, a, n): return bytes(self.mem[a:a + n])
++    def wr(self, a, d): self.mem[a:a + len(d)] = d
++    def rd32(self, a): return struct.unpack('<I', self.rd(a, 4))[0]
++    def rd64(self, a): return struct.unpack('<Q', self.rd(a, 8))[0]
++    def log(self, m): self.logs.append(m)
++    def signal_event(self, ev): pass
++
++
++def call(hz, name, *args, f=None):
++    r = [0] * 39
++    r[:len(args)] = args
++    if f is not None: r[31] = struct.unpack('<I', struct.pack('<f', f))[0]
++    TABLE[SYMS[name]][0](hz, r)
++    return r[0]
++
++
++def sine(frames, hz=480.0, rate=48000, amp=0.5):
++    return b''.join(struct.pack('<h', int(amp * 32767 * math.sin(2 * math.pi * hz * i / rate))) for i in range(frames))
++
++
++@unittest.skipUnless(horizon_mix.library_path(), 'libnx2linux_audio.so is not built')
++class Mix(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory(); self.wav = str(Path(self.tmp.name) / 'out.wav')
++        self.old = os.environ.get('NX2LINUX_AUDIO'); os.environ['NX2LINUX_AUDIO'] = 'wav:' + self.wav
++        self.hz = FakeHz(); self.a = ha.state(self.hz); self.a.rate, self.a.tick_samples = 48000, 240
++        self.a.open_mixer()
++        self.real_start, ha.Audio.start_ticker = ha.Audio.start_ticker, lambda self: None   # the test ticks by hand
++
++    def tearDown(self):
++        ha.Audio.start_ticker = self.real_start
++        self.a.mixer.close()
++        if self.old is None: os.environ.pop('NX2LINUX_AUDIO', None)
++        else: os.environ['NX2LINUX_AUDIO'] = self.old
++        self.tmp.cleanup()
++
++    def voice(self, data, channels=1, fmt=2, rate=48000, addr=0x1000, wb=0x2000, loop=0, start=0, end=0):
++        self.hz.wr(0x40000, data)
++        call(self.hz, 'acquire', 0x500, addr, rate, channels, fmt)
++        self.hz.wr(wb, struct.pack('<QQiiB', 0x40000, len(data), start, end, loop))
++        self.assertEqual(call(self.hz, 'append', addr, wb), 1)
++        return addr
++
++    def samples(self):
++        self.a.mixer.close()
++        with wave.open(self.wav) as w: raw = w.readframes(w.getnframes())
++        return [v[0] for v in struct.iter_unpack('<h', raw)]   # interleaved stereo
++
++    def test_a_started_voice_reaches_the_output_at_its_mix_volume_and_the_buffer_is_released_when_played(self):
++        v = self.voice(sine(480))   # 10 ms of 480 Hz
++        call(self.hz, 'mixvol', v, 0, 0, 0, f=0.5); call(self.hz, 'mixvol', v, 0, 0, 1, f=0.25)   # source 0 to bus 0 at 0.5 (left), to bus 1 at 0.25 (right): (voice, mix, source, bus)
++        call(self.hz, 'play', v, 0)
++        self.a.tick(); self.assertEqual(call(self.hz, 'released', v), 0)   # 240 of 480 frames played
++        self.a.tick(); self.assertEqual(call(self.hz, 'released', v), 0x2000)   # all played
++        s = self.samples()
++        left, right = s[0::2], s[1::2]
++        self.assertEqual(len(left), 480)
++        self.assertAlmostEqual(max(left) / 32767, 0.25, delta=0.01); self.assertAlmostEqual(max(right) / 32767, 0.125, delta=0.01)   # 0.5 * 0.5 and 0.5 * 0.25
++
++    def test_a_voice_that_is_not_started_is_silent_and_the_output_keeps_its_clock(self):
++        v = self.voice(sine(480)); call(self.hz, 'mixvol', v, 0, 0, 0, f=1.0)
++        self.a.tick(); self.assertEqual(max(map(abs, self.samples())), 0)
++
++    def test_the_pitch_changes_the_speed_the_buffer_is_played_at(self):
++        v = self.voice(sine(960)); call(self.hz, 'mixvol', v, 0, 0, 0, f=1.0); call(self.hz, 'pitch', v, f=2.0); call(self.hz, 'play', v, 0)
++        self.a.tick(); self.a.tick()
++        self.assertEqual(call(self.hz, 'released', v), 0x2000)   # twice as fast: 960 frames take two ticks of 240
++
++    def test_the_sample_rate_of_a_voice_is_converted_to_the_output_rate(self):
++        v = self.voice(sine(240, rate=24000), rate=24000); call(self.hz, 'mixvol', v, 0, 0, 0, f=1.0); call(self.hz, 'play', v, 0)
++        self.a.tick(); self.assertEqual(call(self.hz, 'released', v), 0)   # 240 frames at 24 kHz last 480 output samples
++        self.a.tick(); self.assertEqual(call(self.hz, 'released', v), 0x2000)
++
++    def test_a_looping_buffer_is_never_released_and_the_voice_goes_on_sounding(self):
++        v = self.voice(sine(240), loop=1); call(self.hz, 'mixvol', v, 0, 0, 0, f=1.0); call(self.hz, 'play', v, 0)
++        for _ in range(5): self.a.tick()
++        self.assertEqual(call(self.hz, 'released', v), 0)
++        self.assertGreater(max(map(abs, self.samples()[-480:])), 10000)
++
++    def test_a_stereo_voice_sends_each_channel_to_its_bus_and_the_sink_names_the_output_channels(self):
++        pcm = b''.join(struct.pack('<hh', 10000, -20000) for _ in range(240))
++        v = self.voice(pcm, channels=2)
++        call(self.hz, 'mixvol', v, 0, 0, 0, f=1.0); call(self.hz, 'mixvol', v, 1, 1, 1, f=1.0); call(self.hz, 'play', v, 0)
++        self.hz.wr(0x3000, bytes([1, 0])); call(self.hz, 'sink', 0x500, 0x600, 0x700, 0x3000, 2)   # the sink reads bus 1 as its left channel and bus 0 as its right
++        self.a.tick(); s = self.samples()
++        self.assertAlmostEqual(s[0], -20000, delta=2); self.assertAlmostEqual(s[1], 10000, delta=2)
++
++    def test_a_5_1_sink_is_downmixed_to_stereo(self):
++        v = self.voice(b''.join(struct.pack('<h', 10000) for _ in range(240)))
++        call(self.hz, 'mixvol', v, 0, 0, 2, f=1.0); call(self.hz, 'play', v, 0)   # source 0 to the centre bus (2)
++        self.hz.wr(0x3000, bytes(range(6))); call(self.hz, 'sink', 0x500, 0x600, 0x700, 0x3000, 6)
++        self.a.tick(); s = self.samples()
++        self.assertAlmostEqual(s[0], 7071, delta=3); self.assertAlmostEqual(s[1], 7071, delta=3)   # the centre at 0.7071 into both sides
++
++    def test_a_format_that_is_not_decoded_stays_silent_is_counted_and_the_game_still_gets_its_buffers_back(self):
++        v = self.voice(b'\0' * 64, fmt=3, start=0, end=240); call(self.hz, 'mixvol', v, 0, 0, 0, f=1.0); call(self.hz, 'play', v, 0)
++        self.a.tick()
++        self.assertEqual(call(self.hz, 'released', v), 0x2000); self.assertEqual(self.a.unsupported, {3: 1})
++        self.assertTrue(any('not decoded' in m for m in self.hz.logs))
++
++    def adpcm_voice(self, data, coef, addr=0x1000, wb=0x2000):
++        self.hz.wr(0x40000, data); self.hz.wr(0x41000, struct.pack('<16h', *coef))
++        call(self.hz, 'acquire', 0x500, addr, 48000, 1, 6, 0, 0x41000, 32)
++        self.hz.wr(wb, struct.pack('<QQiiB', 0x40000, len(data), 0, 0, 0))
++        call(self.hz, 'append', addr, wb)
++        return addr
++
++    def test_adpcm_is_decoded_with_the_coefficients_the_game_gave(self):
++        # predictor 0 with both coefficients 0: a sample is its 4-bit difference shifted by the scale. Two frames (28 samples), scale 4: differences 1, -1, 7, -8, 0 ...
++        frame = bytes([0x04]) + bytes([0x1F, 0x78, 0x00, 0x11, 0x1F, 0x78, 0x00])   # nibbles: 1 F 7 8 0 0 1 1 1 F 7 8 0 0
++        v = self.adpcm_voice(frame + frame, (0,) * 16)
++        call(self.hz, 'mixvol', v, 0, 0, 0, f=1.0); call(self.hz, 'play', v, 0)
++        self.a.tick(); left = self.samples()[0::2][:28]
++        want = [d * 16 for d in (1, -1, 7, -8, 0, 0, 1, 1, 1, -1, 7, -8, 0, 0)] * 2
++        self.assertEqual(left, [max(-32768, min(32767, w)) for w in want])   # the mixer's float path is exact for these
++
++    def test_adpcm_history_goes_on_across_buffers(self):
++        coef = (2048, 0) + (0,) * 14   # predictor 0: the previous sample, as a gain of 1.0 (a running sum of the differences)
++        frame = bytes([0x00]) + bytes([0x11] * 7)   # scale 0, every difference +1: 14 samples 1..14
++        v = self.adpcm_voice(frame, coef); call(self.hz, 'mixvol', v, 0, 0, 0, f=1.0)
++        self.hz.wr(0x3000, struct.pack('<QQiiB', 0x40000, len(frame), 0, 0, 0)); call(self.hz, 'append', v, 0x3000)   # the same data again: the sum goes on from 14
++        call(self.hz, 'play', v, 0); self.a.tick(); left = self.samples()[0::2][:28]
++        self.assertEqual(left, list(range(1, 29)))
++
++    def test_the_audio_out_buffers_are_mixed_and_handed_back_as_they_are_played(self):
++        call(self.hz, 'openout', 0x800, 0x900); self.hz.wr(0x40000, b''.join(struct.pack('<hh', 5000, -5000) for _ in range(480)))
++        self.hz.wr(0xA00, struct.pack('<QQQ', 0x40000, 1920, 1920))
++        call(self.hz, 'startout', 0x800); call(self.hz, 'appendout', 0x800, 0xA00)
++        self.a.tick(); self.assertEqual(call(self.hz, 'releasedout', 0x800), 0)   # 240 of 480 frames
++        self.a.tick(); self.assertEqual(call(self.hz, 'releasedout', 0x800), 0xA00)
++        s = self.samples(); self.assertAlmostEqual(s[0], 5000, delta=2); self.assertAlmostEqual(s[1], -5000, delta=2)
++
++    def test_the_output_says_what_it_produced(self):
++        v = self.voice(sine(240)); call(self.hz, 'mixvol', v, 0, 0, 0, f=1.0); call(self.hz, 'play', v, 0)
++        self.a.tick(); st = self.a.mixer.stats()
++        self.assertEqual(st['frames'], 240); self.assertGreater(st['loud_frames'], 200); self.assertAlmostEqual(st['peak'], 0.5, delta=0.02)
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_horizon_fs.py b/dm/tools/tests/test_horizon_fs.py
+new file mode 100644
+index 0000000..d72f989
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_fs.py
+@@ -0,0 +1,133 @@
++"""horizon_fs.py: save data has a journal (changes live in a working copy until nn::fs::CommitSaveData, a restart without a commit finds the saved state), and the file operations a game uses on its saves. A fake guest memory
++and a temporary save folder; nothing of any game."""
++import os, shutil, struct, sys, tempfile, unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++import horizon_fs as hf
++from horizon_overrides import TABLE
++
++P = '_ZN2nn2fs'
++SYM = dict(mount=P + '13MountSaveDataEPKcRKNS_7account3UidE', mount_ro=P + '21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE', commit=P + '14CommitSaveDataEPKc', unmount=P + '7UnmountEPKc',
++           create=P + '10CreateFileEPKcl', create3=P + '10CreateFileEPKcli', open=P + '8OpenFileEPNS0_10FileHandleEPKci', write=P + '9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE',
++           read=P + '8ReadFileEPmNS0_10FileHandleElPvm', close=P + '9CloseFileENS0_10FileHandleE', delete=P + '10DeleteFileEPKc', mkdir=P + '15CreateDirectoryEPKc', rmdir=P + '15DeleteDirectoryEPKc',
++           rmrf=P + '26DeleteDirectoryRecursivelyEPKc', rename=P + '10RenameFileEPKcS2_', renamed=P + '15RenameDirectoryEPKcS2_', setsize=P + '11SetFileSizeENS0_10FileHandleEl',
++           free=P + '16GetFreeSpaceSizeEPlPKc', total=P + '17GetTotalSpaceSizeEPlPKc', getsize=P + '11GetFileSizeEPlNS0_10FileHandleE', commit_all=P + '6CommitEPKPKci', entry=P + '12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc')
++
++
++class FakeHz:
++    def __init__(self, save_root):
++        self.mem, self.logs = bytearray(0x10000), []
++        self.fs = hf.FileSystem(self, None, 't'); self.fs.save_root = Path(save_root)
++    def rd(self, a, n): return bytes(self.mem[a:a + n])
++    def wr(self, a, d): self.mem[a:a + len(d)] = d
++    def rd64(self, a): return struct.unpack('<Q', self.rd(a, 8))[0]
++    def wr64(self, a, v): self.wr(a, struct.pack('<Q', v))
++    def wr32(self, a, v): self.wr(a, struct.pack('<I', v))
++    def cstring(self, a, limit=256): return self.rd(a, limit).split(b'\0')[0].decode()
++    def log(self, m): self.logs.append(m)
++
++
++class Saves(unittest.TestCase):
++    def setUp(self): self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name) / 'saves'
++    def tearDown(self): self.tmp.cleanup()
++
++    def boot(self):
++        """A new run on the same save folder, with save: mounted"""
++        hz = FakeHz(self.root); self.call(hz, 'mount', self.text(hz, 0x100, 'save'), 0x200)
++        return hz
++
++    def text(self, hz, at, s): hz.wr(at, s.encode() + b'\0'); return at
++
++    def call(self, hz, name, *args):
++        r = [0] * 39; r[:len(args)] = args
++        TABLE[SYM[name]][0](hz, r)
++        return r[0]
++
++    def put(self, hz, path, data, size=None):
++        self.assertEqual(self.call(hz, 'create', self.text(hz, 0x300, path), len(data) if size is None else size), 0)
++        self.assertEqual(self.call(hz, 'open', 0x400, 0x300, 2), 0)
++        h = hz.rd64(0x400); hz.wr(0x1000, data)
++        self.assertEqual(self.call(hz, 'write', h, 0, 0x1000, len(data), 0), 0); self.call(hz, 'close', h)
++
++    def get(self, hz, path):
++        self.text(hz, 0x300, path)
++        if self.call(hz, 'open', 0x400, 0x300, 1): return None
++        h = hz.rd64(0x400); self.call(hz, 'getsize', 0x500, h); n = hz.rd64(0x500)
++        self.call(hz, 'read', 0x600, h, 0, 0x2000, n); self.call(hz, 'close', h)
++        return hz.rd(0x2000, n)
++
++    def test_a_save_that_was_not_committed_is_not_there_after_a_restart(self):
++        hz = self.boot(); self.put(hz, 'save:/slot0.bin', b'first')
++        self.assertEqual(self.get(hz, 'save:/slot0.bin'), b'first')   # the game sees its own writes at once
++        self.assertEqual(self.get(self.boot(), 'save:/slot0.bin'), None)   # a run that ends here saved nothing
++
++    def test_a_commit_makes_the_changes_the_saved_state(self):
++        hz = self.boot(); self.put(hz, 'save:/slot0.bin', b'first')
++        self.assertEqual(self.call(hz, 'commit', self.text(hz, 0x700, 'save')), 0)
++        self.assertEqual(self.get(self.boot(), 'save:/slot0.bin'), b'first')
++        self.assertTrue(any('committed' in m for m in hz.logs))
++
++    def test_changes_after_the_last_commit_are_rolled_back_by_a_restart(self):
++        hz = self.boot(); self.put(hz, 'save:/a', b'one'); self.call(hz, 'commit', self.text(hz, 0x700, 'save'))
++        self.call(hz, 'open', 0x400, self.text(hz, 0x300, 'save:/a'), 2); h = hz.rd64(0x400); hz.wr(0x1000, b'TWO')
++        self.call(hz, 'write', h, 0, 0x1000, 3, 0); self.put(hz, 'save:/b', b'new')
++        self.assertEqual((self.get(hz, 'save:/a'), self.get(hz, 'save:/b')), (b'TWO', b'new'))
++        again = self.boot()
++        self.assertEqual((self.get(again, 'save:/a'), self.get(again, 'save:/b')), (b'one', None))
++        self.assertIn('3 changes not committed (lost)', hz.fs.report())   # the write to a, the creation of b and the write to b
++
++    def test_unmounting_without_a_commit_loses_the_changes_and_says_so(self):
++        hz = self.boot(); self.put(hz, 'save:/a', b'x')
++        self.call(hz, 'unmount', self.text(hz, 0x700, 'save'))
++        self.assertTrue(any('uncommitted' in m for m in hz.logs)); self.assertEqual(self.get(hz, 'save:/a'), None)   # not mounted any more
++        self.assertEqual(self.get(self.boot(), 'save:/a'), None)
++
++    def test_a_commit_that_died_half_way_leaves_the_old_state_or_gets_it_back(self):
++        hz = self.boot(); self.put(hz, 'save:/a', b'old'); self.call(hz, 'commit', self.text(hz, 0x700, 'save'))
++        base = self.root
++        (base / 'committed.new').mkdir(); (base / 'committed.new' / 'a').write_bytes(b'half written')   # died while building the new state
++        self.assertEqual(self.get(self.boot(), 'save:/a'), b'old'); self.assertFalse((base / 'committed.new').exists())
++        (base / 'committed').rename(base / 'committed.old')   # died between the two renames: only the old state is left
++        self.assertEqual(self.get(self.boot(), 'save:/a'), b'old')
++
++    def test_a_save_folder_from_before_the_journal_is_the_committed_state(self):
++        self.root.mkdir(parents=True); (self.root / 'game.sav').write_bytes(b'legacy')
++        self.assertEqual(self.get(self.boot(), 'save:/game.sav'), b'legacy')
++        self.assertTrue((self.root / 'committed' / 'game.sav').exists())
++
++    def test_a_read_only_mount_shows_the_saved_state_and_refuses_changes(self):
++        hz = self.boot(); self.put(hz, 'save:/a', b'kept'); self.call(hz, 'commit', self.text(hz, 0x700, 'save'))
++        ro = FakeHz(self.root); self.call(ro, 'mount_ro', self.text(ro, 0x100, 'ro'), 0, 0x200)
++        self.assertEqual(self.get(ro, 'ro:/a'), b'kept')
++        self.assertEqual(self.call(ro, 'create', self.text(ro, 0x300, 'ro:/b'), 1), hf.RES_READ_ONLY)
++        self.assertEqual(self.call(ro, 'delete', self.text(ro, 0x300, 'ro:/a')), hf.RES_READ_ONLY)
++        self.assertEqual(self.call(ro, 'open', 0x400, self.text(ro, 0x300, 'ro:/a'), 2), hf.RES_READ_ONLY)
++
++    def test_files_and_directories_can_be_renamed_resized_and_deleted(self):
++        hz = self.boot(); self.call(hz, 'mkdir', self.text(hz, 0x300, 'save:/d')); self.put(hz, 'save:/d/f', b'0123456789')
++        self.assertEqual(self.call(hz, 'rename', self.text(hz, 0x300, 'save:/d/f'), self.text(hz, 0x380, 'save:/d/g')), 0)
++        self.assertEqual((self.get(hz, 'save:/d/f'), self.get(hz, 'save:/d/g')), (None, b'0123456789'))
++        self.assertEqual(self.call(hz, 'rename', self.text(hz, 0x300, 'save:/nope'), self.text(hz, 0x380, 'save:/x')), hf.RES_NOT_FOUND)
++        self.call(hz, 'open', 0x400, self.text(hz, 0x300, 'save:/d/g'), 2); h = hz.rd64(0x400)
++        self.assertEqual(self.call(hz, 'setsize', h, 4), 0); self.call(hz, 'close', h)
++        self.assertEqual(self.get(hz, 'save:/d/g'), b'0123')
++        self.assertEqual(self.call(hz, 'rmdir', self.text(hz, 0x300, 'save:/d')), hf.RES_DIR_NOT_EMPTY)
++        self.assertEqual(self.call(hz, 'renamed', self.text(hz, 0x300, 'save:/d'), self.text(hz, 0x380, 'save:/e')), 0)
++        self.assertEqual(self.get(hz, 'save:/e/g'), b'0123')
++        self.assertEqual(self.call(hz, 'rmrf', self.text(hz, 0x300, 'save:/e')), 0); self.assertEqual(self.get(hz, 'save:/e/g'), None)
++
++    def test_the_space_that_is_free_shrinks_with_the_files(self):
++        hz = self.boot(); self.put(hz, 'save:/big', b'x' * 1000)
++        self.assertEqual(self.call(hz, 'total', 0x500, self.text(hz, 0x300, 'save:/')), 0); self.assertEqual(hz.rd64(0x500), 256 << 20)
++        self.call(hz, 'free', 0x500, self.text(hz, 0x300, 'save:/')); self.assertEqual(hz.rd64(0x500), (256 << 20) - 1000)
++
++    def test_create_file_with_an_option_and_commit_of_several_mounts(self):
++        hz = self.boot()
++        self.assertEqual(self.call(hz, 'create3', self.text(hz, 0x300, 'save:/o'), 8, 0), 0)
++        hz.wr64(0x800, self.text(hz, 0x700, 'save'))
++        self.assertEqual(self.call(hz, 'commit_all', 0x800, 1), 0)
++        self.assertTrue((self.root / 'committed' / 'o').exists())
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_horizon_movie.py b/dm/tools/tests/test_horizon_movie.py
+new file mode 100644
+index 0000000..2975eef
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_movie.py
+@@ -0,0 +1,40 @@
++"""horizon_movie.py: opening a movie fails explicitly and is counted, with the SDK's own code (the host has no decoder behind movie::Decoder)"""
++import sys, unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++import horizon_movie as hm
++import horizon_overrides as ho
++
++
++class FakeHz:
++    def __init__(self): self.mem, self.logs = bytearray(0x1000), []
++    def cstring(self, a, limit=256): return bytes(self.mem[a:a + limit]).split(b'\0')[0].decode()
++    def log(self, m): self.logs.append(m)
++
++
++def call(hz, sym, *args):
++    r = [0] * 39; r[:len(args)] = args
++    ho.TABLE[sym][0](hz, r); return r[0]
++
++
++class Movie(unittest.TestCase):
++    def test_every_way_of_opening_a_movie_is_refused_with_the_sdks_own_code_and_counted(self):
++        hz = FakeHz(); hz.mem[0x100:0x120] = b'stream/movie/mv10010100.webm\0'
++        self.assertEqual(call(hz, '_ZN5movie9Extractor13SetDataSourceEPKc', 0x10, 0x100), hm.NO_IMPLEMENTATION)
++        self.assertEqual(call(hz, '_ZN5movie11NnExtractor13SetDataSourceEPKvi', 0x10, 0x200, 4096), hm.NO_IMPLEMENTATION)
++        self.assertEqual(call(hz, '_ZN5movie9Extractor13SetDataSourceEPNS_18ClientStreamReaderEPKc', 0x10, 0x20, 0x100), hm.NO_IMPLEMENTATION)
++        self.assertEqual(len(hm.refused(hz)), 3)
++        self.assertIn('mv10010100.webm', hz.logs[0]); self.assertIn('no movie decoder', hz.logs[0])
++        self.assertIn('3 openings refused', hm.report(hz))
++
++    def test_the_log_names_the_first_four_and_counts_the_rest(self):
++        hz = FakeHz()
++        for _ in range(9): call(hz, '_ZN5movie9Extractor13SetDataSourceEPKc', 0x10, 0x100)
++        self.assertEqual((len(hz.logs), len(hm.refused(hz))), (4, 9))
++
++    def test_a_run_that_opened_no_movie_says_so(self):
++        self.assertEqual(hm.report(FakeHz()), 'movie: the game opened no movie')
++
++
++if __name__ == '__main__': unittest.main()

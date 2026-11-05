@@ -1,0 +1,772 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 14:42:50 +0100
+Subject: [PATCH] aot_jit: dynarmic as the JIT fallback of the AOT code,
+ counted, logged and limited
+
+When AOT code (blr, br) reaches an address that is no AOT function, aot_jit.cpp loads the State into a
+dynarmic A64 Jit, runs the code found in guest memory, and gives the registers back when it returns to
+the x30 the caller left (kept real, so the return addresses JIT code saves on the stack are true). JIT
+code that branches to an AOT entry goes back to the AOT code and resumes at x30. Writes to a page the
+JIT compiled from (AOT stores, JIT stores, aot_poke) invalidate it, so generated code that changes is
+recompiled. Entries, transitions, invalidations and compiled pages are counted; every (target, kind) is
+logged; an entry budget, a cycle budget and a nesting depth stop runaway use with an explicit error, as do
+no code at an address, an access outside guest memory, an instruction dynarmic cannot translate, an
+exception and an svc (Horizon's services are T5). One Jit per host thread, one exclusive monitor.
+aot_runtime.h shares the runtime with it; aot_lift.py gets Aot(jit=True, ...) and builds the fixed
+objects once per process. 14 tests compare with Unicorn, recompile rewritten code, run an exclusive
+counter loop in the JIT on four threads, and check each limit. Skipped without DYNARMIC_DIR.
+
+Upstream-Status: pending
+Reason: T4 of an AArch64 -> x86_64 recompilation (NX2Linux); new JIT fallback and tests, nothing in the host, loader or shader chain changes
+Issue: none yet (NX2Linux, branch feat/teo-t4-jit-secours)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/aot_jit.cpp           | 250 +++++++++++++++++++++++++++++++++
+ dm/tools/aot_lift.py           |  59 +++++++-
+ dm/tools/aot_runtime.cpp       |  46 ++++--
+ dm/tools/aot_runtime.h         |  25 ++++
+ dm/tools/tests/test_aot_jit.py | 202 ++++++++++++++++++++++++++
+ dm/tools/tests/test_aot_t3.py  |   2 +-
+ 6 files changed, 566 insertions(+), 18 deletions(-)
+ create mode 100644 dm/tools/aot_jit.cpp
+ create mode 100644 dm/tools/aot_runtime.h
+ create mode 100644 dm/tools/tests/test_aot_jit.py
+
+diff --git a/dm/tools/aot_jit.cpp b/dm/tools/aot_jit.cpp
+new file mode 100644
+index 0000000..951f277
+--- /dev/null
++++ b/dm/tools/aot_jit.cpp
+@@ -0,0 +1,250 @@
++// The JIT fallback of the ahead-of-time recompiled code (NX2Linux T4), built on dynarmic (0BSD, the AArch64 JIT the Switch emulators use). It takes over when AOT code reaches an address that is no AOT function:
++// an indirect call or jump (blr, br) to code the translator never saw, such as code the game generated or a function the survey did not find. It then
++//   · loads the guest registers of the lifted code's State into a dynarmic Jit and runs the code found in guest memory from that address;
++//   · ends the run when the code returns to the address the AOT caller left in x30 (that address is refused as code, which stops the run: x30 keeps its real value, so the return addresses JIT'd code
++//     saves on the stack are the true ones, as an unwinder expects), and gives the registers back;
++//   · hands control back to the AOT code when the JIT'd code branches to an AOT function's entry (that entry is refused as code, which stops the run), then resumes at x30 when it returns;
++//   · drops the code it compiled from a page when the guest writes to that page (AOT stores, JIT stores, aot_poke): generated code that changes is recompiled;
++//   · counts and logs every entry and every transition, and stops with an explicit error on: an entry budget, a cycle budget, a nesting depth, no code at an address, an access outside guest memory,
++//     an instruction dynarmic cannot translate, an exception, an `svc` (Horizon's services come in T5).
++// One Jit per host thread (dynarmic's Run is not reentrant); the exclusive monitor is shared by up to 64 of them. A callback never longjmps (dynarmic's state would be left mid-run): it records the
++// fault, halts the Jit, and the error is raised once Run has returned.
++#include "aot_runtime.h"
++#include "dynarmic/interface/A64/a64.h"
++#include "dynarmic/interface/A64/config.h"
++#include "dynarmic/interface/exclusive_monitor.h"
++#include <atomic>
++#include <chrono>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <set>
++
++using namespace Dynarmic;
++
++namespace {
++struct Config { uint64_t max_entries = 0, ticks = 1ull << 40; int max_depth = 8; } g_cfg;   // max_entries 0: unlimited
++ExclusiveMonitor g_monitor(64);
++std::atomic<size_t> g_next_cpu{0};
++std::mutex g_log_mu;
++struct LogRow { uint64_t count, first; const char *kind; };
++std::map<std::pair<uint64_t, const char *>, LogRow> g_log;   // (target, kind) -> how often, and the sequence number of the first time
++uint64_t g_seq;
++
++enum Stop { NONE, RETURN, TO_AOT, FAULT };
++
++struct Cpu final : A64::UserCallbacks {
++    std::unique_ptr<A64::Jit> jit;
++    size_t id = 0;
++    uint64_t tpidr = 0, tpidrro = 0, ticks_left = 0, stop_pc = 0, ret_addr = 0;   // ret_addr: where this run ends, the caller's x30
++    Stop stop = NONE;
++    char fault[300] = {0};
++    std::set<uint64_t> code_pages;   // 4 KiB pages some compiled code was read from
++
++    explicit Cpu(size_t id_) : id(id_) {
++        A64::UserConfig c;
++        c.callbacks = this; c.global_monitor = &g_monitor; c.processor_id = id;
++        c.tpidr_el0 = &tpidr; c.tpidrro_el0 = &tpidrro;
++        c.cntfrq_el0 = 19200000;                 // the Switch's counter frequency
++        c.check_halt_on_memory_access = true;    // a failed access halts at once, not at the end of the block
++        c.code_cache_size = 16 << 20;
++        jit = std::make_unique<A64::Jit>(c);
++    }
++
++    void fail_with(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
++        if (stop == FAULT) return;   // the first fault is the one that explains the rest
++        va_list ap; va_start(ap, fmt); vsnprintf(fault, sizeof fault, fmt, ap); va_end(ap);
++        stop = FAULT; jit->HaltExecution();
++    }
++
++    // ---- code and data ----
++    std::optional<uint32_t> MemoryReadCode(A64::VAddr a) override {
++        if (a == ret_addr || aot_find(a)) return std::nullopt;   // not code to compile: the run ends or goes back to the AOT code (ExceptionRaised)
++        uint8_t *p = aot_guest_ptr(a, 4);
++        if (!p) return std::nullopt;
++        if (code_pages.insert(a >> 12).second) aot_count(AOT_S_JIT_PAGES);
++        uint32_t v; memcpy(&v, p, 4); return v;
++    }
++    template <class T> T rd(A64::VAddr a) {
++        uint8_t *p = aot_guest_ptr(a, sizeof(T));
++        if (!p) { fail_with("JIT: read of %u bytes at %#llx is outside every mapped region", (unsigned)sizeof(T), (unsigned long long)a); return T{}; }
++        T v; memcpy(&v, p, sizeof v); return v;
++    }
++    template <class T> void wr(A64::VAddr a, T v) {
++        uint8_t *p = aot_guest_ptr(a, sizeof(T));
++        if (!p) { fail_with("JIT: write of %u bytes at %#llx is outside every mapped region", (unsigned)sizeof(T), (unsigned long long)a); return; }
++        memcpy(p, &v, sizeof v);
++        written(a, sizeof(T), true);
++    }
++    // The bytes [a, a+n) changed: the compiled code from any page they touch is stale. In a callback InvalidateCacheRange halts the Jit; the run loop resumes it.
++    void written(uint64_t a, uint64_t n, bool in_callback) {
++        for (uint64_t pg = a >> 12; pg <= (a + n - 1) >> 12; pg++) {
++            if (!code_pages.erase(pg)) continue;
++            jit->InvalidateCacheRange(pg << 12, 0x1000);
++            aot_count(AOT_S_JIT_INVALIDATIONS);
++        }
++        (void)in_callback;
++    }
++    uint8_t MemoryRead8(A64::VAddr a) override { return rd<uint8_t>(a); }
++    uint16_t MemoryRead16(A64::VAddr a) override { return rd<uint16_t>(a); }
++    uint32_t MemoryRead32(A64::VAddr a) override { return rd<uint32_t>(a); }
++    uint64_t MemoryRead64(A64::VAddr a) override { return rd<uint64_t>(a); }
++    A64::Vector MemoryRead128(A64::VAddr a) override { return rd<A64::Vector>(a); }
++    void MemoryWrite8(A64::VAddr a, uint8_t v) override { wr(a, v); }
++    void MemoryWrite16(A64::VAddr a, uint16_t v) override { wr(a, v); }
++    void MemoryWrite32(A64::VAddr a, uint32_t v) override { wr(a, v); }
++    void MemoryWrite64(A64::VAddr a, uint64_t v) override { wr(a, v); }
++    void MemoryWrite128(A64::VAddr a, A64::Vector v) override { wr(a, v); }
++    // An exclusive store is a compare-and-swap against the value the exclusive load read, as in the AOT code; true when it wrote.
++    template <class T> bool cas(A64::VAddr a, T v, T expected) {
++        if (a % sizeof(T)) { fail_with("JIT: exclusive access of %u bytes at %#llx is not naturally aligned", (unsigned)sizeof(T), (unsigned long long)a); return false; }
++        uint8_t *p = aot_guest_ptr(a, sizeof(T));
++        if (!p) { fail_with("JIT: exclusive write of %u bytes at %#llx is outside every mapped region", (unsigned)sizeof(T), (unsigned long long)a); return false; }
++        bool ok = __atomic_compare_exchange_n((T *)p, &expected, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++        if (ok) written(a, sizeof(T), true);
++        return ok;
++    }
++    bool MemoryWriteExclusive8(A64::VAddr a, uint8_t v, uint8_t e) override { return cas(a, v, e); }
++    bool MemoryWriteExclusive16(A64::VAddr a, uint16_t v, uint16_t e) override { return cas(a, v, e); }
++    bool MemoryWriteExclusive32(A64::VAddr a, uint32_t v, uint32_t e) override { return cas(a, v, e); }
++    bool MemoryWriteExclusive64(A64::VAddr a, uint64_t v, uint64_t e) override { return cas(a, v, e); }
++    bool MemoryWriteExclusive128(A64::VAddr a, A64::Vector, A64::Vector) override { fail_with("JIT: 128-bit exclusive access at %#llx is not supported", (unsigned long long)a); return false; }
++
++    // ---- events ----
++    void InterpreterFallback(A64::VAddr pc, size_t n) override { fail_with("JIT: %zu instruction(s) at %#llx are not translated by dynarmic, which has no interpreter here", n, (unsigned long long)pc); }
++    void CallSVC(uint32_t swi) override { fail_with("JIT: svc #%u executed by JIT code before %#llx: the Horizon services are connected in T5", swi, (unsigned long long)jit->GetPC()); }
++    void ExceptionRaised(A64::VAddr pc, A64::Exception e) override {
++        if (stop == FAULT) { jit->HaltExecution(); return; }   // a fault already recorded (a failed access) is what to report, not the return that follows it
++        if (e == A64::Exception::NoExecuteFault) {
++            if (pc == ret_addr) { stop = RETURN; stop_pc = pc; }
++            else if (aot_find(pc)) { stop = TO_AOT; stop_pc = pc; }
++            else fail_with("JIT: no code to run at %#llx (outside every mapped region)", (unsigned long long)pc);
++        } else {
++            static const char *names[] = {"unallocated encoding", "reserved value", "unpredictable instruction", "wait for interrupt", "wait for event", "send event", "send event (local)", "yield", "breakpoint", "no-execute fault"};
++            fail_with("JIT: %s at %#llx", (unsigned)e < 10 ? names[(unsigned)e] : "exception", (unsigned long long)pc);
++        }
++        jit->HaltExecution();
++    }
++    void AddTicks(uint64_t t) override { ticks_left = t >= ticks_left ? 0 : ticks_left - t; }
++    uint64_t GetTicksRemaining() override { return ticks_left; }
++    uint64_t GetCNTPCT() override {
++        using namespace std::chrono;
++        return (uint64_t)((double)duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() * 0.0192);   // 19.2 MHz
++    }
++};
++
++thread_local std::unique_ptr<Cpu> t_cpu;
++thread_local int t_depth;
++
++Cpu &cpu() {
++    if (!t_cpu) {
++        size_t id = g_next_cpu.fetch_add(1);
++        if (id >= 64) { fprintf(stderr, "[RED] aot: more than 64 threads used the JIT\n"); abort(); }
++        t_cpu = std::make_unique<Cpu>(id);
++    }
++    return *t_cpu;
++}
++
++#define XREGS(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30)
++
++void load(Cpu &c, const State *st) {   // State -> Jit
++#define X(i) c.jit->SetRegister(i, st->gpr.x##i.qword);
++    XREGS(X)
++#undef X
++    c.jit->SetSP(st->gpr.sp.qword);
++    c.jit->SetPstate((uint32_t)((st->sr.n << 31) | (st->sr.z << 30) | (st->sr.c << 29) | (st->sr.v << 28)));
++    for (int i = 0; i < 32; i++) { A64::Vector v; memcpy(&v, &st->simd.v[i], 16); c.jit->SetVector(i, v); }
++    c.jit->SetFpcr((uint32_t)st->fpcr.flat); c.jit->SetFpsr((uint32_t)st->fpsr.flat);
++    c.tpidr = st->sr.tpidr_el0.qword; c.tpidrro = st->sr.tpidrro_el0.qword;
++}
++
++void store(Cpu &c, State *st) {   // Jit -> State
++#define X(i) st->gpr.x##i.qword = c.jit->GetRegister(i);
++    XREGS(X)
++#undef X
++    st->gpr.sp.qword = c.jit->GetSP();
++    uint32_t ps = c.jit->GetPstate();
++    st->sr.n = ps >> 31 & 1; st->sr.z = ps >> 30 & 1; st->sr.c = ps >> 29 & 1; st->sr.v = ps >> 28 & 1;
++    for (int i = 0; i < 32; i++) { A64::Vector v = c.jit->GetVector(i); memcpy(&st->simd.v[i], &v, 16); }
++    st->fpcr.flat = c.jit->GetFpcr(); st->fpsr.flat = c.jit->GetFpsr();
++    st->sr.tpidr_el0.qword = c.tpidr;
++}
++
++void log_entry(uint64_t target, const char *kind) {
++    std::lock_guard<std::mutex> g(g_log_mu);
++    auto &row = g_log[{target, kind}];
++    if (!row.count++) { row.first = ++g_seq; row.kind = kind; }
++}
++
++// Everything but the final raise lives here, in a frame with no destructor a longjmp could skip. Returns 0, or 1 with err.
++int run_jit(State *st, uint64_t pc, Memory *m, int is_jump, char *err, size_t errn) {
++    Cpu &c = cpu();
++    const uint64_t outer_ret = c.ret_addr;   // this Cpu may be suspended in an outer run, waiting for an AOT function that entered the JIT again
++    c.ret_addr = st->gpr.x30.qword;
++    load(c, st);
++    c.jit->SetPC(pc);
++    c.ticks_left = g_cfg.ticks; c.stop = NONE; c.fault[0] = 0;
++    int rc = 0;
++    for (;;) {
++        HaltReason hr = c.jit->Run();
++        if (c.stop == FAULT) { snprintf(err, errn, "%s", c.fault); rc = 1; break; }
++        if (c.stop == RETURN) break;
++        if (c.stop == TO_AOT) {
++            const uint64_t target = c.stop_pc;
++            store(c, st);
++            aot_count(AOT_S_JIT_TO_AOT); log_entry(target, "jit->aot");
++            c.stop = NONE;
++            if (aot_try_call(aot_find(target), st, target, m, err, errn)) { rc = 1; break; }
++            load(c, st);
++            c.jit->SetPC(st->gpr.x30.qword);   // the AOT function returned: carry on after the call, where x30 says
++            continue;
++        }
++        if (Dynarmic::Has(hr, HaltReason::CacheInvalidation)) { c.jit->ClearHalt(HaltReason::CacheInvalidation); continue; }   // the JIT'd code wrote to code it had compiled: go on, recompiling
++        if (c.ticks_left == 0) { snprintf(err, errn, "JIT budget exceeded: the code at %#llx ran more than %llu cycles without returning", (unsigned long long)pc, (unsigned long long)g_cfg.ticks); rc = 1; break; }
++        snprintf(err, errn, "JIT stopped for an unknown reason (halt %#x) at %#llx", (unsigned)hr, (unsigned long long)c.jit->GetPC()); rc = 1; break;
++    }
++    store(c, st);
++    c.ret_addr = outer_ret;
++    (void)is_jump;
++    return rc;
++}
++
++Memory *fallback(State *st, uint64_t pc, Memory *m, int is_jump) {
++    if (g_cfg.max_entries && aot_stat(AOT_S_JIT_ENTRIES) >= g_cfg.max_entries)
++        aot_fail("JIT budget exceeded: %llu entries already, and %#llx would be one more", (unsigned long long)g_cfg.max_entries, (unsigned long long)pc);
++    if (t_depth >= g_cfg.max_depth) aot_fail("JIT entered %d levels deep (%#llx): AOT and JIT code keep calling each other", t_depth, (unsigned long long)pc);
++    aot_count(AOT_S_JIT_ENTRIES); log_entry(pc, is_jump ? "jump" : "call");
++    char err[300];
++    t_depth++;
++    int rc = run_jit(st, pc, m, is_jump, err, sizeof err);
++    t_depth--;
++    if (rc) aot_fail("%s", err);
++    return m;
++}
++
++void on_write(uint64_t a, uint64_t n) { if (t_cpu) t_cpu->written(a, n, false); }
++}  // namespace
++
++extern "C" {
++// Turn the fallback on: at most max_entries entries (0: no limit), ticks cycles per entry, max_depth nested entries
++void aot_jit_enable(uint64_t max_entries, uint64_t ticks, int max_depth) {
++    g_cfg.max_entries = max_entries; g_cfg.ticks = ticks ? ticks : 1ull << 40; g_cfg.max_depth = max_depth > 0 ? max_depth : 8;
++    aot_fallback = fallback; aot_write_hook = on_write;
++}
++void aot_jit_disable() { aot_fallback = nullptr; aot_write_hook = nullptr; }
++// The log, one line per (target, kind): "#seq pc=0x... kind count=N"
++int aot_jit_log(char *buf, uint64_t n) {
++    std::lock_guard<std::mutex> g(g_log_mu);
++    std::string out;
++    std::map<uint64_t, std::string> by_seq;
++    for (auto &[k, row] : g_log) { char line[100]; snprintf(line, sizeof line, "#%llu pc=%#llx %s count=%llu\n", (unsigned long long)row.first, (unsigned long long)k.first, row.kind, (unsigned long long)row.count); by_seq[row.first] = line; }
++    for (auto &[_, l] : by_seq) out += l;
++    snprintf(buf, n, "%s", out.c_str());
++    return (int)out.size();
++}
++void aot_jit_log_clear() { std::lock_guard<std::mutex> g(g_log_mu); g_log.clear(); g_seq = 0; }
++}
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index dc96694..cb8f148 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -11,7 +11,7 @@ from pathlib import Path
+ 
+ HERE = Path(__file__).resolve().parent
+ RET = 0xD65F03C0
+-STATS = ('indirect_calls', 'indirect_jumps', 'fallback_requests', 'reads', 'writes', 'regions')
++STATS = ('indirect_calls', 'indirect_jumps', 'fallback_requests', 'reads', 'writes', 'regions', 'jit_entries', 'jit_to_aot', 'jit_invalidations', 'jit_pages')
+ 
+ 
+ class LiftError(Exception):
+@@ -28,10 +28,39 @@ def lifter():
+     return next(iter(sorted(glob.glob(os.path.join(b, 'bin/lift/remill-lift-*')))), None) if b else None
+ 
+ 
++def dynarmic_dir():
++    """The dynarmic folder named by DYNARMIC_DIR (its source with a build/ folder built with CMAKE_POSITION_INDEPENDENT_CODE=ON)"""
++    d = os.environ.get('DYNARMIC_DIR')
++    if not d or not os.path.exists(os.path.join(d, 'build/src/dynarmic/libdynarmic.a')): raise LinkError('the JIT needs DYNARMIC_DIR, a dynarmic checkout built with -DCMAKE_POSITION_INDEPENDENT_CODE=ON')
++    return d
++
++
+ def include_dir():
+     return os.environ.get('REMILL_SRC', os.path.join(os.environ['REMILL_BUILD'], '..'))
+ 
+ 
++def table_obj(table, base, d, n):
++    """The generated address table compiled on its own (the JIT build links objects, not sources)"""
++    obj = os.path.join(d, f'table{n}.o')
++    r = subprocess.run(['clang++', '-c', '-std=c++17', *base, table, '-o', obj], capture_output=True, text=True)
++    if r.returncode: raise LinkError('build of the address table failed:\n' + r.stderr[-2000:])
++    return obj
++
++
++_objs = {}
++_objs_dir = tempfile.TemporaryDirectory()
++
++
++def fixed_obj(src, std, base, dyn):
++    """The runtime and the JIT do not depend on the functions: compiled once per process"""
++    if (src, std) not in _objs:
++        obj = os.path.join(_objs_dir.name, f'{Path(src).stem}.o')
++        r = subprocess.run(['clang++', '-c', f'-std={std}', *base, f'-I{dyn}/src', f'-I{dyn}/externals/mcl/include', f'-I{dyn}/externals/fmt/include', f'-I{dyn}/build/src', str(HERE / src), '-o', obj], capture_output=True, text=True)
++        if r.returncode: raise LinkError(f'build of {src} failed:\n' + r.stderr[-2000:])
++        _objs[src, std] = obj
++    return _objs[src, std]
++
++
+ def _disasm(word, address):
+     try:
+         import capstone
+@@ -66,8 +95,10 @@ _counter = itertools.count()
+ 
+ 
+ class Aot:
+-    def __init__(self, functions, tmp=None):
+-        """functions: [(address, bytes)]; builds and loads the library. LiftError / LinkError otherwise"""
++    def __init__(self, functions, tmp=None, jit=False, jit_entries=0, jit_ticks=0, jit_depth=8):
++        """functions: [(address, bytes)]; builds and loads the library. LiftError / LinkError otherwise.
++        jit: also build the dynarmic fallback (DYNARMIC_DIR: its source folder with the build/ folder inside) and turn it on, limited to jit_entries entries (0: no limit),
++        jit_ticks cycles per entry (0: 2**40) and jit_depth nested entries"""
+         self.dir = tempfile.TemporaryDirectory() if tmp is None else None
+         d = tmp or self.dir.name
+         n = next(_counter)
+@@ -83,8 +114,16 @@ class Aot:
+                                + f'extern "C" const unsigned aot_table_n = {len(rows)};\n')
+         so = os.path.join(d, f'aot{n}.so')   # one path per library: dlopen of a path already loaded returns the old one
+         inc = include_dir()
+-        r = subprocess.run(['clang++', '-O2', '-shared', '-fPIC', '-std=c++17', '-DADDRESS_SIZE_BITS=64', f'-I{inc}/include', f'-I{inc}', str(HERE / 'aot_runtime.cpp'), table, *lls, '-o', so, '-Wl,--no-undefined'],
+-                           capture_output=True, text=True)
++        base = ['-O2', '-fPIC', f'-I{inc}/include', f'-I{inc}', '-DADDRESS_SIZE_BITS=64']
++        if jit:
++            dyn = dynarmic_dir()
++            objs = [fixed_obj(src, std, base, dyn) for src, std in (('aot_runtime.cpp', 'c++17'), ('aot_jit.cpp', 'c++20'))]   # dynarmic's headers need C++20; the lifted code and the runtime do not
++            libs = [f'{dyn}/build/src/dynarmic/libdynarmic.a', f'{dyn}/build/externals/mcl/src/libmcl.a', f'{dyn}/build/externals/fmt/libfmt.a',
++                    f'{dyn}/build/externals/zydis/libZydis.a', f'{dyn}/build/externals/zydis/zycore/libZycore.a']
++            cmd = ['clang++', '-shared', *objs, table_obj(table, base, d, n), *lls, '-o', so, '-Wl,--start-group', *libs, '-Wl,--end-group', '-lpthread', '-Wl,--no-undefined']
++        else:
++            cmd = ['clang++', '-shared', '-std=c++17', *base, str(HERE / 'aot_runtime.cpp'), table, *lls, '-o', so, '-Wl,--no-undefined']
++        r = subprocess.run(cmd, capture_output=True, text=True)
+         if r.returncode:
+             missing = sorted(set(re.findall(r'(?:undefined reference to|référence indéfinie vers) [«`\'"]*([A-Za-z_0-9]+)', r.stderr)))
+             if missing: raise LinkError('the runtime does not define: ' + ', '.join(missing) + ' (an instruction class not translated yet)')
+@@ -97,6 +136,16 @@ class Aot:
+         L.aot_stat.argtypes = [ctypes.c_int]; L.aot_stat.restype = ctypes.c_uint64
+         L.aot_run.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
+         self.regions = []
++        if jit:
++            L.aot_jit_enable.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
++            L.aot_jit_enable(jit_entries, jit_ticks, jit_depth)
++            L.aot_jit_log.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
++
++    def jit_log(self):
++        """The JIT's log: one line per (target, kind), in the order first seen"""
++        buf = ctypes.create_string_buffer(1 << 16)
++        self.lib.aot_jit_log(buf, len(buf))
++        return buf.value.decode()
+ 
+     class _Guest(ctypes.Structure):
+         _fields_ = [('x', ctypes.c_uint64 * 31), ('sp', ctypes.c_uint64), ('nzcv', ctypes.c_uint64)]
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index d2b0ace..fb6abfa 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -4,7 +4,7 @@
+ //     fallback (T4) takes it. A direct `bl` needs none of this: Remill lifted it into a call of sub_<address>, resolved at link time.
+ //   · errors leave the lifted code by longjmp (its frames hold no destructors), and aot_run reports them as text.
+ // ADDRESS_SIZE_BITS=64 and Remill's include folder are on the command line (aot_lift.py). Flag and compare intrinsics are markers whose first argument is already the value, as in remill_host.cpp.
+-#include "remill/Arch/AArch64/Runtime/State.h"
++#include "aot_runtime.h"
+ #include <atomic>
+ #include <csetjmp>
+ #include <cstdarg>
+@@ -14,7 +14,6 @@
+ #include <cstring>
+ #include <vector>
+ 
+-typedef Memory *(*AotFn)(State *, uint64_t, Memory *);
+ struct AotEntry { uint64_t addr; AotFn fn; };
+ extern "C" const AotEntry aot_table[];   // generated by aot_lift.py, sorted by address
+ extern "C" const unsigned aot_table_n;
+@@ -24,10 +23,11 @@ struct Region { uint64_t base, size; uint8_t *host; };
+ std::vector<Region> g_regions;
+ thread_local jmp_buf *g_jb;
+ thread_local char g_err[300];
+-uint64_t g_stats[6];   // indirect calls, indirect jumps, fallback requests, memory reads, memory writes, regions mapped
+-enum { S_CALLS, S_JUMPS, S_FALLBACK, S_READS, S_WRITES, S_REGIONS };
++uint64_t g_stats[AOT_S_N];
++enum { S_CALLS = AOT_S_CALLS, S_JUMPS = AOT_S_JUMPS, S_FALLBACK = AOT_S_FALLBACK, S_READS = AOT_S_READS, S_WRITES = AOT_S_WRITES, S_REGIONS = AOT_S_REGIONS };
+ inline void count(int i) { __atomic_fetch_add(&g_stats[i], 1, __ATOMIC_RELAXED); }   // guest threads run the lifted code at once
+ 
++[[noreturn]] void fail(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+ [[noreturn]] void fail(const char *fmt, ...) {
+     va_list ap; va_start(ap, fmt); vsnprintf(g_err, sizeof g_err, fmt, ap); va_end(ap);
+     if (!g_jb) { fprintf(stderr, "[RED] aot: %s (outside aot_run)\n", g_err); abort(); }
+@@ -40,12 +40,32 @@ uint8_t *guest(uint64_t a, uint64_t n, const char *what) {
+     fail("guest %s of %llu bytes at %#llx is outside every mapped region", what, (unsigned long long)n, (unsigned long long)a);
+ }
+ 
+-AotFn find(uint64_t pc) {
++}  // namespace
++
++extern "C" {
++AotFallback aot_fallback;
++AotWriteHook aot_write_hook;
++AotFn aot_find(uint64_t pc) {
+     unsigned lo = 0, hi = aot_table_n;
+     while (lo < hi) { unsigned m = (lo + hi) / 2; if (aot_table[m].addr < pc) lo = m + 1; else hi = m; }
+     return lo < aot_table_n && aot_table[lo].addr == pc ? aot_table[lo].fn : nullptr;
+ }
+-}  // namespace
++uint8_t *aot_guest_ptr(uint64_t a, uint64_t n) {
++    for (const Region &r : g_regions) if (a >= r.base && n <= r.size && a - r.base <= r.size - n) return r.host + (a - r.base);
++    return nullptr;
++}
++void aot_fail(const char *fmt, ...) {
++    va_list ap; va_start(ap, fmt); vsnprintf(g_err, sizeof g_err, fmt, ap); va_end(ap);
++    if (!g_jb) { fprintf(stderr, "[RED] aot: %s (outside aot_run)\n", g_err); abort(); }
++    longjmp(*g_jb, 1);
++}
++void aot_count(int stat) { count(stat); }
++int aot_try_call(AotFn f, State *st, uint64_t pc, Memory *m, char *err, uint64_t errn) {
++    jmp_buf jb, *outer = g_jb; g_jb = &jb;
++    if (setjmp(jb)) { g_jb = outer; snprintf(err, errn, "%s", g_err); return 1; }
++    f(st, pc, m); g_jb = outer; return 0;
++}
++}
+ 
+ extern "C" {
+ bool __remill_flag_computation_sign(bool r, ...) { return r; }
+@@ -57,7 +77,7 @@ COMPARE(eq) COMPARE(neq) COMPARE(slt) COMPARE(sle) COMPARE(sgt) COMPARE(sge) COM
+ 
+ #define ACCESS(N, T) \
+     T __remill_read_memory_##N(Memory *, uint64_t a) { T v; memcpy(&v, guest(a, sizeof(T), "read"), sizeof v); count(S_READS); return v; } \
+-    Memory *__remill_write_memory_##N(Memory *m, uint64_t a, T v) { memcpy(guest(a, sizeof(T), "write"), &v, sizeof v); count(S_WRITES); return m; }
++    Memory *__remill_write_memory_##N(Memory *m, uint64_t a, T v) { memcpy(guest(a, sizeof(T), "write"), &v, sizeof v); count(S_WRITES); if (aot_write_hook) aot_write_hook(a, sizeof(T)); return m; }
+ ACCESS(8, uint8_t) ACCESS(16, uint16_t) ACCESS(32, uint32_t) ACCESS(64, uint64_t)
+ 
+ // Atomics. An exclusive store (stxr, stlxr) is a compare-and-swap against the value the exclusive load read (the Remill patch keeps it in MONITOR_VALUE), so it fails when another thread wrote
+@@ -66,7 +86,7 @@ ACCESS(8, uint8_t) ACCESS(16, uint16_t) ACCESS(32, uint32_t) ACCESS(64, uint64_t
+     Memory *__remill_compare_exchange_memory_##N(Memory *m, uint64_t a, T &expected, T desired) { \
+         if (a % sizeof(T)) fail("atomic access of %u bytes at %#llx is not naturally aligned", (unsigned)sizeof(T), (unsigned long long)a); \
+         __atomic_compare_exchange_n((T *)guest(a, sizeof(T), "atomic access"), &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); \
+-        count(S_WRITES); return m; }
++        count(S_WRITES); if (aot_write_hook) aot_write_hook(a, sizeof(T)); return m; }
+ CAS(8, uint8_t) CAS(16, uint16_t) CAS(32, uint32_t) CAS(64, uint64_t)
+ Memory *__remill_atomic_begin(Memory *m) { return m; }   // the CAS above is the atomic operation; these only bracket the instruction
+ Memory *__remill_atomic_end(Memory *m) { return m; }
+@@ -81,15 +101,17 @@ Memory *__remill_function_return(State &, uint64_t, Memory *m) { return m; }   /
+ 
+ Memory *__remill_function_call(State &st, uint64_t pc, Memory *m) {   // blr
+     count(S_CALLS);
+-    if (AotFn f = find(pc)) return f(&st, pc, m);
++    if (AotFn f = aot_find(pc)) return f(&st, pc, m);
+     count(S_FALLBACK);
++    if (aot_fallback) return aot_fallback(&st, pc, m, 0);
+     fail("indirect call to %#llx: not the entry of an AOT function, and no JIT fallback yet", (unsigned long long)pc);
+ }
+ 
+ Memory *__remill_jump(State &st, uint64_t pc, Memory *m) {   // br: a tail call, so the target must be a function entry too
+     count(S_JUMPS);
+-    if (AotFn f = find(pc)) return f(&st, pc, m);
++    if (AotFn f = aot_find(pc)) return f(&st, pc, m);
+     count(S_FALLBACK);
++    if (aot_fallback) return aot_fallback(&st, pc, m, 1);
+     fail("indirect jump to %#llx: not the entry of an AOT function (a jump table inside a function is not supported yet), and no JIT fallback yet", (unsigned long long)pc);
+ }
+ 
+@@ -101,7 +123,7 @@ void aot_map(uint64_t base, uint64_t size) {
+     g_regions.push_back({base, size, (uint8_t *)calloc(1, size)}); g_stats[S_REGIONS]++;
+ }
+ void aot_unmap_all() { for (Region &r : g_regions) free(r.host); g_regions.clear(); }
+-int aot_poke(uint64_t a, const uint8_t *src, uint64_t n) { jmp_buf jb; if (setjmp(jb)) return 1; g_jb = &jb; memcpy(guest(a, n, "poke"), src, n); g_jb = nullptr; return 0; }
++int aot_poke(uint64_t a, const uint8_t *src, uint64_t n) { jmp_buf jb; if (setjmp(jb)) return 1; g_jb = &jb; memcpy(guest(a, n, "poke"), src, n); g_jb = nullptr; if (aot_write_hook) aot_write_hook(a, n); return 0; }
+ int aot_peek(uint64_t a, uint8_t *dst, uint64_t n) { jmp_buf jb; if (setjmp(jb)) return 1; g_jb = &jb; memcpy(dst, guest(a, n, "peek"), n); g_jb = nullptr; return 0; }
+ uint64_t aot_stat(int i) { return g_stats[i]; }
+ void aot_stats_reset() { memset(g_stats, 0, sizeof g_stats); }
+@@ -118,7 +140,7 @@ int aot_run(Guest *g, uint64_t pc, char *err, uint64_t errn) {
+     if (setjmp(jb)) rc = 1;
+     else {
+         g_jb = &jb;
+-        AotFn f = find(pc);
++        AotFn f = aot_find(pc);
+         if (!f) fail("no AOT function at %#llx", (unsigned long long)pc);
+         f(&st, pc, reinterpret_cast<Memory *>(&g_stats));   // the Memory token is never dereferenced: the regions are global
+     }
+diff --git a/dm/tools/aot_runtime.h b/dm/tools/aot_runtime.h
+new file mode 100644
+index 0000000..3c769a4
+--- /dev/null
++++ b/dm/tools/aot_runtime.h
+@@ -0,0 +1,25 @@
++// What aot_runtime.cpp shares with aot_jit.cpp (the dynarmic fallback): guest memory access, the AOT function table, the error path and the counters.
++#pragma once
++#include "remill/Arch/AArch64/Runtime/State.h"
++#include <cstdint>
++
++typedef Memory *(*AotFn)(State *, uint64_t, Memory *);
++// Statistics, in the order aot_lift.py names them (STATS)
++enum { AOT_S_CALLS, AOT_S_JUMPS, AOT_S_FALLBACK, AOT_S_READS, AOT_S_WRITES, AOT_S_REGIONS,
++       AOT_S_JIT_ENTRIES, AOT_S_JIT_TO_AOT, AOT_S_JIT_INVALIDATIONS, AOT_S_JIT_PAGES, AOT_S_N };
++
++extern "C" {
++AotFn aot_find(uint64_t pc);                                  // the AOT function whose entry is pc, or null
++uint8_t *aot_guest_ptr(uint64_t a, uint64_t n);               // host pointer to n guest bytes at a, or null when they are not all inside one mapped region
++[[noreturn]] void aot_fail(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   // leave the lifted code with an error (aot_run reports it)
++void aot_count(int stat);
++uint64_t aot_stat(int stat);
++// Run an AOT function and catch its error: 0 when it returned, else 1 with the reason in err (the caller then cleans up and fails in its turn)
++int aot_try_call(AotFn f, State *st, uint64_t pc, Memory *m, char *err, uint64_t errn);
++// The JIT fallback: when an indirect call or jump targets no AOT function, aot_fallback (if set) runs it. is_jump: a `br` (a tail call) rather than a `blr`.
++typedef Memory *(*AotFallback)(State *, uint64_t pc, Memory *, int is_jump);
++extern AotFallback aot_fallback;
++// Called after any write to guest memory by AOT code or the harness, so that the JIT can drop the code it compiled from those bytes
++typedef void (*AotWriteHook)(uint64_t addr, uint64_t n);
++extern AotWriteHook aot_write_hook;
++}
+diff --git a/dm/tools/tests/test_aot_jit.py b/dm/tools/tests/test_aot_jit.py
+new file mode 100644
+index 0000000..2c361c6
+--- /dev/null
++++ b/dm/tools/tests/test_aot_jit.py
+@@ -0,0 +1,202 @@
++"""T4, the JIT fallback (aot_jit.cpp, dynarmic): code the AOT translator never saw runs in the JIT when AOT code reaches it by an indirect call or jump, and everything the JIT does is counted, logged and limited.
++  · AOT, JIT and the Unicorn ARM64 reference agree on registers, NZCV, sp and memory;
++  · code generated at run time runs, and recompiles when the guest rewrites it (stores by AOT code, by JIT code and by the harness);
++  · JIT code can call an AOT function and come back; an AOT function can call JIT code;
++  · budgets (entries, cycles, depth), no code at an address, an access outside guest memory, `svc` and the like are explicit errors naming the address;
++  · several host threads use the JIT at once, one dynarmic instance each.
++Needs REMILL_BUILD, DYNARMIC_DIR (dynarmic built with CMAKE_POSITION_INDEPENDENT_CODE=ON), clang++ and unicorn; skipped otherwise."""
++import itertools, os, struct, sys, threading, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_fixture as fx
++import arm64_ref as ref
++from nso_asm import STP_PRE, LDP_POST, BLR, NOP
++from test_aot_t3 import DATA, DATA_SIZE, MEM, SP, READY, same
++
++READY = READY and os.path.exists(os.path.join(os.environ.get('DYNARMIC_DIR', '/nonexistent'), 'build/src/dynarmic/libdynarmic.a'))
++RET, M = aot_lift.RET, ref.MASK
++SLOT, CALL, SPIN, SVC5, BADREAD, RETONLY, COUNT, PATCHME = 0x240, 0x200, 0x280, 0x2A0, 0x2C0, 0x2E0, 0x300, 0x400   # generated code, in the code region at 0
++
++
++def b_to(frm, to): return fx.B(frm, to)
++
++
++def image():
++    """The code region: the fixture's text at 0, then the code a game would have generated"""
++    words, ranges, _ = fx.text_layout()
++    img = bytearray(0x1000)
++    def put(at, ws): img[at:at + 4 * len(ws)] = struct.pack('<%dI' % len(ws), *ws)
++    put(0, words)
++    put(CALL, [STP_PRE(29, 30, 31, -16), fx.BL(CALL + 4, ranges['branch'][0]), LDP_POST(29, 30, 31, 16), RET])   # calls `branch`, which is an AOT function in the second library
++    put(SLOT, [NOP, RET])                                                                                           # the word at SLOT is rewritten by patchme
++    put(SPIN, [b_to(SPIN, SPIN)])                                                                                   # b .
++    put(SVC5, [fx.SVC(5), RET])
++    put(BADREAD, [0xF9400080, RET])                                                                                 # ldr x0, [x4]
++    put(RETONLY, [RET])
++    put(COUNT, [0xC85FFC04, 0x91000484, 0xC805FC04, 0x35000005 | ((-3 & 0x7FFFF) << 5), fx.SUBSI(3, 3, 1), fx.BCOND(COUNT + 20, COUNT, 1), RET])   # x0: counter; x3: times
++    # patchme: store the word x1 at [x0] (code!), call it, return
++    put(PATCHME, [STP_PRE(29, 30, 31, -16), 0xB9000001, BLR(0), LDP_POST(29, 30, 31, 16), RET])
++    return bytes(img), ranges
++
++
++IMG, RANGES = image()
++MEM_AOT = {**MEM, 0: IMG}   # the AOT side maps the code region too: the JIT reads its code from guest memory
++
++
++def make(aot_names=('indirect',), extra=(), **kw):
++    funcs = [(RANGES[n][0], IMG[RANGES[n][0]:RANGES[n][1]]) for n in aot_names] + list(extra)
++    a = aot_lift.Aot(funcs, jit=True, **kw)
++    for b, data in MEM_AOT.items(): a.map(b, len(data), data)
++    return a
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD, DYNARMIC_DIR (dynarmic built with -DCMAKE_POSITION_INDEPENDENT_CODE=ON), clang++ and unicorn')
++class Jit(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.patch_code = IMG[PATCHME:PATCHME + 20]
++        cls.aot = make(('indirect',), [(PATCHME, cls.patch_code)])      # arith, branch and the generated code are not AOT functions here: the JIT takes them
++
++    @classmethod
++    def tearDownClass(cls): cls.aot.close()
++
++    def entry(self): return RANGES['indirect'][0]
++
++    def run_aot(self, a, regs, nz=0, entry=None):
++        a.reset()
++        return a.run(entry or self.entry(), dict(regs, x30=ref.STOP), nz, SP)
++
++    def reference(self, cases, entry=None):
++        return ref.run_image(IMG, entry or self.entry(), [(r, n, SP) for r, n in cases], MEM)
++
++    def test_unknown_functions_run_in_the_jit_and_equal_the_reference(self):
++        """indirect: blr x1 (branch) then br x2 (a tail call to arith): neither is an AOT function here"""
++        cases = [({'x0': v, 'x1': RANGES['branch'][0], 'x2': RANGES['arith'][0]}, nz) for v in (0, 1, 5, M, 1 << 63) for nz in (0, 6)]
++        for (regs, nz), want in zip(cases, self.reference(cases)):
++            self.assertNotIn('fault', want)
++            same(self, self.run_aot(self.aot, regs, nz), want, f'x0={regs["x0"]:#x} nzcv={nz:04b}')
++
++    def test_every_entry_is_counted_and_logged(self):
++        a = make(('indirect',))
++        try:
++            self.run_aot(a, {'x0': 1, 'x1': RANGES['branch'][0], 'x2': RANGES['arith'][0]})
++            self.assertEqual((a.stat('jit_entries'), a.stat('jit_to_aot'), a.stat('fallback_requests')), (2, 0, 2))
++            log = a.jit_log().splitlines()
++            self.assertEqual(len(log), 2)
++            self.assertIn(f'pc={RANGES["branch"][0]:#x} call count=1', log[0]); self.assertIn(f'pc={RANGES["arith"][0]:#x} jump count=1', log[1])
++            self.assertGreaterEqual(a.stat('jit_pages'), 1)
++        finally: a.close()
++
++    def test_jump_into_the_middle_of_a_function_runs_in_the_jit(self):
++        """The AOT build refuses it (test_aot_t3); with the JIT the original code in guest memory runs, and must equal the reference"""
++        cases = [({'x0': v, 'x1': RANGES['branch'][0], 'x2': RANGES['arith'][0] + 4, 'x3': 5}, 0) for v in (0, 3, M)]
++        for (regs, nz), want in zip(cases, self.reference(cases)):
++            self.assertNotIn('fault', want)
++            same(self, self.run_aot(self.aot, regs, nz), want, f'x0={regs["x0"]:#x}')
++
++    def test_generated_code_runs_and_is_recompiled_when_rewritten(self):
++        """patchme stores the word x1 at SLOT then calls SLOT: the same JIT'd page changes under it, three times"""
++        a = self.aot
++        for word, want in ((fx.MOVZ(0, 7), 7), (fx.MOVZ(0, 9), 9), (fx.MOVZ(0, 7), 7), (fx.MOVZ(0, 0x123), 0x123)):
++            got = a.run(PATCHME, {'x0': SLOT, 'x1': word, 'x30': ref.STOP}, 0, SP)   # no reset: the code written before is still there
++            self.assertNotIn('fault', got)
++            self.assertEqual(got['x0'], want, 'the JIT ran stale code')
++        self.assertGreaterEqual(a.stat('jit_invalidations'), 3)
++        a.reset()
++
++    def test_generated_code_equals_the_reference(self):
++        for word in (fx.MOVZ(0, 7), fx.MOVZ(0, 9), 0x91000400):   # mov x0,#7 ; mov x0,#9 ; add x0,x0,#1
++            regs = {'x0': SLOT, 'x1': word}
++            want = self.reference([(regs, 0)], PATCHME)[0]
++            self.assertNotIn('fault', want)
++            same(self, self.run_aot(self.aot, regs, 0, PATCHME), want, f'word {word:#x}')
++
++    def test_the_harness_rewriting_code_also_invalidates(self):
++        """aot_poke (how a harness, and later the loader, writes guest memory) tells the JIT too: SLOT is rewritten between calls, with no store by guest code"""
++        a = make(('indirect',))
++        try:
++            for imm in (11, 12, 13):
++                a.lib.aot_poke(SLOT, struct.pack('<I', fx.MOVZ(0, imm)), 4)
++                self.assertEqual(a.run(self.entry(), {'x1': SLOT, 'x2': RETONLY, 'x30': ref.STOP}, 0, SP)['x0'], imm)
++            self.assertGreaterEqual(a.stat('jit_invalidations'), 2)
++        finally: a.close()
++
++    def test_jit_code_can_call_an_aot_function_and_come_back(self):
++        """CALL (generated) does `bl branch`; here `branch` and `arith` are AOT functions, so that bl leaves the JIT for the AOT code and returns"""
++        a = make(('indirect', 'branch', 'arith'))
++        try:
++            cases = [({'x0': v, 'x1': CALL, 'x2': RANGES['arith'][0]}, 0) for v in (0, 1, 7, M)]
++            for (regs, nz), want in zip(cases, self.reference(cases)):
++                self.assertNotIn('fault', want)
++                a.lib.aot_stats_reset()
++                same(self, self.run_aot(a, regs, nz), want, f'x0={regs["x0"]:#x}')
++                self.assertEqual((a.stat('jit_entries'), a.stat('jit_to_aot')), (1, 1))
++            self.assertIn('jit->aot count=', a.jit_log())
++        finally: a.close()
++
++    def test_a_cycle_budget_stops_a_loop_with_no_exit(self):
++        a = make(('indirect',), jit_ticks=200_000)
++        try:
++            got = self.run_aot(a, {'x1': SPIN, 'x2': RANGES['branch'][0]})
++            self.assertIn('JIT budget exceeded', got['fault']); self.assertIn(f'{SPIN:#x}', got['fault'])
++        finally: a.close()
++
++    def test_an_entry_budget_limits_the_jit(self):
++        a = make(('indirect',), jit_entries=1)
++        try:
++            got = self.run_aot(a, {'x1': RANGES['branch'][0], 'x2': RANGES['arith'][0]})   # blr is the first entry, br the second
++            self.assertIn('JIT budget exceeded', got['fault']); self.assertIn('1 entries', got['fault']); self.assertIn(f'{RANGES["arith"][0]:#x}', got['fault'])
++            self.assertEqual(a.stat('jit_entries'), 1)
++        finally: a.close()
++
++    def test_no_code_at_the_target_is_an_explicit_error(self):
++        got = self.run_aot(self.aot, {'x1': 0x12345678, 'x2': RANGES['branch'][0]})
++        self.assertIn('0x12345678', got['fault']); self.assertIn('no code to run', got['fault'])
++
++    def test_access_outside_guest_memory_in_jit_code(self):
++        ok = self.run_aot(self.aot, {'x1': BADREAD, 'x2': RETONLY, 'x4': DATA})   # a control: the same code reading mapped memory
++        self.assertNotIn('fault', ok)
++        got = self.run_aot(self.aot, {'x1': BADREAD, 'x2': RETONLY, 'x4': 0x5000})
++        self.assertIn('JIT: read of 8 bytes at 0x5000', got['fault'])
++
++    def test_svc_in_jit_code_is_an_explicit_error_until_t5(self):
++        got = self.run_aot(self.aot, {'x1': SVC5, 'x2': RANGES['branch'][0]})
++        self.assertIn('svc #5', got['fault']); self.assertIn('T5', got['fault'])
++
++    def test_threads_use_the_jit_at_once(self):
++        a = make(('indirect',))
++        try:
++            want = a.run(self.entry(), {'x0': 3, 'x1': RANGES['branch'][0], 'x2': RANGES['arith'][0], 'x30': ref.STOP}, 0, SP)['x0']
++            bad = []
++            def work():
++                for _ in range(200):
++                    r = a.run(self.entry(), {'x0': 3, 'x1': RANGES['branch'][0], 'x2': RANGES['arith'][0], 'x30': ref.STOP}, 0, SP)
++                    if r.get('x0') != want: bad.append(r.get('fault') or r['x0'])
++            ts = [threading.Thread(target=work) for _ in range(4)]
++            for t in ts: t.start()
++            for t in ts: t.join()
++            self.assertEqual(bad, [])
++            self.assertEqual(a.stat('jit_entries'), 2 + 4 * 200 * 2)   # the reference run enters twice (blr, br), then each of 800 runs does
++        finally: a.close()
++
++    def test_exclusive_counter_loop_in_the_jit_loses_no_update(self):
++        """The ldaxr/stlxr loop at COUNT is JIT code: dynarmic's exclusive monitor and the compare-and-swap callbacks must keep four threads exact"""
++        a = make(('indirect',))
++        try:
++            start = struct.unpack_from('<Q', MEM[DATA], 0x80)[0]; errs = []
++            def work():
++                r = a.run(self.entry(), {'x0': DATA + 0x80, 'x3': 20000, 'x1': COUNT, 'x2': RANGES['branch'][0], 'x30': ref.STOP}, 0, SP)
++                if 'fault' in r: errs.append(r['fault'])
++            ts = [threading.Thread(target=work) for _ in range(4)]
++            for t in ts: t.start()
++            for t in ts: t.join()
++            self.assertEqual(errs, [])
++            self.assertEqual(struct.unpack_from('<Q', a.peek(DATA, DATA_SIZE), 0x80)[0] - start, 4 * 20000)
++        finally: a.close()
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/dm/tools/tests/test_aot_t3.py b/dm/tools/tests/test_aot_t3.py
+index bc2433a..04e1c70 100644
+--- a/dm/tools/tests/test_aot_t3.py
++++ b/dm/tools/tests/test_aot_t3.py
+@@ -39,7 +39,7 @@ def same(test, a, b, what):
+     test.assertEqual(('fault' in a), ('fault' in b), f'{what}: one run faulted, the other did not: {a.get("fault")!r} / {b.get("fault")!r}')
+     if 'fault' in a: return
+     for k in [f'x{i}' for i in range(31)] + ['sp', 'nzcv']: test.assertEqual(a[k], b[k], f'{what}: {k}: {a[k]:#x} != {b[k]:#x}')
+-    for base in a['mem']:
++    for base in b['mem']:   # the regions the reference knows (the AOT side may map more, such as a code region)
+         if a['mem'][base] != b['mem'][base]:
+             off = next(i for i, (p, q) in enumerate(zip(a['mem'][base], b['mem'][base])) if p != q)
+             test.fail(f'{what}: memory differs at {base + off:#x}: {a["mem"][base][off]:#04x} != {b["mem"][base][off]:#04x}')

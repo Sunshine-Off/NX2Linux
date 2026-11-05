@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Wed, 4 Nov 2026 22:58:04 +0100
+Subject: [PATCH] docs/linux/architecture.md: the stages, the host, the team
+ decisions and the state of NX2Linux
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: NX2Linux architecture page: Linux only, nothing for upstream
+Issue: Sunshine-Off/NX2Linux#1
+
+---
+ docs/linux/architecture.md | 70 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 70 insertions(+)
+ create mode 100644 docs/linux/architecture.md
+
+diff --git a/docs/linux/architecture.md b/docs/linux/architecture.md
+new file mode 100644
+index 0000000..d26b4c1
+--- /dev/null
++++ b/docs/linux/architecture.md
+@@ -0,0 +1,70 @@
++# NX2Linux architecture
++
++NX2Linux runs Nintendo Switch games natively on Linux x86_64. It is the Linux work of this fork of NX2Apple. This page says how the Linux path is built and which decisions fix it. It describes the state of 2026-11-04. Where a fact could not be checked it says "unknown".
++
++## What it does
++
++A Switch game is ARM64 code. NX2Linux does not emulate it instruction by instruction. It translates the game ahead of time, then runs the result next to a host that replaces the Switch's operating system and GPU:
++
++```
++game package (NSP/XCI)  --extract-->  ExeFS modules + RomFS image
++   --convert-->  relocated module images and a versioned JSON manifest
++   --recompile-->  x86_64 code (Remill/LLVM), with a dynarmic JIT as fallback
++   --run-->  Python host + C libraries: services, Vulkan, audio, input, movies
++```
++
++Nothing of a game is stored in the repository. Recompiled code is derived from the game and cannot be distributed.
++
++## The stages
++
++| Stage | What | Where |
++|---|---|---|
++| Extract | `nx_extract` (.NET) reads the package with your own `prod.keys` and writes ExeFS and a RomFS image into the XDG cache, never inside the repository | `nx2linux extract`, `nx_extract.csproj` |
++| Convert | `elf_module.py` reads the NSO directly, applies relocations and writes a module image and a JSON manifest | `engine/dm/tools/elf_module.py` |
++| Recompile | `aot_lift.py` lifts AArch64 to LLVM IR with Remill (patched, see below) and builds x86_64 code. Functions Remill cannot lift fall back to dynarmic at run time. `jump_tables.py` recovers indirect jump targets | `engine/dm/tools/aot_lift.py`, `aot_runtime.cpp`, `aot_jit.cpp` |
++| Survey | How every function is handled: lifted, replaced by the host, JIT, not translated and why | `nx2linux survey`, `engine/dm/tools/survey.py` |
++| Run | `horizon_run.py` loads the modules and serves the Horizon OS calls | `engine/dm/tools/horizon_*.py` |
++
++## The host
++
++The host is a Python program with C libraries. It is not a C program under `dm/host/linux/`.
++
++- Python `horizon_*.py` implement the OS services (threads, fibres, SVC, file system, HID, time, account, display, audio) and the NVN graphics API. `nvn_*.py` record and replay NVN commands and translate shaders to SPIR-V.
++- C libraries built from `linux/host/`: `libnx2linux_display.so` (SDL3 window and events), `libnx2linux_gpu.so` (Vulkan renderer), `libnx2linux_audio.so` (mixing and output), `libnx2linux_movie.so` (VP8/VP9 by libvpx, Vorbis by stb_vorbis). They are built by CMake in `build-host` under `~/.cache/nx2linux`.
++- Games that render with OpenGL use `gl_vulkan.c`, a GL 4.5 core context that Mesa Zink runs on Vulkan. It is not connected to a game's imports yet (see Balatro below).
++
++## Decisions
++
++These were taken by the team on 2026-11-04.
++
++1. **Target.** Any Switch game in the long run. Xenoblade Chronicles 2 (0100E95004038000) is the only test game for now. Balatro and its GL layer come later.
++2. **Host.** Keep the Python host with the C libraries and move the hot paths to C step by step. Reason: lowest risk, and the patches, their tests and the Xenoblade results rest on it. The measured bottleneck is the Python bridge under the GIL (thread synchronisation), not the language as a whole, so C fast paths for the synchronisation calls come first.
++3. **Toolchain.** `tools/setup_toolchain.sh` is the official way to get Remill (patched), dynarmic and the Python venv. It is Fedora-oriented today and must work on any Linux in the long run (tracked separately).
++4. **`engine/` is synchronised, not tracked.** `python3 tools/engine.py sync` builds it from seedds/nxnative at `.upstream-ref` plus `patches/`. Changes are committed in `engine/` and exported as patches with `tools/engine.py export`.
++5. **Language.** Issues and new documents are in English.
++
++## Where things live
++
++| Path | Content |
++|---|---|
++| `linux/host/` | SDL3 and Vulkan C sources, CMake build and tests |
++| `linux/cli/nx2linux.py` | Command line: `doctor`, `build`, `run`, `verify`, `extract`, `survey`, `smoke` |
++| `frontend-qt/` | Qt front end. On Linux it drives `doctor`, `build`, `verify` and the Vulkan demo only. It has no path from game choice to launch yet |
++| `engine/dm/tools/` | Recompiler, host services, NVN, tests (`tests/`) |
++| `engine/dm/games/<title id>/` | Per game profile. A game specific fix lives here |
++| `patches/` | The patch queue on top of upstream |
++| `fork en cours/` | Working notes of the Linux milestones. Not part of the product |
++| `tools/setup_toolchain.sh` | Builds the pinned toolchain outside the repository |
++
++Remill patches 0001 to 0009 are in `fork en cours/remill-patches/` and applied by `setup_toolchain.sh` at Remill commit 56918a8. dynarmic is pinned at a466015, LLVM at 22.x.
++
++## State
++
++- Verified by running the tests (2026-11-04): the engine tests of the Linux path, the Qt, tools and CLI suites, and `engine.py check` (the queue applies to the pin).
++- Reported by the milestone notes and not rerun for this page: Xenoblade Chronicles 2 reaches the first battle with GPU rendering, input, mixed audio, journalled saves and decoded VP9 movies at about 12 to 15 frames per second against a target of 30. Its recompilation costs about 25 minutes and 12 GB of cache. To confirm, rerun it with the game.
++- Balatro is recompiled but does not display.
++- Not done: a user path from package to running game, any CI that builds the Linux host, a distributable package, validation on a GPU other than NVIDIA.
++
++## Platform split of the patches
++
++Patches fall into common (useful to Apple and Linux), Apple only and Linux. The classification is tracked in issue 2 of the NX2Linux repository.

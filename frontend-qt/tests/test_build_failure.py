@@ -53,7 +53,10 @@ class BuildFailure(unittest.TestCase):
         w = MainWindow(m)
         # Delete while the app exists: PySide destroys leftovers after it at exit and segfaults.
         self.addCleanup(self._delete, m, w)
-        w.resize(900, height)
+        # Some compositors and high-DPI configurations ignore a resize of a top-level test window
+        # and leave the offscreen viewport larger than the requested window. Fixed size makes the
+        # short-window precondition deterministic without changing production layout behavior.
+        w.setFixedSize(900, height)
         w.show()
         for _ in range(3):
             self.app.processEvents()

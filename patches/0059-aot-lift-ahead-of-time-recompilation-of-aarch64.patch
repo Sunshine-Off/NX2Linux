@@ -1,0 +1,616 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 1 Nov 2026 14:19:02 +0100
+Subject: [PATCH] aot_lift: ahead-of-time recompilation of AArch64 functions to
+ x86_64 with Remill, branches, memory and calls
+
+aot_lift.py lifts each function with remill-lift, generates the table of their addresses and builds one
+shared library with aot_runtime.cpp: bounded guest memory (an access outside it is an explicit error),
+indirect calls and jumps through the table (an unknown target is counted as a fallback request and stops
+with its address until a JIT exists), direct bl as a linked call. An instruction Remill cannot lift is a
+LiftError (address, word, text), an intrinsic the runtime lacks a LinkError.
+Tests compare the fixture's branch, loop, nested-call and indirect functions, and 36 load/store forms
+(unaligned, pre/post-indexed, pairs, sign extension), with the Unicorn AArch64 reference on all
+registers, NZCV, sp and the guest memory. Skipped without REMILL_BUILD or unicorn.
+
+Upstream-Status: pending
+Reason: T3 of an AArch64 -> x86_64 recompilation (NX2Linux); new tool, runtime and tests, nothing in the host, loader or shader chain changes
+Issue: none yet (NX2Linux, branch feat/teo-t3-branches-memoire-appels)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dm/tools/aot_lift.py                  | 133 ++++++++++++++++++++++++++
+ dm/tools/aot_runtime.cpp              | 114 ++++++++++++++++++++++
+ dm/tools/tests/arm64_ref.py           |  35 ++++++-
+ dm/tools/tests/test_aot_memory.py     | 104 ++++++++++++++++++++
+ dm/tools/tests/test_aot_t3.py         | 113 ++++++++++++++++++++++
+ dm/tools/tests/test_recompile_insn.py |  13 +--
+ 6 files changed, 498 insertions(+), 14 deletions(-)
+ create mode 100644 dm/tools/aot_lift.py
+ create mode 100644 dm/tools/aot_runtime.cpp
+ create mode 100644 dm/tools/tests/test_aot_memory.py
+ create mode 100644 dm/tools/tests/test_aot_t3.py
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+new file mode 100644
+index 0000000..dc96694
+--- /dev/null
++++ b/dm/tools/aot_lift.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python3
++"""Ahead-of-time recompilation of AArch64 functions to x86_64 (NX2Linux T3): each function is lifted to LLVM IR by Remill's remill-lift, compiled by clang++ with the host runtime (aot_runtime.cpp)
++and a generated table of the functions' addresses, into one shared library that Aot wraps for ctypes.
++  · the lifter is an existing brick (Remill); this file only drives it. REMILL_BUILD is Remill's build folder (bin/lift/remill-lift-*); REMILL_SRC its source folder (default: REMILL_BUILD/..)
++  · a function Remill cannot lift (its IR calls __remill_error) is a LiftError naming the address, the word and the instruction; an intrinsic the runtime does not define (svc, floating point...)
++    is a LinkError naming the symbols (the library is linked with --no-undefined): nothing is translated approximately
++  · what a direct `bl` or `b` reaches is resolved by the linker (sub_<address>); an indirect call or jump goes through the runtime's table (aot_runtime.cpp)
++Usage as a module (tests/test_aot_t3.py): Aot([(address, code bytes)]) then .map(), .run(pc, regs) and .stat()."""
++import ctypes, glob, itertools, os, re, struct, subprocess, tempfile
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++RET = 0xD65F03C0
++STATS = ('indirect_calls', 'indirect_jumps', 'fallback_requests', 'reads', 'writes', 'regions')
++
++
++class LiftError(Exception):
++    pass
++
++
++class LinkError(Exception):
++    pass
++
++
++def lifter():
++    """remill-lift of the Remill build named by REMILL_BUILD, or None"""
++    b = os.environ.get('REMILL_BUILD')
++    return next(iter(sorted(glob.glob(os.path.join(b, 'bin/lift/remill-lift-*')))), None) if b else None
++
++
++def include_dir():
++    return os.environ.get('REMILL_SRC', os.path.join(os.environ['REMILL_BUILD'], '..'))
++
++
++def _disasm(word, address):
++    try:
++        import capstone
++        i = next(capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM).disasm(struct.pack('<I', word), address))
++        return f'{i.mnemonic} {i.op_str}'.strip()
++    except Exception:
++        return '?'
++
++
++def _run_lift(code, address, ll):
++    subprocess.run([lifter(), '--arch', 'aarch64', '--address', hex(address), '--bytes', code.hex(), '--ir_out', ll], check=True, capture_output=True, text=True)
++    return '@__remill_error' in Path(ll).read_text()
++
++
++def lift(word, ll, address=0x1000):
++    """Lift one instruction (+ ret) to the IR file ll; LiftError when Remill has no semantics for it"""
++    if _run_lift(struct.pack('<2I', word, RET), address, ll):
++        raise LiftError(f'{address:#x}: {word:#010x} ({_disasm(word, address)}): Remill has no semantics for this instruction (the lifted code calls __remill_error)')
++
++
++def lift_function(code, address, ll):
++    """Lift the function whose bytes are code, at address, to ll; LiftError naming the first instruction Remill cannot lift"""
++    if not _run_lift(code, address, ll): return
++    scratch = ll + '.insn.ll'
++    for i, (w,) in enumerate(struct.iter_unpack('<I', code)):
++        try: lift(w, scratch, address + 4 * i)
++        except LiftError as e: raise LiftError(f'function {address:#x}: {e}') from None
++    raise LiftError(f'function {address:#x}: Remill could not lift it (its IR calls __remill_error), though each instruction lifts alone: a control flow it does not follow')
++
++
++_counter = itertools.count()
++
++
++class Aot:
++    def __init__(self, functions, tmp=None):
++        """functions: [(address, bytes)]; builds and loads the library. LiftError / LinkError otherwise"""
++        self.dir = tempfile.TemporaryDirectory() if tmp is None else None
++        d = tmp or self.dir.name
++        n = next(_counter)
++        lls = []
++        for addr, code in functions:
++            ll = os.path.join(d, f'f{n}_{addr:x}.ll'); lift_function(code, addr, ll); lls.append(ll)
++        table = os.path.join(d, f'table{n}.cpp')
++        rows = sorted(a for a, _ in functions)
++        Path(table).write_text('#include "remill/Arch/AArch64/Runtime/State.h"\n#include <cstdint>\n'
++                               + ''.join(f'extern "C" Memory *sub_{a:x}(State *, uint64_t, Memory *);\n' for a in rows)
++                               + 'struct AotEntry { uint64_t addr; Memory *(*fn)(State *, uint64_t, Memory *); };\n'
++                               + 'extern "C" const AotEntry aot_table[] = {' + ', '.join(f'{{{a:#x}, sub_{a:x}}}' for a in rows) + '};\n'
++                               + f'extern "C" const unsigned aot_table_n = {len(rows)};\n')
++        so = os.path.join(d, f'aot{n}.so')   # one path per library: dlopen of a path already loaded returns the old one
++        inc = include_dir()
++        r = subprocess.run(['clang++', '-O2', '-shared', '-fPIC', '-std=c++17', '-DADDRESS_SIZE_BITS=64', f'-I{inc}/include', f'-I{inc}', str(HERE / 'aot_runtime.cpp'), table, *lls, '-o', so, '-Wl,--no-undefined'],
++                           capture_output=True, text=True)
++        if r.returncode:
++            missing = sorted(set(re.findall(r'(?:undefined reference to|référence indéfinie vers) [«`\'"]*([A-Za-z_0-9]+)', r.stderr)))
++            if missing: raise LinkError('the runtime does not define: ' + ', '.join(missing) + ' (an instruction class not translated yet)')
++            raise LinkError('build failed:\n' + r.stderr[-2000:])
++        self.lib = ctypes.CDLL(so)
++        L = self.lib
++        L.aot_map.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
++        L.aot_poke.argtypes = [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
++        L.aot_peek.argtypes = [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
++        L.aot_stat.argtypes = [ctypes.c_int]; L.aot_stat.restype = ctypes.c_uint64
++        L.aot_run.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
++        self.regions = []
++
++    class _Guest(ctypes.Structure):
++        _fields_ = [('x', ctypes.c_uint64 * 31), ('sp', ctypes.c_uint64), ('nzcv', ctypes.c_uint64)]
++
++    def map(self, base, size, data=None):
++        self.lib.aot_map(base, size); self.regions.append((base, size, bytes(data) if data else bytes(size)))
++        self.reset()
++
++    def reset(self):
++        """Every region back to the contents it was mapped with (the guest memory is global: a run leaves its writes behind)"""
++        for b, _, data in self.regions: assert self.lib.aot_poke(b, data, len(data)) == 0
++
++    def peek(self, base, size):
++        buf = ctypes.create_string_buffer(size)
++        assert self.lib.aot_peek(base, buf, size) == 0
++        return buf.raw
++
++    def stat(self, name): return self.lib.aot_stat(STATS.index(name))
++
++    def run(self, pc, regs=None, nzcv=0, sp=0):
++        """Run the AOT function at pc. Returns {'x0'..'x30', 'sp', 'nzcv', 'mem': {base: bytes}} or {'fault': reason}"""
++        g = self._Guest()
++        for k, v in (regs or {}).items(): g.x[int(k[1:])] = v & (2 ** 64 - 1)
++        g.sp, g.nzcv = sp, nzcv
++        err = ctypes.create_string_buffer(300)
++        rc = self.lib.aot_run(ctypes.byref(g), pc, err, 300)
++        if rc: return {'fault': err.value.decode()}
++        out = {f'x{i}': g.x[i] for i in range(31)}; out['sp'] = g.sp; out['nzcv'] = g.nzcv
++        out['mem'] = {b: self.peek(b, n) for b, n, _ in self.regions}
++        return out
++
++    def close(self):
++        self.lib.aot_unmap_all()
++        if self.dir: self.dir.cleanup()
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+new file mode 100644
+index 0000000..38d5923
+--- /dev/null
++++ b/dm/tools/aot_runtime.cpp
+@@ -0,0 +1,114 @@
++// Host runtime of the ahead-of-time recompiled AArch64 code (NX2Linux T3). The functions Remill lifted (aot_lift.py) call the `__remill_*` intrinsics defined here:
++//   · guest memory: bounded regions, every access checked; an access outside them is an explicit error (address, size, read or write), never a host fault. Unaligned accesses are allowed, as on AArch64 normal memory.
++//   · indirect calls and jumps (blr, br): the target must be the entry of an AOT function in aot_table (generated); any other target is counted as a fallback request and is an explicit error until the JIT
++//     fallback (T4) takes it. A direct `bl` needs none of this: Remill lifted it into a call of sub_<address>, resolved at link time.
++//   · errors leave the lifted code by longjmp (its frames hold no destructors), and aot_run reports them as text.
++// ADDRESS_SIZE_BITS=64 and Remill's include folder are on the command line (aot_lift.py). Flag and compare intrinsics are markers whose first argument is already the value, as in remill_host.cpp.
++#include "remill/Arch/AArch64/Runtime/State.h"
++#include <csetjmp>
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++typedef Memory *(*AotFn)(State *, uint64_t, Memory *);
++struct AotEntry { uint64_t addr; AotFn fn; };
++extern "C" const AotEntry aot_table[];   // generated by aot_lift.py, sorted by address
++extern "C" const unsigned aot_table_n;
++
++namespace {
++struct Region { uint64_t base, size; uint8_t *host; };
++std::vector<Region> g_regions;
++thread_local jmp_buf *g_jb;
++thread_local char g_err[300];
++uint64_t g_stats[6];   // indirect calls, indirect jumps, fallback requests, memory reads, memory writes, regions mapped
++enum { S_CALLS, S_JUMPS, S_FALLBACK, S_READS, S_WRITES, S_REGIONS };
++
++[[noreturn]] void fail(const char *fmt, ...) {
++    va_list ap; va_start(ap, fmt); vsnprintf(g_err, sizeof g_err, fmt, ap); va_end(ap);
++    if (!g_jb) { fprintf(stderr, "[RED] aot: %s (outside aot_run)\n", g_err); abort(); }
++    longjmp(*g_jb, 1);
++}
++
++uint8_t *guest(uint64_t a, uint64_t n, const char *what) {
++    for (const Region &r : g_regions)
++        if (a >= r.base && n <= r.size && a - r.base <= r.size - n) return r.host + (a - r.base);
++    fail("guest %s of %llu bytes at %#llx is outside every mapped region", what, (unsigned long long)n, (unsigned long long)a);
++}
++
++AotFn find(uint64_t pc) {
++    unsigned lo = 0, hi = aot_table_n;
++    while (lo < hi) { unsigned m = (lo + hi) / 2; if (aot_table[m].addr < pc) lo = m + 1; else hi = m; }
++    return lo < aot_table_n && aot_table[lo].addr == pc ? aot_table[lo].fn : nullptr;
++}
++}  // namespace
++
++extern "C" {
++bool __remill_flag_computation_sign(bool r, ...) { return r; }
++bool __remill_flag_computation_zero(bool r, ...) { return r; }
++bool __remill_flag_computation_carry(bool r, ...) { return r; }
++bool __remill_flag_computation_overflow(bool r, ...) { return r; }
++#define COMPARE(n) bool __remill_compare_##n(bool r) { return r; }
++COMPARE(eq) COMPARE(neq) COMPARE(slt) COMPARE(sle) COMPARE(sgt) COMPARE(sge) COMPARE(ult) COMPARE(ule) COMPARE(ugt) COMPARE(uge)
++
++#define ACCESS(N, T) \
++    T __remill_read_memory_##N(Memory *, uint64_t a) { T v; memcpy(&v, guest(a, sizeof(T), "read"), sizeof v); g_stats[S_READS]++; return v; } \
++    Memory *__remill_write_memory_##N(Memory *m, uint64_t a, T v) { memcpy(guest(a, sizeof(T), "write"), &v, sizeof v); g_stats[S_WRITES]++; return m; }
++ACCESS(8, uint8_t) ACCESS(16, uint16_t) ACCESS(32, uint32_t) ACCESS(64, uint64_t)
++
++Memory *__remill_function_return(State &, uint64_t, Memory *m) { return m; }   // `ret`: the C return of the lifted function is the AArch64 return (x30 is not consulted, see hypotheses.md)
++
++Memory *__remill_function_call(State &st, uint64_t pc, Memory *m) {   // blr
++    g_stats[S_CALLS]++;
++    if (AotFn f = find(pc)) return f(&st, pc, m);
++    g_stats[S_FALLBACK]++;
++    fail("indirect call to %#llx: not the entry of an AOT function, and no JIT fallback yet", (unsigned long long)pc);
++}
++
++Memory *__remill_jump(State &st, uint64_t pc, Memory *m) {   // br: a tail call, so the target must be a function entry too
++    g_stats[S_JUMPS]++;
++    if (AotFn f = find(pc)) return f(&st, pc, m);
++    g_stats[S_FALLBACK]++;
++    fail("indirect jump to %#llx: not the entry of an AOT function (a jump table inside a function is not supported yet), and no JIT fallback yet", (unsigned long long)pc);
++}
++
++// ---- the harness side (ctypes) ----
++struct Guest { uint64_t x[31]; uint64_t sp; uint64_t nzcv; };   // nzcv: N Z C V as bits 3..0
++
++void aot_map(uint64_t base, uint64_t size) {
++    for (const Region &r : g_regions) if (base < r.base + r.size && r.base < base + size) { fprintf(stderr, "[RED] aot: region %#llx+%#llx overlaps another\n", (unsigned long long)base, (unsigned long long)size); abort(); }
++    g_regions.push_back({base, size, (uint8_t *)calloc(1, size)}); g_stats[S_REGIONS]++;
++}
++void aot_unmap_all() { for (Region &r : g_regions) free(r.host); g_regions.clear(); }
++int aot_poke(uint64_t a, const uint8_t *src, uint64_t n) { jmp_buf jb; if (setjmp(jb)) return 1; g_jb = &jb; memcpy(guest(a, n, "poke"), src, n); g_jb = nullptr; return 0; }
++int aot_peek(uint64_t a, uint8_t *dst, uint64_t n) { jmp_buf jb; if (setjmp(jb)) return 1; g_jb = &jb; memcpy(dst, guest(a, n, "peek"), n); g_jb = nullptr; return 0; }
++uint64_t aot_stat(int i) { return g_stats[i]; }
++void aot_stats_reset() { memset(g_stats, 0, sizeof g_stats); }
++
++// Run the AOT function at pc on the registers of g; 0 when it returned, else 1 with the reason in err
++int aot_run(Guest *g, uint64_t pc, char *err, uint64_t errn) {
++    State st; memset(&st, 0, sizeof st);
++#define X(i) st.gpr.x##i.qword = g->x[i];
++    X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30)
++#undef X
++    st.gpr.sp.qword = g->sp;
++    st.sr.n = g->nzcv >> 3 & 1; st.sr.z = g->nzcv >> 2 & 1; st.sr.c = g->nzcv >> 1 & 1; st.sr.v = g->nzcv & 1;
++    jmp_buf jb; int rc = 0;
++    if (setjmp(jb)) rc = 1;
++    else {
++        g_jb = &jb;
++        AotFn f = find(pc);
++        if (!f) fail("no AOT function at %#llx", (unsigned long long)pc);
++        f(&st, pc, reinterpret_cast<Memory *>(&g_stats));   // the Memory token is never dereferenced: the regions are global
++    }
++    g_jb = nullptr;
++#define X(i) g->x[i] = st.gpr.x##i.qword;
++    X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30)
++#undef X
++    g->sp = st.gpr.sp.qword; g->nzcv = st.sr.n << 3 | st.sr.z << 2 | st.sr.c << 1 | st.sr.v;
++    if (rc) snprintf(err, errn, "%s", g_err); else if (errn) err[0] = 0;
++    return rc;
++}
++}
+diff --git a/dm/tools/tests/arm64_ref.py b/dm/tools/tests/arm64_ref.py
+index 79b9ffc..06f7702 100644
+--- a/dm/tools/tests/arm64_ref.py
++++ b/dm/tools/tests/arm64_ref.py
+@@ -8,6 +8,12 @@ MASK = (1 << 64) - 1
+ BASE, STACK, STOP = 0x10000, 0x200000, 0x400000   # text mapped at BASE; STOP: the return address, where the run ends
+ 
+ 
++def xreg(i):
++    """Unicorn's constant for register xi: x0..x28 are consecutive, x29 and x30 are separate constants, so X0 + i is wrong from x29 on"""
++    from unicorn import arm64_const as c
++    return c.UC_ARM64_REG_X29 if i == 29 else c.UC_ARM64_REG_X30 if i == 30 else c.UC_ARM64_REG_X0 + i
++
++
+ def run(name, regs=None, steps=10000):
+     """Run function `name` of the fixture with registers {'x0': v, ...}; returns {'x0'..'x30', 'sp', 'nzcv'} (nzcv: N Z C V as bits 3..0). The run ends when the function returns to STOP.
+     An exception of the core (an undecodable word, an unmapped access) propagates: a reference run never hides one."""
+@@ -18,11 +24,11 @@ def run(name, regs=None, steps=10000):
+     code = struct.pack('<%dI' % len(words), *words)
+     uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+     uc.mem_map(BASE, 0x10000); uc.mem_write(BASE, code); uc.mem_map(STACK - 0x10000, 0x10000); uc.mem_map(STOP, 0x1000)
+-    for r, v in (regs or {}).items(): uc.reg_write(UC_ARM64_REG_X0 + int(r[1:]), v & MASK)
++    for r, v in (regs or {}).items(): uc.reg_write(xreg(int(r[1:])), v & MASK)
+     uc.reg_write(UC_ARM64_REG_SP, STACK); uc.reg_write(UC_ARM64_REG_X30, STOP)
+     start = BASE + ranges[name][0]
+     uc.emu_start(start, STOP, count=steps)
+-    out = {f'x{i}': uc.reg_read(UC_ARM64_REG_X0 + i) for i in range(31)}
++    out = {f'x{i}': uc.reg_read(xreg(i)) for i in range(31)}
+     out['sp'] = uc.reg_read(UC_ARM64_REG_SP); out['nzcv'] = uc.reg_read(UC_ARM64_REG_NZCV) >> 28
+     return out
+ 
+@@ -54,8 +60,31 @@ def run_words(words, cases, steps=100):
+     uc.mem_map(BASE, 0x10000); uc.mem_write(BASE, struct.pack('<%dI' % len(words), *words)); uc.mem_map(STOP, 0x1000)
+     out = []
+     for regs, nzcv in cases:
+-        for i in range(31): uc.reg_write(UC_ARM64_REG_X0 + i, regs.get(f'x{i}', 0) & MASK)
++        for i in range(31): uc.reg_write(xreg(i), regs.get(f'x{i}', 0) & MASK)
+         uc.reg_write(UC_ARM64_REG_NZCV, nzcv << 28); uc.reg_write(UC_ARM64_REG_X30, STOP); uc.reg_write(UC_ARM64_REG_SP, STOP)
+         uc.emu_start(BASE, STOP, count=steps)
+         out.append(({f'x{i}': uc.reg_read(UC_ARM64_REG_X0 + i) for i in range(4)}, uc.reg_read(UC_ARM64_REG_NZCV) >> 28))
+     return out
++
++
++def run_image(code, entry, cases, mem=None, steps=1000000, stop=STOP):
++    """Run the function at `entry` of `code` (mapped at address 0) once per case on one Unicorn core, with the memory regions {base: bytes} (a size that is a whole number of pages) restored before each case.
++    A case is (registers {'x0': v, ...}, nzcv in, sp). Returns, per case, {'x0'..'x30', 'sp', 'nzcv', 'mem': {base: bytes}}, or {'fault': reason} when the core raised (a fetch, read or write outside the regions)."""
++    from unicorn import Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM
++    from unicorn.arm64_const import UC_ARM64_REG_X0, UC_ARM64_REG_X30, UC_ARM64_REG_SP, UC_ARM64_REG_NZCV
++    uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
++    uc.mem_map(0, (len(code) + 0xFFF) & ~0xFFF); uc.mem_write(0, code); uc.mem_map(stop, 0x1000)
++    for b, data in (mem or {}).items(): uc.mem_map(b, len(data))
++    out = []
++    for regs, nzcv, sp in cases:
++        for b, data in (mem or {}).items(): uc.mem_write(b, data)
++        for i in range(31): uc.reg_write(xreg(i), regs.get(f'x{i}', 0) & MASK)
++        uc.reg_write(UC_ARM64_REG_X30, regs.get('x30', stop) & MASK); uc.reg_write(UC_ARM64_REG_SP, sp); uc.reg_write(UC_ARM64_REG_NZCV, nzcv << 28)
++        try: uc.emu_start(entry, stop, count=steps)
++        except UcError as e:
++            out.append({'fault': str(e)}); continue
++        r = {f'x{i}': uc.reg_read(xreg(i)) for i in range(31)}
++        r['sp'] = uc.reg_read(UC_ARM64_REG_SP); r['nzcv'] = uc.reg_read(UC_ARM64_REG_NZCV) >> 28
++        r['mem'] = {b: bytes(uc.mem_read(b, len(data))) for b, data in (mem or {}).items()}
++        out.append(r)
++    return out
+diff --git a/dm/tools/tests/test_aot_memory.py b/dm/tools/tests/test_aot_memory.py
+new file mode 100644
+index 0000000..041feec
+--- /dev/null
++++ b/dm/tools/tests/test_aot_memory.py
+@@ -0,0 +1,104 @@
++"""T3, memory instruction by instruction: loads and stores of 8 to 64 bits, signed and unsigned, unaligned, with a scaled, unscaled, pre-indexed, post-indexed or register offset, and pairs, lifted by Remill, compiled to x86_64
++(aot_lift.py) and compared with the Unicorn ARM64 reference on registers, NZCV and the whole guest memory. An access outside the guest memory is an explicit error (address, size, read or write); the reference faults too.
++Each word is checked against Capstone's text first. Needs REMILL_BUILD, clang++ and unicorn; skipped otherwise."""
++import itertools, struct, sys, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_ref as ref
++from test_aot_t3 import DATA, DATA_SIZE, INIT, MEM, SP, READY, same
++
++RET = aot_lift.RET
++ADDR = 0x1000
++M = ref.MASK
++
++
++def ls(base, rt=2, rn=0, imm=0): return base | (imm & 0x1FF) << 12 | rn << 5 | rt                  # unscaled / pre / post: imm9 at bit 12
++def lu(base, rt=2, rn=0, imm12=0): return base | imm12 << 10 | rn << 5 | rt                        # unsigned scaled offset
++def lp(base, rt=2, rt2=3, rn=0, imm7=0): return base | (imm7 & 0x7F) << 15 | rt2 << 10 | rn << 5 | rt   # pairs
++def lr(base, rt=2, rn=0, rm=3): return base | rm << 16 | rn << 5 | rt                              # register offset
++
++# (word, text Capstone must print). x0 is the address register, x1 the value stored, x3 an index
++INSNS = [
++    (lu(0xF9000000, 1), 'str x1, [x0]'), (lu(0xB9000000, 1), 'str w1, [x0]'), (lu(0x79000000, 1), 'strh w1, [x0]'), (lu(0x39000000, 1), 'strb w1, [x0]'),
++    (lu(0xF9400000), 'ldr x2, [x0]'), (lu(0xB9400000), 'ldr w2, [x0]'), (lu(0x79400000), 'ldrh w2, [x0]'), (lu(0x39400000), 'ldrb w2, [x0]'),
++    (lu(0x39800000), 'ldrsb x2, [x0]'), (lu(0x39C00000), 'ldrsb w2, [x0]'), (lu(0x79800000), 'ldrsh x2, [x0]'), (lu(0x79C00000), 'ldrsh w2, [x0]'), (lu(0xB9800000), 'ldrsw x2, [x0]'),
++    (lu(0xF9400000, imm12=2), 'ldr x2, [x0, #0x10]'), (lu(0xF9000000, 1, imm12=3), 'str x1, [x0, #0x18]'),
++    (ls(0xF8400000, imm=-3), 'ldur x2, [x0, #-3]'), (ls(0xF8000000, 1, imm=-5), 'stur x1, [x0, #-5]'), (ls(0xB8800000, imm=-1), 'ldursw x2, [x0, #-1]'), (ls(0x38400000, imm=1), 'ldurb w2, [x0, #1]'),
++    (ls(0xF8400C00, imm=16), 'ldr x2, [x0, #0x10]!'), (ls(0xF8000C00, 1, imm=-16), 'str x1, [x0, #-0x10]!'), (ls(0xF8400400, imm=8), 'ldr x2, [x0], #8'), (ls(0xF8000400, 1, imm=-8), 'str x1, [x0], #0xfffffffffffffff8'),
++    (ls(0x38400C00, imm=1), 'ldrb w2, [x0, #1]!'), (ls(0x78000400, 1, imm=2), 'strh w1, [x0], #2'),
++    (lp(0xA9000000, 1, 3, imm7=2), 'stp x1, x3, [x0, #0x10]'), (lp(0xA9400000, imm7=-2), 'ldp x2, x3, [x0, #-0x10]'), (lp(0xA9800000, 1, 3, imm7=2), 'stp x1, x3, [x0, #0x10]!'),
++    (lp(0xA8C00000, imm7=2), 'ldp x2, x3, [x0], #0x10'), (lp(0x29400000, imm7=1), 'ldp w2, w3, [x0, #4]'), (lp(0x29000000, 1, 3, imm7=1), 'stp w1, w3, [x0, #4]'), (lp(0x69400000, imm7=1), 'ldpsw x2, x3, [x0, #4]'),
++    (lr(0xF8606800), 'ldr x2, [x0, x3]'), (lr(0xF8607800), 'ldr x2, [x0, x3, lsl #3]'), (lr(0xF8236800, 2), 'str x2, [x0, x3]'),
++    (lr(0xB8607800), 'ldr w2, [x0, x3, lsl #2]'), (lr(0x38606800), 'ldrb w2, [x0, x3]'),
++]
++# addresses: aligned, odd, across a 4-byte and an 8-byte boundary, near both ends of the region (every access of every instruction stays inside it)
++ADDRS = [DATA + 0x40, DATA + 0x41, DATA + 0x43, DATA + 0x47, DATA + 0x1000 - 3, DATA + 0x1000 - 8, DATA + 0x100, DATA + DATA_SIZE - 0x100]
++VALUES = [0, 0x80, 0xFFFF8001, 0x123456789ABCDEF0, M, 0x8000000000000000]
++INDEX = [0, 1, 5, 0x10]
++
++
++def snippet(w): return struct.pack('<2I', w, RET)
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD (a Remill build folder), clang++ and unicorn')
++class Memory(unittest.TestCase):
++    def test_encodings_are_what_the_table_says(self):
++        import capstone
++        md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
++        wrong = []
++        for w, want in INSNS:
++            i = next(md.disasm(struct.pack('<I', w), ADDR))
++            if f'{i.mnemonic} {i.op_str}'.strip() != want: wrong.append(f'{w:#010x}: {i.mnemonic} {i.op_str} != {want}')
++        self.assertEqual(wrong, [])
++
++    def test_every_access_equals_the_arm64_reference(self):
++        cases = [({'x0': a, 'x1': v, 'x3': ix, 'x2': 0xDEADBEEFCAFEF00D}, nz) for a, v, ix in itertools.product(ADDRS, VALUES, INDEX) for nz in (0, 9)]
++        for w, text in INSNS:
++            code = snippet(w)
++            # the reference maps the snippet at 0: pad so that it sits at ADDR
++            image = bytes(ADDR) + code
++            aot = aot_lift.Aot([(ADDR, code)])
++            try:
++                for b, data in MEM.items(): aot.map(b, len(data), data)
++                want = ref.run_image(image, ADDR, [(r, n, SP) for r, n in cases], MEM)
++                faulted = 0
++                for (regs, nz), wr in zip(cases, want):
++                    what = f'{text}: x0={regs["x0"]:#x} x1={regs["x1"]:#x} x3={regs["x3"]:#x}'
++                    aot.reset()
++                    same(self, aot.run(ADDR, dict(regs, x30=ref.STOP), nz, SP), wr, what)   # a case where the reference faults must fault on the AOT code too
++                    faulted += 'fault' in wr
++                self.assertLess(faulted, len(cases) // 10, f'{text}: too many cases leave the guest memory: they test nothing')
++            finally: aot.close()
++
++    def test_stores_reach_the_memory(self):
++        """A guard against a comparison that passes because nothing is written: str x1,[x0] changes exactly the 8 bytes"""
++        aot = aot_lift.Aot([(ADDR, snippet(INSNS[0][0]))])
++        try:
++            for b, data in MEM.items(): aot.map(b, len(data), data)
++            got = aot.run(ADDR, {'x0': DATA + 0x41, 'x1': 0x0102030405060708, 'x30': ref.STOP}, 0, SP)
++            diff = [i for i in range(DATA_SIZE) if got['mem'][DATA][i] != INIT[i]]
++            self.assertEqual(got['mem'][DATA][0x41:0x49], bytes.fromhex('0807060504030201'))
++            self.assertTrue(diff and min(diff) >= 0x41 and max(diff) < 0x49)
++            self.assertEqual((aot.stat('writes'), aot.stat('reads')), (1, 0))
++        finally: aot.close()
++
++    def test_access_outside_the_guest_memory_is_an_explicit_error(self):
++        cases = [(DATA + DATA_SIZE - 4, 'write', 8, INSNS[0][0]),   # str x1,[x0]: 8 bytes, the last 4 beyond the region
++                 (DATA - 1, 'read', 8, INSNS[4][0]),                 # ldr x2,[x0] one byte below it
++                 (0x5000, 'read', 1, INSNS[7][0])]                   # ldrb: unmapped
++        for addr, what, n, w in cases:
++            aot = aot_lift.Aot([(ADDR, snippet(w))])
++            try:
++                for b, data in MEM.items(): aot.map(b, len(data), data)
++                got = aot.run(ADDR, {'x0': addr, 'x1': 1, 'x30': ref.STOP}, 0, SP)
++                self.assertIn('fault', got)
++                for part in (what, f'{n} bytes', f'{addr:#x}'): self.assertIn(part, got['fault'])
++                self.assertIn('fault', ref.run_image(bytes(ADDR) + snippet(w), ADDR, [({'x0': addr, 'x1': 1}, 0, SP)], MEM)[0], 'the reference accepts what the AOT code refuses')
++            finally: aot.close()
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/dm/tools/tests/test_aot_t3.py b/dm/tools/tests/test_aot_t3.py
+new file mode 100644
+index 0000000..bc2433a
+--- /dev/null
++++ b/dm/tools/tests/test_aot_t3.py
+@@ -0,0 +1,113 @@
++"""T3: branches, memory and calls. The synthetic fixture's functions (arm64_fixture.py) lifted by Remill and compiled to x86_64 by aot_lift.py, run against the Unicorn ARM64 reference: every register, NZCV, the
++stack pointer and the guest memory must be identical. Indirect targets that are not AOT functions, accesses outside the guest memory and the instruction classes not translated yet are explicit errors.
++Needs REMILL_BUILD (a Remill build with the ADC/ADCS patch for the instruction tests), clang++ and unicorn; skipped otherwise."""
++import itertools, struct, sys, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_fixture as fx
++import arm64_ref as ref
++
++try: import unicorn   # noqa: F401
++except ImportError: unicorn = None
++READY = aot_lift.lifter() and unicorn
++
++M = ref.MASK
++DATA, DATA_SIZE, STACK, STACK_SIZE = 0x100000, 0x2000, 0x200000, 0x10000
++SP = STACK + STACK_SIZE
++VALUES = [0, 1, 2, 0x7FFFFFFF, 0x80000000, M, 0x7FFFFFFFFFFFFFFF, 0x8000000000000000]
++INIT = bytes((i * 131 + 7) & 0xFF for i in range(DATA_SIZE))   # fixed, uneven contents: a load of the wrong bytes shows
++MEM = {DATA: INIT, STACK: bytes(STACK_SIZE)}
++
++
++def fixture():
++    words, ranges, has_fde = fx.text_layout()
++    code = struct.pack('<%dI' % len(words), *words)
++    return code, ranges
++
++
++def new_aot(functions):
++    a = aot_lift.Aot(functions)
++    for b, data in MEM.items(): a.map(b, len(data), data)
++    return a
++
++
++def same(test, a, b, what):
++    """Two run results equal, field by field, so a failure names the register or the memory that differs"""
++    test.assertEqual(('fault' in a), ('fault' in b), f'{what}: one run faulted, the other did not: {a.get("fault")!r} / {b.get("fault")!r}')
++    if 'fault' in a: return
++    for k in [f'x{i}' for i in range(31)] + ['sp', 'nzcv']: test.assertEqual(a[k], b[k], f'{what}: {k}: {a[k]:#x} != {b[k]:#x}')
++    for base in a['mem']:
++        if a['mem'][base] != b['mem'][base]:
++            off = next(i for i, (p, q) in enumerate(zip(a['mem'][base], b['mem'][base])) if p != q)
++            test.fail(f'{what}: memory differs at {base + off:#x}: {a["mem"][base][off]:#04x} != {b["mem"][base][off]:#04x}')
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD (a Remill build folder), clang++ and unicorn')
++class Functions(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.code, cls.ranges = fixture()
++        cls.fns = [(s, cls.code[s:e]) for n, (s, e) in cls.ranges.items() if n not in ('svc_setheap', 'tls')]   # svc and the thread registers are T5
++        cls.aot = new_aot(cls.fns)
++
++    @classmethod
++    def tearDownClass(cls): cls.aot.close()
++
++    def compare(self, name, cases):
++        """Each case on the reference and on the AOT code; the reference must complete (a case where both fault would pass `same` for nothing)"""
++        entry = self.ranges[name][0]
++        want = ref.run_image(self.code, entry, [(r, n, SP) for r, n in cases], MEM)
++        for (regs, nzcv), w in zip(cases, want):
++            what = f'{name}({", ".join(f"{k}={v:#x}" for k, v in regs.items())}) nzcv={nzcv:04b}'
++            self.assertNotIn('fault', w, f'{what}: the reference itself faulted: a bad test case')
++            self.aot.reset()
++            same(self, self.aot.run(entry, dict(regs, x30=ref.STOP), nzcv, SP), w, what)
++
++    def test_conditional_branch(self):
++        self.compare('branch', [({'x0': v, 'x1': 9}, n) for v in VALUES for n in (0, 4, 15)])
++
++    def test_loop_with_a_back_edge(self):
++        self.compare('loop', [({'x0': v}, 0) for v in (0, 1, 2, 7, 50, 1000)])
++
++    def test_nested_direct_calls_and_the_stack(self):
++        """caller: stp x29,x30 to the stack, bl arith, bl branch, ldp: the saved registers and the memory they leave behind must match"""
++        self.compare('caller', [({'x0': a, 'x1': b, 'x29': 0xAAAA5555AAAA5555}, 0) for a, b in itertools.product(VALUES, VALUES)])
++
++    def test_indirect_call_and_jump_to_known_functions(self):
++        """indirect: blr x1 then br x2 (a tail call). The call target must leave x2 alone, which arith does not: it is `branch`; the jump goes to each function"""
++        r = self.ranges
++        for f2 in ('branch', 'arith', 'loop'):
++            vals = (0, 1, 5) if f2 == 'loop' else (0, 1, 5, M)   # loop counts x0 down: a huge count would run for ever
++            self.compare('indirect', [({'x0': v, 'x1': r['branch'][0], 'x2': r[f2][0]}, 0) for v in vals])
++
++    def test_indirect_targets_are_counted(self):
++        self.aot.lib.aot_stats_reset()
++        got = self.aot.run(self.ranges['indirect'][0], {'x0': 1, 'x1': self.ranges['branch'][0], 'x2': self.ranges['arith'][0], 'x30': ref.STOP}, 0, SP)
++        self.assertNotIn('fault', got)
++        self.assertEqual((self.aot.stat('indirect_calls'), self.aot.stat('indirect_jumps'), self.aot.stat('fallback_requests')), (1, 1, 0))
++
++    def test_unknown_indirect_call_is_an_explicit_error_and_a_fallback_request(self):
++        self.aot.lib.aot_stats_reset()
++        got = self.aot.run(self.ranges['indirect'][0], {'x1': 0x12345678, 'x2': self.ranges['branch'][0], 'x30': ref.STOP}, 0, SP)
++        self.assertIn('indirect call to 0x12345678', got['fault']); self.assertIn('no JIT fallback', got['fault'])
++        self.assertEqual(self.aot.stat('fallback_requests'), 1)
++        # the reference also cannot go there: it fetches from unmapped memory
++        self.assertIn('fault', ref.run_image(self.code, self.ranges['indirect'][0], [({'x1': 0x12345678, 'x2': 0}, 0, SP)], MEM)[0])
++
++    def test_jump_into_the_middle_of_a_function_is_an_explicit_error(self):
++        mid = self.ranges['arith'][0] + 4
++        got = self.aot.run(self.ranges['indirect'][0], {'x1': self.ranges['branch'][0], 'x2': mid, 'x30': ref.STOP}, 0, SP)
++        self.assertIn(f'indirect jump to {mid:#x}', got['fault']); self.assertIn('not the entry', got['fault'])
++
++    def test_svc_is_not_translated_until_t5(self):
++        """Remill has no semantics for `svc`: the function is refused with the instruction named, never run. T5 maps svc to the Horizon services"""
++        s, e = self.ranges['svc_setheap']
++        with self.assertRaises(aot_lift.LiftError) as c: aot_lift.Aot([(s, self.code[s:e])])
++        self.assertIn('svc #1', str(c.exception)); self.assertIn(f'{s:#x}', str(c.exception))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/dm/tools/tests/test_recompile_insn.py b/dm/tools/tests/test_recompile_insn.py
+index 62c0187..454f2cc 100644
+--- a/dm/tools/tests/test_recompile_insn.py
++++ b/dm/tools/tests/test_recompile_insn.py
+@@ -7,6 +7,8 @@ from pathlib import Path
+ HERE = Path(__file__).resolve().parent
+ sys.path.insert(0, str(HERE))
+ import arm64_ref as ref
++sys.path.insert(0, str(HERE.parent))
++from aot_lift import lift, LiftError   # noqa: E402  (the lifter and its error live in the tool)
+ from test_recompile_arith import BUILD, LIFT, unicorn
+ 
+ RET = 0xD65F03C0
+@@ -35,17 +37,6 @@ INSNS = [  # (word, expected disassembly)
+ UNSUPPORTED = [(ccmp(0xBA400000, 'hi', 0), 'ccmn x0, x1, #0, hi'), (ccmp(0x3A400000, 'vs', 15), 'ccmn w0, w1, #0xf, vs')]
+ 
+ 
+-class LiftError(Exception):
+-    pass
+-
+-
+-def lift(word, ll, address=0x1000):
+-    """Lift one instruction (+ ret) to the IR file ll; LiftError naming the instruction, its address and the reason when Remill had no semantics for it (the IR then calls __remill_error)"""
+-    subprocess.run([LIFT, '--arch', 'aarch64', '--address', hex(address), '--bytes', struct.pack('<2I', word, RET).hex(), '--ir_out', ll], check=True, capture_output=True, text=True)
+-    if '@__remill_error' in Path(ll).read_text():
+-        raise LiftError(f'{address:#x}: {word:#010x}: Remill has no semantics for this instruction (the lifted code calls __remill_error)')
+-
+-
+ def build_lib(word, tmp):
+     ll, so = os.path.join(tmp, f'i{word:08x}.ll'), os.path.join(tmp, f'i{word:08x}.so')   # one path per word: dlopen of a path already loaded returns the old library
+     lift(word, ll)

@@ -1,0 +1,93 @@
+file	class	note
+0001-runtime-profile.patch	apple	Apple C host runtime profile
+0003-ios-game-data-folder.patch	apple	by the paths it touches
+0004-ios-slim-ipa.patch	apple	by the paths it touches
+0005-nsp-dotnet-home.patch	apple	by the paths it touches
+0006-nsp-chain-changed-note.patch	apple	by the paths it touches
+0008-bc-cpu-decode.patch	apple	by the paths it touches
+0009-mac-keymap.patch	apple	by the paths it touches
+0010-mac-library-folder.patch	apple	by the paths it touches
+0011-hades2-update-profile.patch	common	Game profile data, platform neutral
+0012-env-switches-verify.patch	common	env_switches.py check, platform neutral
+0014-ios-probe.patch	apple	by the paths it touches
+0015-fork-docs.patch	apple	The fork's launcher planning and release documents
+0016-ref-hle-hid-d2r.patch	common	Reference copy of a HID layer
+0017-fork-patches-stamp.patch	apple	by the paths it touches
+0018-nsp-dotnet-root-verify.patch	apple	by the paths it touches
+0024-games-md-gallery.patch	common	GAMES.md gallery generator
+0031-front-mac-dm-screen.patch	apple	by the paths it touches
+0032-front-mac-hide-the-pointer-after-a-few-idle-seco.patch	apple	by the paths it touches
+0033-lint-c-test-without-workflow.patch	common	Test of the C lint, platform neutral
+0034-metal-a-newer-compiler-of-the-recorded-generatio.patch	apple	by the paths it touches
+0037-totk-1.4.2-frame-step-sites.patch	common	Game profile data, platform neutral
+0040-nsp-derived-profile-without-frame-step.patch	apple	NSP to IPA script (build_ipa_from_nsp.py)
+0041-shared-fonts-a-compact-stand-in-for-a-font-engin.patch	apple	Apple C host and iOS build script (hle_sdk16.c, build_ipa.sh)
+0042-ios-launcher-present-the-document-picker-once-pe.patch	apple	by the paths it touches
+0045-route-c-loader-image-header.patch	apple	Apple C loader (loader.c), not the Linux ELF path
+0046-route-c-game-framework.patch	apple	by the paths it touches
+0047-route-c-framework-build.patch	apple	by the paths it touches
+0048-route-c-framework-tests.patch	apple	by the paths it touches
+0049-dm-framework-env-switch-row.patch	apple	Row for the Apple route C framework switch
+0052-front-progress-hook.patch	apple	by the paths it touches
+0050-route-c-shell.patch	apple	by the paths it touches
+0051-nsp-shell-framework.patch	apple	by the paths it touches
+0053-runtime-profile-every-site.patch	apple	Apple C host and Metal sites. Ambiguous: it touches one Linux file too
+0054-front-mac-start-with-the-pointer-hidden-when-the.patch	apple	by the paths it touches
+0055-arm64-survey-a-read-only-survey-of-a-module-s-aa.patch	linux	ARM64 survey for the recompiler
+0056-tests-arith-lifted-by-remill-and-compiled-to-x86.patch	linux	Tests of Remill lifting and x86_64 compilation
+0057-tests-26-flag-instructions-lifted-by-remill-matc.patch	linux	Tests of Remill lifting
+0058-tests-adc-and-adcs-join-the-instructions-checked.patch	linux	Tests of Remill lifting
+0059-aot-lift-ahead-of-time-recompilation-of-aarch64.patch	linux	by the paths it touches
+0060-tests-aot-runtime-atomics-and-barriers-ldxr-stxr.patch	linux	by the paths it touches
+0061-aot-jit-dynarmic-as-the-jit-fallback-of-the-aot.patch	linux	by the paths it touches
+0062-aot-real-gcc-output-as-a-test-scalar-float-memor.patch	linux	by the paths it touches
+0063-aot-stub-for-functions-the-translator-cannot-lif.patch	linux	by the paths it touches
+0064-aot-svc-reaches-the-horizon-service-handler-thre.patch	linux	by the paths it touches
+0065-aot-elf-modules-and-a-manifest-instead-of-the-ma.patch	linux	by the paths it touches
+0066-aot-validation-on-a-real-module-plt-split-lift-l.patch	linux	by the paths it touches
+0067-aot-jump-tables-resolved-at-translation-time-tra.patch	linux	by the paths it touches
+0068-aot-floating-point-and-vector-memory-instruction.patch	linux	by the paths it touches
+0069-aot-neon-coverage-blocker-3-closed-for-balatro-t.patch	linux	by the paths it touches
+0070-aot-ext-crc32-and-yield-found-by-balatro-s-main.patch	linux	by the paths it touches
+0071-aot-modules-laid-out-contiguously-cross-module-e.patch	linux	by the paths it touches
+0072-elf-module-accept-8-byte-relocations-at-4-byte-a.patch	linux	by the paths it touches
+0073-aot-counter-register-reads-mrs-cntpct-el0-and-fr.patch	linux	by the paths it touches
+0074-horizon-on-linux-svcs-ipc-and-sm-nn-init-start-b.patch	linux	by the paths it touches
+0075-horizon-display-show-rgba-frames-through.patch	linux	by the paths it touches
+0076-aot-host-overrides-of-sdk-functions-thread-exit.patch	linux	by the paths it touches
+0077-horizon-on-linux-threads-and-synchronisation.patch	linux	by the paths it touches
+0078-jump-tables-through-x16-x17-thread-pointers-of-a.patch	linux	by the paths it touches
+0079-horizon-on-linux-fibers-nn-hid-per-title-profile.patch	linux	by the paths it touches
+0080-aot-an-svc-no-longer-leaks-into-the-next-dc-ic-p.patch	linux	by the paths it touches
+0081-horizon-on-linux-silent-nn-audio-nn-time-nested.patch	linux	by the paths it touches
+0082-horizon-on-linux-nvn-draws-on-a-vulkan-gpu.patch	linux	by the paths it touches
+0083-horizon-on-linux-layered-3d-and-mip-mapped-textu.patch	linux	by the paths it touches
+0084-horizon-on-linux-the-kernel-side-of-the-mutex-wo.patch	linux	by the paths it touches
+0085-horizon-on-linux-geometry-tessellation-compute-s.patch	linux	by the paths it touches
+0086-horizon-on-linux-frames-go-from-the-gpu-to-the-w.patch	linux	by the paths it touches
+0087-horizon-on-linux-timings-for-the-gpu-path-write.patch	linux	by the paths it touches
+0088-horizon-on-linux-constant-buffer-1-holds-the-sha.patch	linux	by the paths it touches
+0089-horizon-on-linux-the-hot-nvn-calls-are-recorded.patch	linux	by the paths it touches
+0090-horizon-on-linux-the-nvn-queue-runs-on-a-thread.patch	linux	by the paths it touches
+0091-horizon-on-linux-the-driver-constant-segment-c0.patch	linux	by the paths it touches
+0092-horizon-on-linux-where-the-queue-thread-and-the.patch	linux	by the paths it touches
+0093-horizon-on-linux-the-draws-of-a-command-stream-a.patch	linux	by the paths it touches
+0094-horizon-on-linux-a-signal-wakes-the-threads-that.patch	linux	by the paths it touches
+0095-aot-guest-memory-accesses-inline-in-the-recompil.patch	linux	by the paths it touches
+0096-horizon-on-linux-svc-profile-knobs-and-the-updat.patch	linux	by the paths it touches
+0097-horizon-on-linux-an-8-mib-main-stack-and-a-ccmp.patch	linux	by the paths it touches
+0098-horizon-on-linux-textures-of-one-memory-are-one.patch	linux	by the paths it touches
+0099-jump-tables-the-bound-of-a-dispatch-entered-by-a.patch	linux	by the paths it touches
+0100-horizon-run-jit-dynarmic-fallback-test-aot-simd.patch	linux	by the paths it touches
+0101-runtime-nx2-aes-for-the-aes-instructions-remill.patch	linux	by the paths it touches
+0102-linux-host-the-game-s-constants-and-workarounds.patch	linux	by the paths it touches
+0103-gpu-path-line-loops-quad-strips-and-polygons-a-c.patch	linux	by the paths it touches
+0104-linux-host-nn-audio-is-mixed-and-played-voices-a.patch	linux	by the paths it touches
+0105-linux-host-movie-decoder-decodes-vp8-vp9-by-libv.patch	linux	by the paths it touches
+0106-module-validate-workers-run-with-the-venv-interp.patch	linux	by the paths it touches
+0107-tests-three-stale-or-non-portable-tests-fixed-ao.patch	common	Test fixes. Mostly Linux AOT test, also shared tests. Ambiguous
+0108-env-switches-the-table-lists-dm-font-cache-and.patch	common	Table of DM_* switches, platform neutral
+0109-tests-the-apple-only-tests-are-skipped-off-macos.patch	common	Skips Apple-only tests off macOS. Helps every non-Mac runner
+0110-docs-linux-architecture-md-the-stages-the-host-t.patch	linux	by the paths it touches
+0111-test-elf-module-the-switch-test-is-skipped-when.patch	common	A test that needs Remill skips without it. Helps any runner without the toolchain
+0112-linux-host-a-test-that-the-linux-chain-reaches-n.patch	linux	A test of the Linux chain, which has no Apple counterpart
