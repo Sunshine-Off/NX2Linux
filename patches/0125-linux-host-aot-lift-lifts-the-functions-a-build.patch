@@ -1,0 +1,317 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 21:22:47 +0100
+Subject: [PATCH] Linux host: aot_lift lifts the functions a build lacks in
+ groups of 32 per remill-lift process (#18)
+
+A remill-lift run spends about 85 ms of a 90 ms lift loading the architecture
+semantics. With Remill patch 0011 (remill-lift --batch) the semantics are
+loaded once and each function is lifted by a forked copy. Aot now sends the
+functions the cache lacks to the lifter 32 at a time, spread over the pool.
+A function the batch cannot do is lifted again alone, AOT_LIFT_BATCH=0 turns
+it off, and a lifter without --batch is detected on first use. The objects
+are the same byte for byte, so the cache keys do not change. A cold build of
+400 generated functions goes from 68 s to 31.6 s of CPU.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: Batch lifting: one remill-lift process for many functions, needs Remill patch 0011
+Issue: Sunshine-Off/NX2Linux#18
+
+---
+ dm/tools/aot_lift.py                  |  97 ++++++++++++------
+ dm/tools/tests/test_aot_lift_batch.py | 135 ++++++++++++++++++++++++++
+ dm/tools/tests/test_aot_stub.py       |   4 +-
+ 3 files changed, 207 insertions(+), 29 deletions(-)
+ create mode 100644 dm/tools/tests/test_aot_lift_batch.py
+
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index c1a19882..de558434 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -91,16 +91,47 @@ def _run_lift(code, address, ll, entry=None):
+     return '@__remill_error' in Path(ll).read_text()
+ 
+ 
++LIFT_BATCH = 32          # functions handed to one remill-lift process: its start-up (the architecture semantics, about 85 ms) is paid once for all of them
++_batch_refused = False   # set when the lifter does not know --batch (a Remill built before patch 0011): every function then goes through its own process
++
++
++def _lift_batch(requests):
++    """requests: [(code, address, ll, entry)]. Lifts them in one remill-lift process (--batch) -> a list as long as requests, each True (the IR calls __remill_error), False, or None when the request was not
++    done in the batch (too long for the command-line cap, refused by the lifter, or the lifter has no --batch): the caller then lifts it alone, which gives the error the single run gives.
++    The objects do not depend on this: a batch child lifts from the same untouched state as a run of its own (the IR is identical, byte for byte)"""
++    global _batch_refused
++    todo = [i for i, (code, address, ll, entry) in enumerate(requests) if len(code) <= MAX_LIFT_BYTES and not re.search(r'\s', ll)]
++    out = [None] * len(requests)
++    if len(todo) < 2 or _batch_refused or os.environ.get('AOT_LIFT_BATCH', '1') == '0': return out
++    fd, path = tempfile.mkstemp(suffix='.batch', dir=os.path.dirname(requests[todo[0]][2]))
++    try:
++        with os.fdopen(fd, 'w') as f:
++            for i in todo:
++                code, address, ll, entry = requests[i]
++                f.write(f"{address:x} {'-' if entry is None else format(entry, 'x')} {code.hex()} {ll}\n")
++        r = subprocess.run([lifter(), '--arch', 'aarch64', '--batch', path], capture_output=True, text=True, errors='replace')
++    finally: os.unlink(path)
++    if 'unknown command line flag' in r.stderr: _batch_refused = True; return out
++    for line in r.stdout.splitlines():
++        parts = line.split()
++        if len(parts) >= 2 and parts[0] == 'ok' and parts[1].isdigit() and 0 < int(parts[1]) <= len(todo):
++            ll = requests[todo[int(parts[1]) - 1]][2]
++            if os.path.exists(ll): out[todo[int(parts[1]) - 1]] = '@__remill_error' in Path(ll).read_text()
++    return out
++
++
+ def lift(word, ll, address=0x1000):
+     """Lift one instruction (+ ret) to the IR file ll; LiftError when Remill has no semantics for it"""
+     if _run_lift(struct.pack('<2I', word, RET), address, ll):
+         raise LiftError(f'{address:#x}: {word:#010x} ({_disasm(word, address)}): Remill has no semantics for this instruction (the lifted code calls __remill_error)')
+ 
+ 
+-def lift_function(code, address, ll, entry=None):
++def lift_function(code, address, ll, entry=None, lifted=None):
+     """Lift the function whose bytes are code, at address, to ll; LiftError naming the first instruction Remill cannot lift.
+-    entry: lift from this address inside the bytes instead of from their start (a case of a switch, reached by the jump table), the whole function being there for the branches that go back before it"""
+-    if not _run_lift(code, address, ll, entry): return
++    entry: lift from this address inside the bytes instead of from their start (a case of a switch, reached by the jump table), the whole function being there for the branches that go back before it.
++    lifted: the answer of a lift already done into ll (True: the IR calls __remill_error), from _lift_batch"""
++    if lifted is None: lifted = _run_lift(code, address, ll, entry)
++    if not lifted: return
+     scratch = ll + '.insn.ll'
+     traps = 0
+     for i, (w,) in enumerate(struct.iter_unpack('<I', code)):
+@@ -206,32 +237,44 @@ class Aot:
+                 self._attach(cached_so, jit, jit_entries, jit_ticks, jit_depth)
+                 return
+         jobs = jobs or (min(16, os.cpu_count() or 1) if len(functions) > 8 else 1)   # remill-lift and clang each handle one function at a time: many functions go through a pool
+-        def lift_item(item):
+-            addr, code, origin = item
+-            ll = os.path.join(d, f'f{n}_{addr:x}.ll')
+-            try:
+-                lift_function(code, origin, ll, addr if addr != origin else None)
+-                if inline_mem: inline_accessors(ll)
+-                return addr, ll, None
+-            except LiftError as e: return addr, ll, e
++        def lift_items(items):   # -> [(addr, ll, error or None)]: one remill-lift process for the whole list when the lifter has --batch
++            reqs = [(code, origin, os.path.join(d, f'f{n}_{addr:x}.ll'), addr if addr != origin else None) for addr, code, origin in items]
++            out = []
++            for (addr, code, origin), (_, _, ll, entry), first in zip(items, reqs, _lift_batch(reqs)):
++                try:
++                    lift_function(code, origin, ll, entry, first)
++                    if inline_mem: inline_accessors(ll)
++                    out.append((addr, ll, None))
++                except LiftError as e: out.append((addr, ll, e))
++            return out
++        def chunks(items): return [items[i:i + LIFT_BATCH] for i in range(0, len(items), LIFT_BATCH)]
+         def compile_ll(ll, obj):
+             r = subprocess.run(['clang++', '-c', '-O2', '-fPIC', '-Wno-override-module', ll, '-o', obj], capture_output=True, text=True, errors='replace')
+             if r.returncode: raise LinkError(f'build of {ll} failed:\n' + r.stderr[-1500:])
+         if cache:
+-            def cached_item(item):   # -> (addr, object path, None) or (addr, None, reason); lifts and compiles only what the cache lacks
+-                addr = item[0]
+-                base_path = os.path.join(cache, 'obj', fkeys[addr][:2], fkeys[addr])
+-                if os.path.exists(base_path + '.o'): return addr, base_path + '.o', None, True
+-                if os.path.exists(base_path + '.fail'): return addr, None, Path(base_path + '.fail').read_text(), True
+-                a2, ll, e = lift_item(item)
+-                if e is not None: _atomic(base_path + '.fail', str(e).encode()); return addr, None, str(e), False
+-                tmp_obj = ll[:-3] + '.o'
+-                compile_ll(ll, tmp_obj)
+-                _atomic(base_path + '.syms', ' '.join(undefined_symbols(tmp_obj)).encode())
+-                _atomic(base_path + '.o', Path(tmp_obj).read_bytes())
+-                os.unlink(ll); os.unlink(tmp_obj)
+-                return addr, base_path + '.o', None, False
+-            with concurrent.futures.ThreadPoolExecutor(jobs) as ex: done = list(ex.map(cached_item, functions))
++            def paths_of(addr): return os.path.join(cache, 'obj', fkeys[addr][:2], fkeys[addr])
++            found, pending = {}, []   # what the cache already holds (an object, or the reason a function cannot be lifted), and what it lacks
++            for item in functions:
++                base_path = paths_of(item[0])
++                if os.path.exists(base_path + '.o'): found[item[0]] = (item[0], base_path + '.o', None, True)
++                elif os.path.exists(base_path + '.fail'): found[item[0]] = (item[0], None, Path(base_path + '.fail').read_text(), True)
++                else: pending.append(item)
++            def fill(chunk):   # lifts the functions of the chunk together, compiles each, and records objects and failures under their keys
++                res = []
++                for addr, ll, e in lift_items(chunk):
++                    base_path = paths_of(addr)
++                    if e is not None: _atomic(base_path + '.fail', str(e).encode()); res.append((addr, None, str(e), False)); continue
++                    tmp_obj = ll[:-3] + '.o'
++                    compile_ll(ll, tmp_obj)
++                    _atomic(base_path + '.syms', ' '.join(undefined_symbols(tmp_obj)).encode())
++                    _atomic(base_path + '.o', Path(tmp_obj).read_bytes())
++                    os.unlink(ll); os.unlink(tmp_obj)
++                    res.append((addr, base_path + '.o', None, False))
++                return res
++            with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
++                for res in ex.map(fill, chunks(pending)):
++                    for r in res: found[r[0]] = r
++            done = [found[item[0]] for item in functions]
+             objs = {}
+             for addr, path, why, hit in done:
+                 self.cache_hits += hit; self.cache_misses += not hit
+@@ -241,8 +284,8 @@ class Aot:
+                     self.unlifted[addr] = why
+         else:
+             if jobs > 1:
+-                with concurrent.futures.ThreadPoolExecutor(jobs) as ex: lifted = list(ex.map(lift_item, functions))
+-            else: lifted = [lift_item(f) for f in functions]
++                with concurrent.futures.ThreadPoolExecutor(jobs) as ex: lifted = [r for res in ex.map(lift_items, chunks(functions)) for r in res]
++            else: lifted = [r for c in chunks(functions) for r in lift_items(c)]
+             for addr, ll, e in lifted:
+                 if e is None: lls[addr] = ll; continue
+                 if not stub_unliftable: raise e
+diff --git a/dm/tools/tests/test_aot_lift_batch.py b/dm/tools/tests/test_aot_lift_batch.py
+new file mode 100644
+index 00000000..98e94cab
+--- /dev/null
++++ b/dm/tools/tests/test_aot_lift_batch.py
+@@ -0,0 +1,135 @@
++"""Lifting many functions per remill-lift process (aot_lift.Aot, remill-lift --batch, Remill patch 0011).
++A run of remill-lift spends about 85 ms of a 90 ms lift loading the architecture semantics, so a build used to pay that once per function.
++  · a build of many functions starts a few lifter processes, not one per function;
++  · the objects are the same, byte for byte, with the batch and without it (AOT_LIFT_BATCH=0), so the cache keys and the cached objects stay valid;
++  · a lifter without --batch (a Remill built before patch 0011) is detected on first use and the build goes on one function per process;
++  · a function Remill cannot lift, a function with a trap and a function that is too long give the same answer in a batch as alone.
++Needs REMILL_BUILD, clang++ and unicorn; skipped otherwise. The tests that need --batch in the lifter are skipped with the reason when the Remill build lacks it."""
++import os, stat, struct, subprocess, sys, tempfile, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_ref as ref
++from test_aot_t3 import SP, READY
++
++MOVZ_X0, CLS_X0_X0 = 0xD2800000, 0xDAC01400   # mov x0, #imm16 (imm16 << 5) ; cls x0, x0 (Remill has no semantics for it)
++BASE = 0x10000
++
++
++def has_batch():
++    """True when the lifter in REMILL_BUILD knows --batch"""
++    if not READY: return False
++    r = subprocess.run([aot_lift.lifter(), '--arch', 'aarch64', '--batch', os.devnull], capture_output=True, text=True, errors='replace')
++    return 'unknown command line flag' not in r.stderr
++
++
++def functions(count):
++    """count distinct functions: function i returns i + 1 in x0"""
++    return [(BASE + 0x40 * i, struct.pack('<2I', MOVZ_X0 | ((i + 1) << 5), aot_lift.RET)) for i in range(count)]
++
++
++class Counting:
++    """Replaces aot_lift.lifter by a script that logs each start, then runs the real lifter (or, with refuse_batch, behaves like a lifter built before --batch)"""
++    def __init__(self, refuse_batch=False):
++        self.dir = tempfile.TemporaryDirectory()
++        self.log = Path(self.dir.name) / 'starts'
++        self.real = aot_lift.lifter()
++        self.script = Path(self.dir.name) / 'remill-lift-test'
++        refuse = ('case " $* " in *" --batch "*) echo "ERROR: unknown command line flag \'batch\'" >&2; exit 1;; esac\n' if refuse_batch else '')
++        self.script.write_text(f'#!/bin/sh\necho start >> "{self.log}"\n{refuse}exec "{self.real}" "$@"\n')
++        self.script.chmod(self.script.stat().st_mode | stat.S_IEXEC)
++
++    def __enter__(self):
++        self.saved = aot_lift.lifter
++        aot_lift.lifter = lambda: str(self.script)
++        aot_lift._batch_refused = False
++        return self
++
++    def __exit__(self, *a):
++        aot_lift.lifter = self.saved
++        aot_lift._batch_refused = False
++        self.dir.cleanup()
++
++    @property
++    def starts(self): return len(self.log.read_text().split()) if self.log.exists() else 0
++
++
++def objects(cache):
++    return {p.relative_to(cache).as_posix(): p.read_bytes() for p in sorted(Path(cache).rglob('*')) if p.is_file() and p.suffix in ('.o', '.syms', '.fail')}
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD (a Remill build folder), clang++ and unicorn')
++class Batch(unittest.TestCase):
++    def setUp(self):
++        self.dir = tempfile.TemporaryDirectory()
++        self.root = Path(self.dir.name)
++        self.saved_env = os.environ.get('AOT_LIFT_BATCH')
++
++    def tearDown(self):
++        if self.saved_env is None: os.environ.pop('AOT_LIFT_BATCH', None)
++        else: os.environ['AOT_LIFT_BATCH'] = self.saved_env
++        self.dir.cleanup()
++
++    def build(self, fs, cache=None, **kw):
++        return aot_lift.Aot(fs, cache=str(self.root / cache) if cache else None, **kw)
++
++    @unittest.skipUnless(has_batch(), 'this Remill build has no remill-lift --batch (patch 0011)')
++    def test_many_functions_start_few_lifter_processes(self):
++        fs = functions(70)
++        with Counting() as c:
++            a = self.build(fs, 'c1', jobs=4)
++            try:
++                for i in (0, 37, 69): self.assertEqual(a.run(fs[i][0], {'x30': ref.STOP}, 0, SP)['x0'], i + 1)
++            finally: a.close()
++            self.assertLessEqual(c.starts, 5, f'{c.starts} lifter processes for 70 functions')
++
++    @unittest.skipUnless(has_batch(), 'this Remill build has no remill-lift --batch (patch 0011)')
++    def test_the_objects_are_the_same_with_and_without_the_batch(self):
++        fs = functions(40) + [(0x90000, struct.pack('<2I', CLS_X0_X0, aot_lift.RET))]
++        os.environ['AOT_LIFT_BATCH'] = '0'
++        with Counting() as alone:
++            self.build(fs, 'alone', stub_unliftable=True, jobs=4).close()
++            self.assertGreaterEqual(alone.starts, 40, 'AOT_LIFT_BATCH=0 must lift one function per process')
++        os.environ.pop('AOT_LIFT_BATCH')
++        with Counting(): self.build(fs, 'batch', stub_unliftable=True, jobs=4).close()
++        a, b = objects(self.root / 'alone'), objects(self.root / 'batch')
++        self.assertEqual(sorted(a), sorted(b))
++        self.assertEqual(len(a), 2 * 40 + 1, 'an .o and a .syms per function that lifts, a .fail for the one that does not')
++        self.assertEqual([k for k in a if a[k] != b[k]], [])
++
++    def test_a_lifter_without_batch_is_detected_and_the_build_goes_on(self):
++        fs = functions(20)
++        with Counting(refuse_batch=True) as c:
++            a = self.build(fs, 'old', jobs=2)
++            try: self.assertEqual(a.run(fs[11][0], {'x30': ref.STOP}, 0, SP)['x0'], 12)
++            finally: a.close()
++            first = c.starts
++            self.build(functions(30)[20:], 'old2', jobs=2).close()
++            self.assertGreaterEqual(first, 20, 'one process per function without --batch')
++            self.assertLessEqual(c.starts - first, 10 + 2, 'the refusal is remembered: no second attempt per chunk')
++
++    @unittest.skipUnless(has_batch(), 'this Remill build has no remill-lift --batch (patch 0011)')
++    def test_an_unliftable_function_in_a_batch_gives_the_reason_it_gives_alone(self):
++        g = (0x90000, struct.pack('<2I', CLS_X0_X0, aot_lift.RET))
++        fs = functions(10) + [g]
++        os.environ['AOT_LIFT_BATCH'] = '0'
++        alone = self.build(fs, stub_unliftable=True); why_alone = alone.unlifted[g[0]]; alone.close()
++        os.environ.pop('AOT_LIFT_BATCH')
++        batch = self.build(fs, stub_unliftable=True); why_batch = batch.unlifted[g[0]]; batch.close()
++        self.assertIn('cls', why_batch)
++        self.assertEqual(why_batch, why_alone)
++        with self.assertRaises(aot_lift.LiftError) as e: self.build(fs, stub_unliftable=False)
++        self.assertIn('cls', str(e.exception))
++
++    @unittest.skipUnless(has_batch(), 'this Remill build has no remill-lift --batch (patch 0011)')
++    def test_a_function_over_the_command_line_cap_is_still_refused_by_name(self):
++        big = (0x90000, struct.pack('<I', 0xD503201F) * (aot_lift.MAX_LIFT_BYTES // 4 + 1) + struct.pack('<I', aot_lift.RET))
++        with self.assertRaises(aot_lift.LiftError) as e: self.build(functions(3) + [big])
++        self.assertIn('0x90000', str(e.exception).replace('0x090000', '0x90000'))
++        self.assertIn(str(aot_lift.MAX_LIFT_BYTES), str(e.exception))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/dm/tools/tests/test_aot_stub.py b/dm/tools/tests/test_aot_stub.py
+index e24826fa..7631d5ca 100644
+--- a/dm/tools/tests/test_aot_stub.py
++++ b/dm/tools/tests/test_aot_stub.py
+@@ -42,8 +42,8 @@ import contextlib
+ def needs_missing_symbol():
+     """Every function lifted inside the block also refers to a symbol the runtime does not define"""
+     real = aot_lift.lift_function
+-    def lift_function(code, address, ll, entry=None):
+-        real(code, address, ll, entry)
++    def lift_function(code, address, ll, entry=None, lifted=None):
++        real(code, address, ll, entry, lifted)
+         with open(ll, 'a') as f: f.write('\ndeclare void @nx_missing_symbol()\ndefine void @nx_user() { call void @nx_missing_symbol() ret void }\n')
+     aot_lift.lift_function = lift_function
+     try: yield

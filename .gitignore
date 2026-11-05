@@ -48,6 +48,8 @@ frontend/NX2Apple.app/
 /ProdKeys.-v22.5.0/
 .Balatro [0100CD801CE5E000][USA][v0].nsp
 /engine/.git.backup/
+ProdKeys*
+*.keys
 
 # Game packages: never commit a game (a teammate's NSP used to be excluded only by their local .git/info/exclude)
 *.nsp
