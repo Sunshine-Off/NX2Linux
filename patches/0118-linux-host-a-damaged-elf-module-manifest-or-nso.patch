@@ -45,7 +45,7 @@ index cc3b014..b8c6c8c 100644
      etype, machine = struct.unpack_from('<HH', data, 16)
      if etype != 3 or machine != 183: raise ModuleError(f'ELF type {etype} machine {machine}: a shared object (3) for AArch64 (183) is needed')
      phoff, phentsize, phnum = struct.unpack_from('<QxxxxxxxxxxxxxxHH', data, 32)[0], *struct.unpack_from('<HH', data, 54)
-+    if phentsize < PHSIZE: raise ModuleError(f'program header size {phentsize} is smaller than {PHSIZE}')
++    if phnum and phentsize < PHSIZE: raise ModuleError(f'program header size {phentsize} is smaller than {PHSIZE}')
 +    if phoff + phentsize * phnum > len(data): raise ModuleError(f'the program header table ({phnum} entries of {phentsize} bytes at {phoff:#x}) runs past the end of the file ({len(data):#x} bytes)')
      loads, dyn, eh = [], None, None
      for i in range(phnum):
