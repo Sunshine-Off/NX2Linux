@@ -33,6 +33,30 @@ server. The Vulkan triangle test requires a real SDL video backend because a
 Vulkan surface is platform-owned. SDL itself selects Wayland or X11 for normal
 visible windows.
 
+## Sanitizers (ASan and UBSan)
+
+```sh
+source ~/.cache/nx2linux/toolchain-clean/env.sh      # REMILL_BUILD, and DYNARMIC_DIR for the JIT cases
+python3 linux/cli/nx2linux.py sanitize               # build, check, run, print a table
+python3 linux/cli/nx2linux.py sanitize --only host   # only the host libraries (needs no Remill)
+```
+
+This checks the native code that has no other test than the ones that happen to pass: the AOT runtime
+(`aot_runtime.cpp` and `aot_jit.cpp` in the engine, with the SIGSEGV handler of the inline memory accesses)
+and the libraries here (`gpu.c`, `nvnrec.c`, `audio.c`, `movie.c`, `display.c`). It needs clang with its
+`compiler-rt` package. It never touches the normal build: the libraries are built by clang into
+`~/.cache/nx2linux/build-host-asan` (`--build-dir` changes that) with `-DNX2LINUX_SANITIZE=address,undefined`,
+an option that is empty by default. The AOT runtime is built the same way by `AOT_SANITIZE=address,undefined`,
+which also gives it a cache key of its own. The lifted functions stay uninstrumented.
+
+The command refuses a build that has no sanitizer in it, runs the C tests with `ctest` and the engine
+tests that use the libraries, and prints one row per case: `clean`, `SANITIZER` (a report, the process
+stops at the first), `FAILED` (a test failed with no report) or `skipped` with its reason (no Remill, no
+dynarmic). A case that needs a missing tool is skipped, never dropped. The sanitizer runtime is preloaded
+into the Python of the child process only. `--vulkan soft` runs the GPU tests on llvmpipe, `--leaks` turns
+leak detection on (off by default, the Vulkan drivers and Python leak at exit from code that has no
+symbols here). Each case's full output is kept in `<build dir>/logs/`.
+
 ## OpenGL on Vulkan
 
 Some games render with OpenGL, not NVN: Balatro's LOVE 11.4 asks for a core profile
