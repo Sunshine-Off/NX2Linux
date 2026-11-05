@@ -1,0 +1,431 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 20:41:53 +0100
+Subject: [PATCH] Linux host: aot_cost.py measures what a recompiled game costs
+ in disk and time, on generated code and on a cache (#18)
+
+measure: generated C compiled for AArch64, lifted by Remill and compiled in six variants (no unwind tables, slim
+objects, -Os, -O1, thin LTO, 64 functions per object), with the size and the sections of the objects, the CPU time,
+the compressed sizes and the link. cache-stats: read-only, the files and sizes of an AOT cache folder and, for a
+random sample of its objects, their sections and compression. No behaviour of the build changes: this only measures.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: A tool that measures the disk and time cost of a recompiled game, so that the choice of how to lower it rests on numbers
+Issue: Sunshine-Off/NX2Linux#18
+
+---
+ dm/tools/aot_cost.py            | 255 ++++++++++++++++++++++++++++++++
+ dm/tools/tests/test_aot_cost.py | 140 ++++++++++++++++++
+ 2 files changed, 395 insertions(+)
+ create mode 100644 dm/tools/aot_cost.py
+ create mode 100644 dm/tools/tests/test_aot_cost.py
+
+diff --git a/dm/tools/aot_cost.py b/dm/tools/aot_cost.py
+new file mode 100644
+index 00000000..4c731146
+--- /dev/null
++++ b/dm/tools/aot_cost.py
+@@ -0,0 +1,255 @@
++#!/usr/bin/env python3
++"""What a recompiled game costs on disk and in time, and what each way of lowering it would save (NX2Linux Phase 2, #18). A full build of Xenoblade 2 is about 98,000 objects, about 12 GB and 1,430 to 1,541 s on
++16 cores, and every user pays it (the code is derived from the game, so it cannot be shipped). This measures the options on code that is not the game's, and reads a real cache without writing to it.
++  measure      a corpus of AArch64 functions (generated C, compiled by aarch64-linux-gnu-gcc: loops, switches, floats, structures, calls; deterministic, no game data) is lifted by Remill and compiled in each variant.
++               Per variant: the size of the objects and what is in them (code, unwind tables, symbols, relocations, other), the CPU time of the compile, the size once compressed, and the link.
++  cache-stats  read-only: for a cache folder (aot-cache), the files and sizes by kind, the distribution of the object sizes, and for a random sample of objects the same section breakdown and compression ratio.
++               It reads object files (code derived from the game) on your machine and prints sizes only.
++Variants (all are the current command, `clang++ -c -O2 -fPIC`, with one change):
++  base          as it is today
++  no-unwind     + -fno-unwind-tables -fno-asynchronous-unwind-tables: no .eh_frame in an object (errors leave the lifted code by longjmp and no C++ exception crosses it)
++  slim          no-unwind + -fno-addrsig -fno-ident (no .llvm_addrsig, no .comment)
++  slim-Os       slim at -Os     slim-O1    slim at -O1     (the code gets slower or faster: this table measures size and compile time, not run time)
++  group64       slim, 64 functions linked into one module (llvm-link) and compiled as one object
++  thin-lto      slim with -flto=thin (objects are bitcode: the optimisation moves to the link)
++Usage: aot_cost.py measure [--functions N] [--jobs J] [--seed S] [--json OUT]
++       aot_cost.py cache-stats <cache dir> [--sample N] [--seed S] [--no-compress] [--json OUT]
++Needs REMILL_BUILD, aarch64-linux-gnu-gcc, clang++, llvm-readelf and llvm-link for measure; llvm-readelf for cache-stats."""
++import argparse, concurrent.futures as cf, json, lzma, os, random, re, resource, shutil, statistics, subprocess, sys, tempfile, time, zlib
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++
++BASE_FLAGS = ['-c', '-O2', '-fPIC', '-Wno-override-module']
++UNWIND = ['-fno-unwind-tables', '-fno-asynchronous-unwind-tables']
++SLIM = UNWIND + ['-fno-addrsig', '-fno-ident']
++VARIANTS = {'base': BASE_FLAGS, 'no-unwind': BASE_FLAGS + UNWIND, 'slim': BASE_FLAGS + SLIM,
++            'slim-Os': [f for f in BASE_FLAGS if f != '-O2'] + ['-Os'] + SLIM, 'slim-O1': [f for f in BASE_FLAGS if f != '-O2'] + ['-O1'] + SLIM,
++            'thin-lto': BASE_FLAGS + SLIM + ['-flto=thin']}
++GROUP = 64
++SECTION_KINDS = (('code', re.compile(r'^\.text')), ('unwind', re.compile(r'^\.(eh_frame|rela\.eh_frame)')), ('relocations', re.compile(r'^\.rela')), ('symbols', re.compile(r'^\.(symtab|strtab|shstrtab)$')),
++                 ('data', re.compile(r'^\.(data|rodata|bss)')), ('metadata', re.compile(r'^\.(comment|llvm_addrsig|note)')))
++
++
++# ---- the corpus ----
++def corpus_source(n, rng):
++    """C for about n functions of the kinds a game has: arithmetic chains, loops over arrays, switches, floats, structures, small calls. Deterministic for a seed"""
++    out = ['typedef unsigned long u64; typedef unsigned u32; typedef unsigned char u8; typedef struct { u32 a, b, c; float x, y; u64 id; u8 tag[8]; } S;', 'volatile u64 sink;']
++    names = []
++    for i in range(n):
++        kind = rng.choice(('arith', 'loop', 'switch', 'float', 'struct', 'call', 'bytes', 'loop2'))
++        f = f'f{i}'
++        if kind == 'arith':
++            body = ' '.join(f'a = (a {rng.choice("+-^|&")} b) {rng.choice(["*", "+", "^"])} {rng.randrange(3, 99)}u; b = (b << {rng.randrange(1, 9)}) ^ (a >> {rng.randrange(1, 9)});' for _ in range(rng.randrange(2, 14)))
++            out.append(f'u64 {f}(u64 a, u64 b) {{ {body} return a ^ b; }}')
++        elif kind == 'loop':
++            out.append(f'u64 {f}(const u32 *p, u32 n, u32 k) {{ u64 s = {rng.randrange(1, 9)}; for (u32 i = 0; i < n; i++) {{ s += (u64)p[i] * (i + k); if (p[i] > k) s ^= p[i] << {rng.randrange(1, 9)}; }} return s; }}')
++        elif kind == 'loop2':
++            out.append(f'void {f}(u8 *d, const u8 *s, u32 n) {{ for (u32 i = 0; i < n; i++) d[i] = (u8)((s[i] * {rng.randrange(2, 9)} + i) ^ {rng.randrange(1, 255)}); }}')
++        elif kind == 'switch':
++            cases = rng.randrange(3, 24)
++            body = ' '.join(f'case {j}: r = r * {rng.randrange(2, 9)} + {rng.randrange(1, 99)}; break;' for j in range(cases))
++            out.append(f'u32 {f}(u32 x, u32 r) {{ switch (x) {{ {body} default: r ^= x; }} return r; }}')
++        elif kind == 'float':
++            out.append(f'float {f}(float a, float b, float c) {{ float r = a * b + c; {" ".join(f"r = r * {rng.randrange(2, 9)}.5f - a / (b + {rng.randrange(1, 9)}.25f);" for _ in range(rng.randrange(1, 6)))} return r > c ? r : c; }}')
++        elif kind == 'struct':
++            out.append(f'void {f}(S *s, const S *t, u32 k) {{ s->a += t->b * k; s->b = t->c ^ k; s->c = s->a + s->b; s->x = t->x * {rng.randrange(2, 9)}.0f + t->y; s->y = s->x - {rng.randrange(1, 9)}.5f; s->id = t->id + k; for (int i = 0; i < 8; i++) s->tag[i] = t->tag[i] + (u8)k; }}')
++        elif kind == 'call' and names:
++            callee = rng.choice([nm for nm, sig in names if sig == 'u64'] or [None])
++            if callee: out.append(f'u64 {f}(u64 a, u64 b) {{ u64 r = {callee}(a, b); sink = r; return {callee}(r, a) + b; }}')
++            else: out.append(f'u64 {f}(u64 a, u64 b) {{ return a * b + {i}; }}')
++        else:
++            out.append(f'u64 {f}(u64 a, u64 b) {{ return a * b + {i}; }}')
++        if out[-1].startswith('u64 ') and '(u64 a, u64 b)' in out[-1]: names.append((f, 'u64'))
++    return '\n'.join(out) + '\n'
++
++
++def build_corpus(n, seed, tmp):
++    """[(address, bytes)] of the functions of generated code compiled for AArch64"""
++    gcc = shutil.which('aarch64-linux-gnu-gcc')
++    if not gcc: sys.exit('[RED] aot_cost: needs aarch64-linux-gnu-gcc')
++    src, elf = Path(tmp) / 'corpus.c', Path(tmp) / 'corpus.elf'
++    src.write_text(corpus_source(n, random.Random(seed)))
++    base = 0x10000
++    r = subprocess.run([gcc, '-O2', '-ffreestanding', '-fno-stack-protector', '-fno-pic', '-march=armv8-a', '-mno-outline-atomics', '-nostdlib', '-static', f'-Wl,-Ttext={base:#x}', '-Wl,-e,f0', '-o', str(elf), str(src)],
++                       capture_output=True, text=True)
++    if r.returncode: sys.exit('[RED] aot_cost: the corpus does not compile:\n' + r.stderr[-1500:])
++    flat = Path(tmp) / 'text.bin'
++    subprocess.run([gcc.replace('gcc', 'objcopy'), '-O', 'binary', '-j', '.text', str(elf), str(flat)], check=True)
++    nm = subprocess.run([gcc.replace('gcc', 'nm'), '-S', '-n', str(elf)], check=True, capture_output=True, text=True).stdout.splitlines()
++    data = flat.read_bytes(); out = []
++    for line in nm:
++        p = line.split()
++        if len(p) == 4 and p[2] in 'Tt' and p[3].startswith('f'):
++            a, size = int(p[0], 16), int(p[1], 16)
++            if size >= 8: out.append((a, data[a - base:a - base + size]))
++    return out
++
++
++# ---- reading objects ----
++def sections(path):
++    """{kind: bytes} of an object, every section including the ones that are not loaded (symbols, relocations, names): grouped as code, unwind, relocations, symbols, data, metadata, other, and `headers` for the
++    rest of the file (the ELF header, the table of section headers, padding)"""
++    r = subprocess.run(['llvm-readelf', '-S', '-W', str(path)], capture_output=True, text=True)
++    out = group_sections(r.stdout)
++    out['headers'] = max(0, Path(path).stat().st_size - sum(out.values()))
++    return out
++
++
++def group_sections(text):
++    """The sections of `llvm-readelf -S -W` by kind: lines like `[ 3] .text PROGBITS 0000000000000000 000040 000050 00 AX 0 0 16`"""
++    out = {}
++    for line in text.splitlines():
++        m = re.match(r'\s*\[\s*(\d+)\]\s+(\S+)\s+(\S+)\s+[0-9a-f]+\s+[0-9a-f]+\s+([0-9a-f]+)\s', line)
++        if not m or m.group(1) == '0' or m.group(3) == 'NOBITS': continue
++        kind = next((k for k, rx in SECTION_KINDS if rx.search(m.group(2))), 'other')
++        out[kind] = out.get(kind, 0) + int(m.group(4), 16)
++    return out
++
++
++def percentiles(values):
++    v = sorted(values)
++    if not v: return {}
++    def q(f): return v[min(len(v) - 1, int(f * len(v)))]
++    return dict(min=v[0], p50=q(0.5), p90=q(0.9), p99=q(0.99), max=v[-1], mean=round(statistics.fmean(v)))
++
++
++def compress_sizes(blobs):
++    """Sizes of the blobs concatenated and compressed: zlib 6 (gzip) and xz 1, plus zstd 3 when the interpreter or the zstd tool has it; and the same one blob at a time (a cache that compresses each object)"""
++    whole = b''.join(blobs)
++    out = {'raw': len(whole), 'gzip6': len(zlib.compress(whole, 6)), 'xz1': len(lzma.compress(whole, preset=1)), 'gzip6_each': sum(len(zlib.compress(b, 6)) for b in blobs)}
++    try:
++        from compression import zstd
++        out['zstd3'] = len(zstd.compress(whole, level=3)); out['zstd3_each'] = sum(len(zstd.compress(b, level=3)) for b in blobs)
++    except ImportError:
++        if shutil.which('zstd'):
++            out['zstd3'] = len(subprocess.run(['zstd', '-3', '-c', '-q'], input=whole, capture_output=True).stdout)
++    return out
++
++
++# ---- measure ----
++def cpu_seconds():
++    """User and system CPU time of every child process that has finished so far"""
++    r = resource.getrusage(resource.RUSAGE_CHILDREN)
++    return r.ru_utime + r.ru_stime
++
++
++def timed(cmd):
++    t = time.perf_counter(); r = subprocess.run(cmd, capture_output=True, text=True, errors='replace'); dt = time.perf_counter() - t
++    if r.returncode: raise RuntimeError(f'{" ".join(map(str, cmd))[:200]}: {r.stderr[-400:]}')
++    return dt
++
++
++def measure(a):
++    import aot_lift
++    if not aot_lift.lifter(): sys.exit('[RED] aot_cost: needs REMILL_BUILD')
++    for tool in ('llvm-readelf', 'llvm-link', 'clang++'):
++        if not shutil.which(tool): sys.exit(f'[RED] aot_cost: needs {tool}')
++    jobs = a.jobs or max(1, (os.cpu_count() or 2) - 2)
++    res = {'functions': 0, 'variants': {}}
++    with tempfile.TemporaryDirectory(prefix='aot-cost-') as tmp:
++        funcs = build_corpus(a.functions, a.seed, tmp)
++        res['functions'] = len(funcs); res['code_bytes_aarch64'] = sum(len(c) for _, c in funcs)
++        t, c0 = time.perf_counter(), cpu_seconds()
++        def lift(item):
++            addr, code = item; ll = os.path.join(tmp, f'f{addr:x}.ll')
++            t0 = time.perf_counter(); aot_lift.lift_function(code, addr, ll); return ll, time.perf_counter() - t0
++        with cf.ThreadPoolExecutor(jobs) as ex: lifted = list(ex.map(lift, funcs))
++        lls = [l for l, _ in lifted]
++        res['lift'] = dict(cpu_seconds=round(cpu_seconds() - c0, 2), wall_seconds=round(time.perf_counter() - t, 2), ll_bytes=sum(os.path.getsize(l) for l in lls))
++        for name, flags in VARIANTS.items():
++            d = Path(tmp) / name; d.mkdir()
++            def comp(ll, flags=flags, d=d):
++                o = d / (Path(ll).stem + ('.bc' if '-flto=thin' in flags else '.o'))
++                timed(['clang++', *flags, ll, '-o', str(o)]); return o
++            t, c0 = time.perf_counter(), cpu_seconds()
++            with cf.ThreadPoolExecutor(jobs) as ex: done = list(ex.map(comp, lls))
++            res['variants'][name] = row(name, done, cpu_seconds() - c0, time.perf_counter() - t, d, jobs)
++        # groups of 64 functions linked into one module before the compile
++        d = Path(tmp) / 'group64'; d.mkdir(); t, c0 = time.perf_counter(), cpu_seconds()
++        def grp(i):
++            part = lls[i:i + GROUP]
++            timed(['llvm-link', '-S', *part, '-o', str(d / f'g{i}.ll')]); o = d / f'g{i}.o'
++            timed(['clang++', *VARIANTS['slim'], str(d / f'g{i}.ll'), '-o', str(o)]); return o
++        with cf.ThreadPoolExecutor(jobs) as ex: parts = list(ex.map(grp, range(0, len(lls), GROUP)))
++        res['variants']['group64'] = row('group64', parts, cpu_seconds() - c0, time.perf_counter() - t, d, jobs, functions=len(lls))
++    return res
++
++
++def row(name, objs, cpu, wall, d, jobs, functions=None):
++    objs = [Path(o) for o in objs]
++    secs = {}
++    for o in objs:
++        if o.suffix == '.o':
++            for k, v in sections(o).items(): secs[k] = secs.get(k, 0) + v
++    sizes = [o.stat().st_size for o in objs]
++    r = dict(objects=len(objs), functions=functions or len(objs), total_bytes=sum(sizes), bytes_per_function=round(sum(sizes) / (functions or len(objs))), sections=secs, compile_cpu_seconds=round(cpu, 2),
++             compile_wall_seconds=round(wall, 2), compressed=compress_sizes([o.read_bytes() for o in objs]))
++    if name in ('base', 'slim') and shutil.which('clang++'):   # the link, with the symbols nobody defines left alone: the time and the size of the library
++        so = d / 'lib.so'
++        r['link'] = dict(seconds=round(timed(['clang++', '-shared', '-o', str(so), *map(str, objs), '-Wl,--unresolved-symbols=ignore-all']), 2), library_bytes=so.stat().st_size)
++    return r
++
++
++def measure_text(res):
++    base = res['variants']['base']
++    lines = [f"{res['functions']} functions ({res['code_bytes_aarch64']} bytes of AArch64), lifted in {res['lift']['cpu_seconds']} s of CPU ({res['lift']['wall_seconds']} s wall), {res['lift']['ll_bytes']} bytes of IR",
++             f'{"variant":<10} {"objects":>7} {"bytes/func":>10} {"vs base":>8} {"compile CPU s":>13} {"vs base":>8} {"zstd3 whole":>12} {"zstd3 each":>11} {"link s":>7}  sections (bytes)']
++    for name, v in res['variants'].items():
++        c = v['compressed']
++        lines.append(f"{name:<10} {v['objects']:>7} {v['bytes_per_function']:>10} {v['total_bytes'] / base['total_bytes']:>7.0%} {v['compile_cpu_seconds']:>13} {v['compile_cpu_seconds'] / max(base['compile_cpu_seconds'], 1e-9):>7.0%} "
++                     f"{c.get('zstd3', '-'):>12} {c.get('zstd3_each', '-'):>11} {v.get('link', {}).get('seconds', '-'):>7}  " + ', '.join(f'{k} {n}' for k, n in sorted(v['sections'].items(), key=lambda kv: -kv[1])))
++    return '\n'.join(lines)
++
++
++# ---- cache-stats ----
++def cache_stats(a):
++    root = Path(a.cache)
++    objd = root / 'obj'
++    if not objd.is_dir(): sys.exit(f'[RED] aot_cost: {root} has no obj/ folder: it is not an AOT cache')
++    if not shutil.which('llvm-readelf'): sys.exit('[RED] aot_cost: needs llvm-readelf')
++    kinds = {'.o': [], '.syms': [], '.fail': []}
++    for p in objd.rglob('*'):
++        if p.suffix in kinds and p.is_file(): kinds[p.suffix].append(p)
++    lib = list((root / 'lib').glob('*.so')) if (root / 'lib').is_dir() else []
++    res = {'cache': str(root), 'files': {k: dict(count=len(v), bytes=sum(p.stat().st_size for p in v)) for k, v in kinds.items()}, 'libraries': dict(count=len(lib), bytes=sum(p.stat().st_size for p in lib))}
++    objs = kinds['.o']
++    res['object_sizes'] = percentiles([p.stat().st_size for p in objs])
++    sample = random.Random(a.seed).sample(objs, min(a.sample, len(objs)))
++    secs, blobs = {}, []
++    for p in sample:
++        for k, v in sections(p).items(): secs[k] = secs.get(k, 0) + v
++        if not a.no_compress: blobs.append(p.read_bytes())
++    res['sample'] = dict(objects=len(sample), file_bytes=sum(p.stat().st_size for p in sample), sections=secs)
++    if blobs: res['sample']['compressed'] = compress_sizes(blobs)
++    return res
++
++
++def cache_text(res):
++    mb = lambda n: f'{n / 1e6:,.1f} MB'
++    f = res['files']
++    lines = [f"{res['cache']}: {f['.o']['count']} objects ({mb(f['.o']['bytes'])}), {f['.syms']['count']} symbol lists ({mb(f['.syms']['bytes'])}), {f['.fail']['count']} failures ({mb(f['.fail']['bytes'])}), {res['libraries']['count']} finished libraries ({mb(res['libraries']['bytes'])})",
++             'object size in bytes: ' + ', '.join(f'{k} {v}' for k, v in res['object_sizes'].items())]
++    s = res['sample']
++    tot = sum(s['sections'].values()) or 1
++    lines.append(f"sample of {s['objects']} objects, {s['file_bytes']} bytes; what the sections hold (header and padding not counted): " + ', '.join(f'{k} {n} ({n / tot:.0%})' for k, n in sorted(s['sections'].items(), key=lambda kv: -kv[1])))
++    if 'compressed' in s:
++        c = s['compressed']
++        lines.append('sample compressed: ' + ', '.join(f"{k} {n} ({n / c['raw']:.0%})" for k, n in c.items() if k != 'raw'))
++    return '\n'.join(lines)
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter)
++    sub = ap.add_subparsers(dest='cmd', required=True)
++    m = sub.add_parser('measure'); m.add_argument('--functions', type=int, default=300); m.add_argument('--jobs', type=int, default=0); m.add_argument('--seed', type=int, default=1); m.add_argument('--json')
++    c = sub.add_parser('cache-stats'); c.add_argument('cache'); c.add_argument('--sample', type=int, default=500); c.add_argument('--seed', type=int, default=1); c.add_argument('--no-compress', action='store_true'); c.add_argument('--json')
++    a = ap.parse_args(argv)
++    res = measure(a) if a.cmd == 'measure' else cache_stats(a)
++    print(measure_text(res) if a.cmd == 'measure' else cache_text(res))
++    if a.json: Path(a.json).write_text(json.dumps(res, indent=1) + '\n')
++    return 0
++
++
++if __name__ == '__main__': sys.exit(main())
+diff --git a/dm/tools/tests/test_aot_cost.py b/dm/tools/tests/test_aot_cost.py
+new file mode 100644
+index 00000000..79414d20
+--- /dev/null
++++ b/dm/tools/tests/test_aot_cost.py
+@@ -0,0 +1,140 @@
++"""aot_cost.py (NX2Linux Phase 2, #18): the tool that measures what a recompiled game costs in disk and time, on code that is not the game's. The parsing and the arithmetic need nothing. The corpus needs
++aarch64-linux-gnu-gcc, the measurement REMILL_BUILD and clang++ too, and the cache statistics need llvm-readelf and clang: each is skipped without them. No game data: the corpus is generated C."""
++import json, os, shutil, subprocess, sys, tempfile, unittest
++from pathlib import Path
++from unittest import mock
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_cost as ac
++import random
++
++GCC = shutil.which('aarch64-linux-gnu-gcc')
++READELF = shutil.which('llvm-readelf')
++REMILL = bool(os.environ.get('REMILL_BUILD')) and bool(READELF) and bool(shutil.which('llvm-link')) and bool(shutil.which('clang++')) and bool(GCC)
++
++READELF_TEXT = """Section Headers:
++  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al
++  [ 0]                   NULL            0000000000000000 000000 000000 00      0   0  0
++  [ 1] .text             PROGBITS        0000000000000000 000040 000050 00  AX  0   0 16
++  [ 2] .rela.text        RELA            0000000000000000 000090 000030 18   I  5   1  8
++  [ 3] .eh_frame         PROGBITS        0000000000000000 0000c0 000038 00   A  0   0  8
++  [ 4] .bss              NOBITS          0000000000000000 0000f8 000100 00  WA  0   0  1
++  [ 5] .symtab           SYMTAB          0000000000000000 0000f8 000060 18      6   2  8
++  [ 6] .strtab           STRTAB          0000000000000000 000158 000020 00      0   0  1
++  [ 7] .comment          PROGBITS        0000000000000000 000178 000010 01  MS  0   0  1
++  [ 8] .llvm_addrsig     LLVM_ADDRSIG    0000000000000000 000188 000004 00   E  5   0  1
++  [ 9] .shstrtab         STRTAB          0000000000000000 00018c 000050 00      0   0  1
++"""
++
++
++class Parsing(unittest.TestCase):
++    def test_sections_are_grouped_by_kind_and_the_empty_and_bss_ones_are_left_out(self):
++        g = ac.group_sections(READELF_TEXT)
++        self.assertEqual(g, {'code': 0x50, 'relocations': 0x30, 'unwind': 0x38, 'symbols': 0x60 + 0x20 + 0x50, 'metadata': 0x10 + 0x04})   # .bss (NOBITS) and the null section do not count
++
++    def test_the_eh_frame_relocations_are_unwind_not_relocations(self):
++        g = ac.group_sections('  [ 1] .rela.eh_frame     RELA            0000000000000000 000040 000018 18   I  5   3  8\n  [ 2] .rela.text RELA 0000000000000000 000058 000018 18 I 5 1 8\n')
++        self.assertEqual(g, {'unwind': 0x18, 'relocations': 0x18})
++
++    def test_percentiles(self):
++        p = ac.percentiles([10, 20, 30, 40, 1000])
++        self.assertEqual((p['min'], p['p50'], p['max'], p['mean']), (10, 30, 1000, 220)); self.assertEqual(ac.percentiles([]), {})
++
++    def test_compression_sizes_are_consistent(self):
++        blobs = [bytes(range(256)) * 8 for _ in range(10)]
++        c = ac.compress_sizes(blobs)
++        self.assertEqual(c['raw'], 20480)
++        for k in ('gzip6', 'xz1', 'gzip6_each'): self.assertLess(c[k], c['raw'])
++        self.assertLess(c['gzip6'], c['gzip6_each'])   # the same blobs compressed together are smaller than one at a time: that is the whole point of grouping
++
++    def test_the_variants_differ_from_base_by_what_their_name_says(self):
++        v = ac.VARIANTS
++        self.assertEqual(set(v['no-unwind']) - set(v['base']), {'-fno-unwind-tables', '-fno-asynchronous-unwind-tables'})
++        self.assertTrue({'-fno-addrsig', '-fno-ident'} <= set(v['slim'])); self.assertIn('-Os', v['slim-Os']); self.assertNotIn('-O2', v['slim-Os']); self.assertIn('-O1', v['slim-O1'])
++        self.assertIn('-flto=thin', v['thin-lto']); self.assertEqual([f for f in v['base']], ['-c', '-O2', '-fPIC', '-Wno-override-module'])   # the current command of aot_lift.compile_ll
++
++    def test_the_base_flags_are_the_ones_aot_lift_really_uses(self):
++        src = (HERE.parent / 'aot_lift.py').read_text()
++        self.assertIn("['clang++', '-c', '-O2', '-fPIC', '-Wno-override-module', ll, '-o', obj]", src)   # if the real command changes, the baseline of this tool is wrong
++
++
++class Corpus(unittest.TestCase):
++    def test_the_source_is_deterministic_and_varied(self):
++        a, b = ac.corpus_source(120, random.Random(5)), ac.corpus_source(120, random.Random(5))
++        self.assertEqual(a, b); self.assertNotEqual(a, ac.corpus_source(120, random.Random(6)))
++        for kind in ('switch (', 'float', 'for (', 'S *s'): self.assertIn(kind, a)
++
++    @unittest.skipUnless(GCC, 'needs aarch64-linux-gnu-gcc')
++    def test_the_corpus_compiles_and_gives_functions_with_their_bytes(self):
++        with tempfile.TemporaryDirectory() as d:
++            funcs = ac.build_corpus(80, 3, d)
++        self.assertGreater(len(funcs), 60); self.assertTrue(all(len(c) >= 8 and len(c) % 4 == 0 for _, c in funcs))
++        self.assertEqual(len({a for a, _ in funcs}), len(funcs))
++
++
++@unittest.skipUnless(REMILL, 'needs REMILL_BUILD, aarch64-linux-gnu-gcc, clang++, llvm-readelf and llvm-link')
++class Measure(unittest.TestCase):
++    def test_a_small_measurement_has_every_variant_and_the_shapes_the_proposal_relies_on(self):
++        import argparse
++        res = ac.measure(argparse.Namespace(functions=40, jobs=2, seed=2))
++        self.assertEqual(set(res['variants']), {'base', 'no-unwind', 'slim', 'slim-Os', 'slim-O1', 'thin-lto', 'group64'})
++        b, s, g = res['variants']['base'], res['variants']['slim'], res['variants']['group64']
++        self.assertGreater(res['functions'], 30); self.assertEqual(b['objects'], res['functions'])
++        self.assertLessEqual(s['total_bytes'], b['total_bytes'])   # the slim flags remove sections, never add one
++        self.assertLess(g['objects'], b['objects']); self.assertLess(g['bytes_per_function'], b['bytes_per_function'])   # one object per group of 64: the headers and symbols are paid once
++        self.assertLess(b['compressed']['gzip6'], b['compressed']['raw']); self.assertIn('link', b)
++        self.assertIn('code', b['sections']); self.assertIn('headers', b['sections'])
++        text = ac.measure_text(res)
++        for name in res['variants']: self.assertIn(name, text)
++
++
++@unittest.skipUnless(READELF and shutil.which('clang'), 'needs llvm-readelf and clang')
++class CacheStats(unittest.TestCase):
++    def make_cache(self, d, n=12):
++        """A cache folder shaped like aot_lift's (obj/<2 chars>/<key>.o, .syms, .fail, lib/<key>.so) from real objects of generated C, no game data"""
++        root = Path(d) / 'aot-cache'
++        src = Path(d) / 'a.c'
++        for i in range(n):
++            src.write_text(f'int f{i}(int x) {{ int s = 0; for (int i = 0; i < x + {i}; i++) s += i * {i + 2}; return s; }}\n')
++            key = f'{i:02x}' + 'ab' * 15
++            (root / 'obj' / key[:2]).mkdir(parents=True, exist_ok=True)
++            subprocess.run(['clang', '-c', '-O2', '-fPIC', str(src), '-o', str(root / 'obj' / key[:2] / f'{key}.o')], check=True)
++            (root / 'obj' / key[:2] / f'{key}.syms').write_text('__remill_x')
++        (root / 'obj' / '00' / ('zz' * 16 + '.fail')).write_text('no semantics')
++        (root / 'lib').mkdir(); (root / 'lib' / 'k.so').write_bytes(b'\0' * 5000)
++        return root
++
++    def test_the_counts_the_sizes_and_the_sample_are_read_and_nothing_is_written(self):
++        import argparse
++        with tempfile.TemporaryDirectory() as d:
++            root = self.make_cache(d)
++            before = sorted((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in root.rglob('*'))
++            res = ac.cache_stats(argparse.Namespace(cache=str(root), sample=5, seed=1, no_compress=False))
++            self.assertEqual(sorted((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in root.rglob('*')), before)   # read-only
++        self.assertEqual((res['files']['.o']['count'], res['files']['.syms']['count'], res['files']['.fail']['count']), (12, 12, 1))
++        self.assertEqual((res['libraries']['count'], res['libraries']['bytes']), (1, 5000)); self.assertEqual(res['sample']['objects'], 5)
++        self.assertIn('code', res['sample']['sections']); self.assertIn('compressed', res['sample'])
++        text = ac.cache_text(res)
++        self.assertIn('12 objects', text); self.assertIn('1 finished libraries', text); self.assertIn('sample of 5 objects', text)
++
++    def test_no_compress_does_not_read_the_objects_bytes_for_compression(self):
++        import argparse
++        with tempfile.TemporaryDirectory() as d:
++            root = self.make_cache(d, 4)
++            res = ac.cache_stats(argparse.Namespace(cache=str(root), sample=4, seed=1, no_compress=True))
++        self.assertNotIn('compressed', res['sample'])
++
++    def test_a_folder_that_is_not_a_cache_is_an_explicit_exit(self):
++        import argparse
++        with tempfile.TemporaryDirectory() as d, self.assertRaises(SystemExit) as cm: ac.cache_stats(argparse.Namespace(cache=d, sample=1, seed=1, no_compress=False))
++        self.assertIn('not an AOT cache', str(cm.exception))
++
++    def test_the_command_line_prints_and_writes_json(self):
++        with tempfile.TemporaryDirectory() as d:
++            root = self.make_cache(d, 3)
++            r = subprocess.run([sys.executable, '-I', str(HERE.parent / 'aot_cost.py'), 'cache-stats', str(root), '--sample', '3', '--json', str(Path(d) / 'o.json')], capture_output=True, text=True)
++            self.assertEqual(r.returncode, 0, r.stderr); self.assertIn('3 objects', r.stdout); self.assertEqual(json.loads((Path(d) / 'o.json').read_text())['files']['.o']['count'], 3)
++
++
++if __name__ == '__main__': unittest.main()
