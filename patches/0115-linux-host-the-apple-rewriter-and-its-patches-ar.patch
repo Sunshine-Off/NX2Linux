@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 16:55:46 +0100
+Subject: [PATCH] Linux host: the Apple rewriter and its patches are not
+ applied, with a determinism test
+
+Decision recorded in docs/linux/architecture.md. test_linux_no_rewriter.py proves the NSO to ELF and manifest conversion is deterministic and does not read sdk_patches.
+
+Upstream-Status: fork-only
+Reason: Records that the Linux chain does not need the Apple rewriter and tests the deterministic conversion that replaces it
+Issue: Sunshine-Off/NX2Linux#8
+
+---
+ dm/tools/tests/test_linux_no_rewriter.py | 52 ++++++++++++++++++++++++
+ docs/linux/architecture.md               |  1 +
+ 2 files changed, 53 insertions(+)
+ create mode 100644 dm/tools/tests/test_linux_no_rewriter.py
+
+diff --git a/dm/tools/tests/test_linux_no_rewriter.py b/dm/tools/tests/test_linux_no_rewriter.py
+new file mode 100644
+index 0000000..0426f06
+--- /dev/null
++++ b/dm/tools/tests/test_linux_no_rewriter.py
+@@ -0,0 +1,52 @@
++"""The Linux chain does not run the Apple rewriter (patch_nso.py) and does not need its patches (sdk_patches.py, dm/games/<id>/patches.py): decision of NX2Linux phase 1, docs/linux/architecture.md.
++What replaces it is a deterministic NSO -> ELF + manifest conversion (elf_module.convert_nso). Proven here on synthetic NSOs: the same NSO gives the same bytes, in any output folder and under any name
++of the folder, and no registered patch or build ID can change the result because the conversion never reads them. No game file is needed."""
++import hashlib
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++TOOLS = HERE.parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(TOOLS))
++import elf_module as em
++import module_fixture as mf
++
++try: import capstone  # noqa: F401
++except ImportError: capstone = None
++
++
++def digest(*paths): return [hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in paths]
++
++
++@unittest.skipIf(capstone is None, 'capstone is not installed in this interpreter')
++class Conversion(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
++        self.nso = Path(self.tmp.name) / 'main.nso'; self.nso.write_bytes(mf.build(mf.module_a())[0])
++
++    def convert(self, folder):
++        return em.convert_nso(self.nso, Path(self.tmp.name) / folder, 'main')
++
++    def test_same_input_same_bytes(self):
++        a, b = self.convert('one'), self.convert('two/deeper')
++        self.assertEqual(digest(*a), digest(*b))
++
++    def test_the_manifest_describes_the_nso_and_nothing_added(self):
++        _, man = self.convert('one'); m, _ = em.load_manifest(man)
++        self.assertEqual(m['build_id'], self.nso.read_bytes()[0x40:0x60].hex())
++        self.assertEqual(m['name'], 'main')
++
++    def test_registered_patches_cannot_change_the_result(self):
++        # Make the registered build ID of this NSO look like one patch_nso would cut, then convert again: sdk_patches is not read by the conversion, so nothing moves
++        import sdk_patches
++        before = digest(*self.convert('before'))
++        bid = self.nso.read_bytes()[0x40:0x60][:16].hex()
++        sdk_patches.CUTS[bid] = [(0x0, '00000000', 'ffffffff', 'a cut that must never be applied on Linux')]
++        self.addCleanup(sdk_patches.CUTS.pop, bid, None)
++        self.assertEqual(digest(*self.convert('after')), before)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/docs/linux/architecture.md b/docs/linux/architecture.md
+index d26b4c1..deb4d46 100644
+--- a/docs/linux/architecture.md
++++ b/docs/linux/architecture.md
+@@ -42,6 +42,7 @@ These were taken by the team on 2026-11-04.
+ 3. **Toolchain.** `tools/setup_toolchain.sh` is the official way to get Remill (patched), dynarmic and the Python venv. It is Fedora-oriented today and must work on any Linux in the long run (tracked separately).
+ 4. **`engine/` is synchronised, not tracked.** `python3 tools/engine.py sync` builds it from seedds/nxnative at `.upstream-ref` plus `patches/`. Changes are committed in `engine/` and exported as patches with `tools/engine.py export`.
+ 5. **Language.** Issues and new documents are in English.
++6. **No Apple rewriter.** The Linux chain does not run `patch_nso.py` and does not apply `sdk_patches.py` or `games/<id>/patches.py` (decided 2026-11-05, issue #8). The rewriter exists because Apple's kernel owns `x18`, `tpidr_el0`, `tpidrro_el0` and the system call and timer instructions. On Linux the lifter and runtime handle them (`svc` as a hyper call, the thread registers in the guest state, `cntpct_el0` read by `__nx2_read_cntpct`). The patches fit Apple's address space limits. What replaces the rewriter is a deterministic NSO to ELF and manifest conversion (`test_linux_no_rewriter.py`), and a Linux workaround goes in the profile's `linux_profile.py`. Not proven: acquire ordering of lock loops on x86, the cost of busy waits, and games with larger address needs than the fixed Linux layout. A second game or `module_validate.py` on Xenoblade 2 settles them.
+ 
+ ## Where things live
+ 
