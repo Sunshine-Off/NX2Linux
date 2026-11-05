@@ -58,4 +58,5 @@
 0116-linux-host-horizon-run-build-only-recompiles-int.patch
 0117-linux-host-an-empty-module-folder-is-a-red-line.patch
 0118-linux-host-a-damaged-elf-module-manifest-or-nso.patch
+0119-linux-host-aot-sanitize-builds-the-aot-runtime-w.patch
 0120-linux-host-horizon-run-report-json-and-aot-repor.patch
