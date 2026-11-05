@@ -174,6 +174,11 @@ class Build:
         return out
 
     def run_modules(self) -> None:
+        npdm = self.root / 'ExeFS' / 'main.npdm'
+        if npdm.is_file():
+            head = npdm.read_bytes()[:0x10]
+            if head[:4] == b'META' and not head[0xc] & 1:
+                raise BuildError('modules', 'this is a 32-bit ARM program (its NPDM flags say so), which NX2Linux cannot run. Only 64-bit AArch64 games are supported')
         nsos = [p for p in self.nso_files() if p.name != 'rtld']   # rtld is the host's: the loader never loads it
         if not any(p.name == 'main' for p in nsos):
             raise BuildError('modules', f'ExeFS has no main module (found: {", ".join(p.name for p in nsos) or "nothing"})')
