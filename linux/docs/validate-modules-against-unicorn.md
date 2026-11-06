@@ -44,7 +44,7 @@ Everything the tool runs is `module_validate.py`, which you can also run by hand
 | unliftable | functions Remill cannot lift (only with no fallback) |
 | timeout, died | a batch that hung or a worker that crashed: a result is missing, so the run is not a pass |
 | cases equal | the number of comparisons behind the "equal" column. A row of "equal" with few cases proves little |
-| both fault, budget, fault differs | cases that prove nothing (both fault, over budget) and a case where only one side faulted (a difference) |
+| both fault, budget, fault differs | cases that prove nothing (both fault, over budget) and a case where only one side faulted (a difference). The line under the table gives the case and, when Unicorn is the one that stopped, **the mnemonic of the instruction it stopped on** (`UC_ERR_EXCEPTION on fmov`). Unicorn cannot execute everything Remill lifts, such as half-precision floating point, LSE atomics and pointer authentication, so read the mnemonic before reading it as a defect of the recompiler |
 | MISMATCH cases | cases where registers, flags or memory differ |
 | jump-table jumps | indirect jumps of the tables that stayed native |
 
@@ -60,3 +60,15 @@ The exit status is 0 only when nothing differs, nothing timed out or died, and a
 
 It compares leaf functions and switch functions, with random inputs, one module at a time. A function that calls another, a function that reads
 a system register and the interaction between threads are not compared, because the Unicorn side has no Horizon around it. Equal on 3 seeds is evidence, not a proof of the whole game.
+
+## Running again only the functions that differed
+
+The functions and the inputs are drawn from the seed, so the same command on the same module gives the same cases. A new work folder keeps the earlier results.
+
+```sh
+WORK2=~/.cache/nx2linux/validate-xc2-sdk
+"$NX2_PYTHON" -I engine/dm/tools/validate_game.py "$EXEFS" "$WORK2" sdk \
+    --functions 300 --cases 12 --seeds 1,2,3 --coverage-sample 200 --md ~/xc2-validate-sdk.md
+```
+
+Send back the lines that start with `- sdk` under the table. They hold the mnemonic and the random inputs, not game code.
