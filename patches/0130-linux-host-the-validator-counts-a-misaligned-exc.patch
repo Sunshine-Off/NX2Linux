@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Fri, 6 Nov 2026 15:10:15 +0100
+Subject: [PATCH] Linux host: the validator counts a misaligned exclusive
+ access apart instead of calling it a difference (#15)
+
+The five cases left on Xenoblade 2 sdk are Unicorn stopping on ldxr, ldxrh,
+ldaxr or ldaxrh at an odd address. ARM faults on an exclusive access that is
+not aligned to its size and x86 does not, so the recompiled code goes on.
+misaligned_exclusive() checks the instruction (an exclusive load or store,
+never a byte one) and the real value of its base register at the stop, and
+only then is the case counted in its own column. An unaligned ordinary
+load, any other instruction and an address outside the image are still
+differences.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: Unicorn faults on a misaligned exclusive access and x86 does not: counted apart, only when verified
+Issue: Sunshine-Off/NX2Linux#15
+
+---
+ dm/tools/module_validate.py                 | 29 ++++++++++-
+ dm/tools/tests/test_module_validate.py      | 26 ++++++++++
+ dm/tools/tests/test_module_validate_stop.py | 53 +++++++++++++++++++++
+ dm/tools/tests/test_validate_game.py        | 15 ++++++
+ dm/tools/validate_game.py                   | 14 ++++--
+ 5 files changed, 130 insertions(+), 7 deletions(-)
+
+diff --git a/dm/tools/module_validate.py b/dm/tools/module_validate.py
+index cfb70c6a..ef5c7b51 100644
+--- a/dm/tools/module_validate.py
++++ b/dm/tools/module_validate.py
+@@ -191,6 +191,28 @@ def stop_instruction(pc, img, base):
+     return 'svc' if at(pc - 4) == 'svc' else at(pc)
+ 
+ 
++EXCLUSIVES = {'ldxr', 'ldxrb', 'ldxrh', 'ldaxr', 'ldaxrb', 'ldaxrh', 'stxr', 'stxrb', 'stxrh', 'stlxr', 'stlxrb', 'stlxrh', 'ldxp', 'ldaxp', 'stxp', 'stlxp'}
++
++
++def misaligned_exclusive(pc, img, base, regval):
++    """True when the instruction at pc is an exclusive load or store whose address is not aligned to its size (a pair: to the size of both registers). ARM faults on it and x86 does not, so the recompiled code
++    goes on where Unicorn stops: a known difference, and the only one the validator excuses. Exclusives of a byte, every other instruction and an address outside the image are never excused.
++    regval(name) gives the value of the base register ('x3' or 'sp') at the moment Unicorn stopped"""
++    import capstone
++    off = pc - base
++    if pc % 4 or not 0 <= off <= len(img) - 4: return False
++    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM); md.detail = True
++    i = next(md.disasm(bytes(img[off:off + 4]), pc), None)
++    if i is None or i.mnemonic not in EXCLUSIVES: return False
++    regs = [o for o in i.operands if o.type == capstone.arm64.ARM64_OP_REG]
++    mem = [o for o in i.operands if o.type == capstone.arm64.ARM64_OP_MEM]
++    if not mem or not regs: return False
++    value = regs[1 if i.mnemonic.startswith('st') else 0]   # a store's first register is the status
++    size = 1 if i.mnemonic.endswith('b') else 2 if i.mnemonic.endswith('h') else 8 if md.reg_name(value.reg).startswith('x') else 4
++    if i.mnemonic.endswith('p'): size *= 2
++    return size > 1 and regval(md.reg_name(mem[0].mem.base)) % size != 0
++
++
+ def worker(a):
+     """Run a batch of functions: AOT next to Unicorn; prints one JSON line per function"""
+     import aot_lift
+@@ -223,14 +245,17 @@ def worker(a):
+             for i in range(32): uc.reg_write(UC_ARM64_REG_Q0 + i, vr[f'v{i}'])
+             uc.reg_write(UC_ARM64_REG_FPCR, 0); uc.reg_write(UC_ARM64_REG_FPSR, 0)
+             uc.reg_write(ref.xreg(30), STOP); uc.reg_write(UC_ARM64_REG_SP, STACK + STACK_SIZE - 0x100); uc.reg_write(UC_ARM64_REG_NZCV, nz << 28)
+-            stopped = None
++            stopped, excused = None, False
+             try: uc.emu_start(mod.base + s, STOP, count=200000); fault = None
+-            except UcError as e: fault = str(e); stopped = stop_instruction(uc.reg_read(UC_ARM64_REG_PC), img, mod.base)
++            except UcError as e:
++                fault = str(e); stopped = stop_instruction(uc.reg_read(UC_ARM64_REG_PC), img, mod.base)
++                excused = misaligned_exclusive(uc.reg_read(UC_ARM64_REG_PC), img, mod.base, lambda n: uc.reg_read(UC_ARM64_REG_SP if n == 'sp' else ref.xreg(int(n[1:]))))
+             if fault is None and uc.reg_read(UC_ARM64_REG_PC) != STOP: counts['budget'] += 1; continue
+             aot.reset()
+             got = aot.run(mod.base + s, dict(inp, x30=STOP), nz, STACK + STACK_SIZE - 0x100, vregs=vr)
+             if fault is not None or 'fault' in got:
+                 if fault is not None and 'fault' in got: counts['both-fault'] += 1
++                elif excused and fault is not None: counts['exclusive-misaligned'] += 1   # ARM faults on it, x86 does not: counted apart, never a pass of its own
+                 else: counts['fault-differs'] += 1; r['detail'] = f'inputs {inp} nzcv {nz:04b}: unicorn {fault!r}{f" on {stopped}" if stopped else ""}, aot {got.get("fault")!r}'
+                 continue
+             want = {f'x{i}': uc.reg_read(ref.xreg(i)) for i in range(31)}; want['sp'] = uc.reg_read(UC_ARM64_REG_SP); want['nzcv'] = uc.reg_read(UC_ARM64_REG_NZCV) >> 28
+diff --git a/dm/tools/tests/test_module_validate.py b/dm/tools/tests/test_module_validate.py
+index 40a56ec0..1300ac80 100644
+--- a/dm/tools/tests/test_module_validate.py
++++ b/dm/tools/tests/test_module_validate.py
+@@ -66,4 +66,30 @@ class UnicornCannotRun(unittest.TestCase):
+         self.assertEqual(rows['equal']['counts']['equal'], 4)
+ 
+ 
++@unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++, unicorn and capstone')
++class MisalignedExclusive(unittest.TestCase):
++    """ARM faults on an exclusive load at an address that is not aligned and x86 does not. The validator counts those cases apart instead of calling them a difference"""
++    def run_diff(self, words):
++        RET = 0xD65F03C0
++        spec = dict(name='a', funcs=[mf.Fn('f', True, lambda c, me: words + [RET]), mf.Fn('plain', True, lambda c, me: [0x91000400, RET])], imports=[], data=[], inits=[])
++        with tempfile.TemporaryDirectory() as d:
++            exefs, work = Path(d) / 'ExeFS', Path(d) / 'work'; exefs.mkdir()
++            (exefs / 'a').write_bytes(mf.build(spec)[0])
++            p = subprocess.run([mv.worker_python(), '-I', str(TOOL), 'diff', str(exefs), str(work), 'a', '--functions', '10', '--cases', '60', '--batch', '1', '--jobs', '2'],
++                               capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=f'{TOOL.parent}:{HERE}'), timeout=300)
++            return p, json.loads((work / 'a.diff.json').read_text())
++
++    def test_an_unaligned_exclusive_load_is_counted_apart_and_is_not_a_difference(self):
++        p, rows = self.run_diff([0xC85F7C01])   # ldxr x1, [x0]
++        counts = {k: sum(r.get('counts', {}).get(k, 0) for r in rows) for k in ('exclusive-misaligned', 'fault-differs', 'MISMATCH', 'equal')}
++        self.assertEqual(p.returncode, 0, p.stdout + p.stderr[-400:])
++        self.assertGreater(counts['exclusive-misaligned'], 0); self.assertEqual((counts['fault-differs'], counts['MISMATCH']), (0, 0)); self.assertGreater(counts['equal'], 60)
++
++    def test_an_unaligned_ordinary_load_is_never_excused(self):
++        p, rows = self.run_diff([0xF9400001, 0x1EEE1000])   # ldr x1, [x0] then a half-precision fmov, which Unicorn cannot run
++        counts = {k: sum(r.get('counts', {}).get(k, 0) for r in rows) for k in ('exclusive-misaligned', 'fault-differs')}
++        if not counts['fault-differs']: self.skipTest('this Remill does not lift a half-precision fmov')
++        self.assertNotEqual(p.returncode, 0); self.assertEqual(counts['exclusive-misaligned'], 0)
++
++
+ if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_module_validate_stop.py b/dm/tools/tests/test_module_validate_stop.py
+index 31edfedf..b4339a5a 100644
+--- a/dm/tools/tests/test_module_validate_stop.py
++++ b/dm/tools/tests/test_module_validate_stop.py
+@@ -43,5 +43,58 @@ class Stop(unittest.TestCase):
+         self.assertEqual(mv.stop_instruction(BASE + 6, img, BASE), '?')   # not word aligned
+ 
+ 
++LDXR_X, LDXR_W, LDXRH, LDXRB, LDAXR_X, LDAXRH = 0xC85F7C01, 0x885F7C01, 0x485F7C01, 0x085F7C01, 0xC85FFC01, 0x485FFC01   # ... x1/w1, [x0]
++STXR_X, STLXRH, LDXP_X, STXP_X, LDR_X, LDXR_SP = 0xC8027C01, 0x4802FC01, 0xC87F0801, 0xC8230801, 0xF9400001, 0xC85F7FE1
++LDXP_W = 0x887F0801
++
++
++def misaligned(word, address, reg='x0'):
++    img = struct.pack('<2I', word, RET)
++    return mv.misaligned_exclusive(BASE, img, BASE, lambda name: {reg: address}.get(name, 0))
++
++
++@unittest.skipUnless(READY, 'needs unicorn and capstone')
++class Misaligned(unittest.TestCase):
++    """ARM faults on an exclusive access whose address is not aligned to its size and x86 does not: that is the only difference the validator accepts as a known one, and only for these instructions"""
++    def test_an_exclusive_access_at_an_unaligned_address_is_the_known_difference(self):
++        for word, size in ((LDXR_X, 8), (LDXR_W, 4), (LDXRH, 2), (LDAXR_X, 8), (LDAXRH, 2), (STXR_X, 8), (STLXRH, 2)):
++            for off in range(1, size):
++                self.assertTrue(misaligned(word, 0x1000 + off), (hex(word), off))
++            self.assertFalse(misaligned(word, 0x1000), hex(word))
++
++    def test_a_byte_exclusive_cannot_be_unaligned(self):
++        self.assertFalse(misaligned(LDXRB, 0x1001))
++
++    def test_a_pair_needs_the_alignment_of_both_registers(self):
++        self.assertTrue(misaligned(LDXP_X, 0x1008)); self.assertFalse(misaligned(LDXP_X, 0x1010))
++        self.assertTrue(misaligned(LDXP_W, 0x1004)); self.assertFalse(misaligned(LDXP_W, 0x1008))
++        self.assertTrue(misaligned(STXP_X, 0x1008))
++
++    def test_nothing_else_is_ever_excused(self):
++        self.assertFalse(misaligned(LDR_X, 0x1001), 'an ordinary unaligned load is allowed on ARM')
++        self.assertFalse(misaligned(FMOV_H, 0x1001)); self.assertFalse(misaligned(LDADD, 0x1001)); self.assertFalse(misaligned(UDF, 0x1001)); self.assertFalse(misaligned(SVC, 0x1001))
++
++    def test_the_base_register_can_be_sp(self):
++        img = struct.pack('<2I', LDXR_SP, RET)
++        self.assertTrue(mv.misaligned_exclusive(BASE, img, BASE, lambda name: 0x2004 if name == 'sp' else 0))
++        self.assertFalse(mv.misaligned_exclusive(BASE, img, BASE, lambda name: 0x2008 if name == 'sp' else 0))
++
++    def test_an_address_outside_the_image_is_not_excused(self):
++        img = struct.pack('<2I', LDXR_X, RET)
++        self.assertFalse(mv.misaligned_exclusive(BASE + 0x2000, img, BASE, lambda name: 1)); self.assertFalse(mv.misaligned_exclusive(BASE + 2, img, BASE, lambda name: 1))
++
++    def test_what_unicorn_really_does_agrees(self):
++        for word in (LDXR_X, LDXRH, LDAXR_X, LDAXRH):
++            for off, stops in ((0, False), (1, True)):
++                img = struct.pack('<2I', word, RET)
++                uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM); uc.mem_map(BASE, 0x1000); uc.mem_map(0x20000, 0x1000); uc.mem_write(BASE, img)
++                from unicorn.arm64_const import UC_ARM64_REG_X0
++                uc.reg_write(UC_ARM64_REG_X0, 0x20100 + off)
++                try: uc.emu_start(BASE, BASE + 4); raised = False   # only the exclusive access, not the ret after it
++                except UcError: raised = True
++                self.assertEqual(raised, stops, (hex(word), off))
++                if raised: self.assertTrue(mv.misaligned_exclusive(uc.reg_read(UC_ARM64_REG_PC), img, BASE, lambda name: 0x20100 + off))
++
++
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/dm/tools/tests/test_validate_game.py b/dm/tools/tests/test_validate_game.py
+index 54ebbf8f..9e1011a9 100644
+--- a/dm/tools/tests/test_validate_game.py
++++ b/dm/tools/tests/test_validate_game.py
+@@ -49,6 +49,21 @@ class Table(unittest.TestCase):
+             write(d, 'plain.seed1', 'm', [row('0x1', 'equal', equal=11, **{'fault-differs': 1})])
+             self.assertFalse(vg.summarize(d, ['m'])[1])
+ 
++    def test_misaligned_exclusive_cases_have_their_own_column_and_a_note_and_do_not_fail(self):
++        with tempfile.TemporaryDirectory() as d:
++            write(d, 'plain.seed1', 'm', [row('0x1', 'equal', equal=11, **{'exclusive-misaligned': 4}), row('0x2', 'equal', equal=12)])
++            table, ok = vg.summarize(d, ['m'])
++        self.assertTrue(ok, table); self.assertIn('| misaligned exclusive |', table)
++        self.assertIn('| m | 2 | 2 | 0 | 0 | 0 | 0 | 23 | 0 | 0 | 0 | 4 | 0 | 0 |', table)
++        self.assertIn('4 cases where Unicorn stopped on an exclusive access at an address that is not aligned', table)
++        self.assertIn('2 functions identical to Unicorn over 23 cases', table, 'the excused cases are not counted as compared')
++
++    def test_a_table_without_any_misaligned_exclusive_has_no_note(self):
++        with tempfile.TemporaryDirectory() as d:
++            write(d, 'plain.seed1', 'm', [row('0x1', 'equal', equal=12)])
++            table, ok = vg.summarize(d, ['m'])
++        self.assertTrue(ok); self.assertNotIn('not aligned', table)
++
+     def test_a_table_of_nothing_compared_is_not_a_pass(self):
+         with tempfile.TemporaryDirectory() as d:
+             write(d, 'plain.seed1', 'm', [row('0x1', 'inconclusive', **{'both-fault': 12}), row('0x2', 'unliftable')])
+diff --git a/dm/tools/validate_game.py b/dm/tools/validate_game.py
+index 4eb9e41f..22a9b968 100644
+--- a/dm/tools/validate_game.py
++++ b/dm/tools/validate_game.py
+@@ -53,9 +53,9 @@ def _link(src, dst):
+ def summarize(work, modules):
+     """(markdown, ok): the table of everything the work folder holds"""
+     work = Path(work)
+-    lines, ok, grand = [], True, collections.Counter()
+-    lines.append('| module | functions tested | equal | mismatch | inconclusive | unliftable | timeout, died | cases equal | both fault | budget | fault differs | MISMATCH cases | jump-table jumps |')
+-    lines.append('|---|---|---|---|---|---|---|---|---|---|---|---|---|')
++    lines, ok, grand, misaligned = [], True, collections.Counter(), 0
++    lines.append('| module | functions tested | equal | mismatch | inconclusive | unliftable | timeout, died | cases equal | both fault | budget | fault differs | misaligned exclusive | MISMATCH cases | jump-table jumps |')
++    lines.append('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+     details = []
+     for m in modules:
+         files = sorted(work.glob(f'*/{m}.diff.json')) + sorted(work.glob(f'{m}.diff.json'))
+@@ -67,17 +67,21 @@ def summarize(work, modules):
+                 st[r.get('status', '?')] += 1
+                 for k, v in r.get('counts', {}).items(): cases[k] += v
+                 if r.get('status') in BAD: details.append(f'{m} {f.parent.name} {r.get("function")}: {r.get("status")} {r.get("detail", "")[:300]}')
+-        if not files: lines.append(f'| {m} | no diff result in the work folder | | | | | | | | | | | |'); ok = False; continue
++        if not files: lines.append(f'| {m} | no diff result in the work folder | | | | | | | | | | | | |'); ok = False; continue
+         bad = sum(st[k] for k in BAD) + st['unreadable file']
+         ok = ok and not bad and not cases['MISMATCH'] and not cases['fault-differs']
+         lines.append(f"| {m} | {sum(st.values())} | {st['equal']} | {st['mismatch']} | {st['inconclusive']} | {st['unliftable']} | {st['timeout'] + st['worker-died']} | {cases['equal']} | {cases['both-fault']} | "
+-                     f"{cases['budget']} | {cases['fault-differs']} | {cases['MISMATCH']} | {cases['table-jumps']} |")
++                     f"{cases['budget']} | {cases['fault-differs']} | {cases['exclusive-misaligned']} | {cases['MISMATCH']} | {cases['table-jumps']} |")
++        misaligned += cases['exclusive-misaligned']
+         grand.update({'functions': sum(st.values()), 'equal': st['equal'], 'cases': cases['equal'], 'mismatch': cases['MISMATCH'] + cases['fault-differs']})
+     lines.append('')
+     if ok and not grand['cases']: ok = False; why = 'no case was compared.'
+     else: why = 'a difference, a timeout, a dead worker or a missing result is listed above or below.'
+     lines.append(f"**{grand['equal']} functions identical to Unicorn over {grand['cases']} cases, {grand['mismatch']} cases that differ.**" if ok else '**Not a pass:** ' + why)
+     for d in details: lines.append(f'- {d}')
++    if misaligned:
++        lines += ['', f'{misaligned} cases where Unicorn stopped on an exclusive access at an address that is not aligned to its size. ARM faults on it and x86 does not, so the recompiled code went on. '
++                      'The tool checked the instruction and the address of each one. They are counted apart, they are not cases compared and they do not make the run fail.']
+     cov = []
+     for m in modules:
+         f = work / f'{m}.coverage.json'
