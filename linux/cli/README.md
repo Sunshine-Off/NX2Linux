@@ -10,6 +10,7 @@ python3 linux/cli/nx2linux.py doctor
 python3 linux/cli/nx2linux.py build-host -j2
 python3 linux/cli/nx2linux.py verify --require-vulkan
 python3 linux/cli/nx2linux.py run
+python3 linux/cli/nx2linux.py cache-prune <an AOT cache folder>     # lists the old finished libraries, --delete removes them
 ```
 
 `doctor` also checks that the interpreter of the engine workers imports `capstone`,
