@@ -45,6 +45,7 @@ Everything the tool runs is `module_validate.py`, which you can also run by hand
 | timeout, died | a batch that hung or a worker that crashed: a result is missing, so the run is not a pass |
 | cases equal | the number of comparisons behind the "equal" column. A row of "equal" with few cases proves little |
 | both fault, budget, fault differs | cases that prove nothing (both fault, over budget) and a case where only one side faulted (a difference). The line under the table gives the case and, when Unicorn is the one that stopped, **the mnemonic of the instruction it stopped on** (`UC_ERR_EXCEPTION on fmov`). Unicorn cannot execute everything Remill lifts, such as half-precision floating point, LSE atomics and pointer authentication, so read the mnemonic before reading it as a defect of the recompiler |
+| misaligned exclusive | cases where Unicorn stopped on an exclusive load or store (`ldxr`, `ldaxr`, `stxr`, their byte, half and pair forms) at an address that is not aligned to its size. ARM faults on it and x86 does not, so the recompiled code went on. The tool checks the instruction and the real address of each case before counting it here. They are not cases compared, they do not make the run fail, and code that runs on a Switch never does this |
 | MISMATCH cases | cases where registers, flags or memory differ |
 | jump-table jumps | indirect jumps of the tables that stayed native |
 
