@@ -1,0 +1,563 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Fri, 6 Nov 2026 14:05:45 +0100
+Subject: [PATCH] Linux host: AOT_GROUP=N compiles about N lifted functions
+ into one object (#18)
+
+Option B of the recompilation cost. Every small object takes a 4 KB block
+and repeats its ELF headers and symbols: 622,259 objects held 2.7 GB of
+content in 6.3 GB on disk. With AOT_GROUP=N the IR of about N functions is
+merged by llvm-link and compiled once, with a .grp beside the object. The
+groups are cut by a hash of the addresses, so a change recompiles its group
+and not the ones after it. A group that cannot be merged, or where a function
+needs a symbol the runtime lacks, is split into one object per function.
+Off by default. On 1,000 generated functions with N=64: 26 files against
+2,000, 1.4 MB on disk against 8.7 MB, half the CPU. cache-stats counts the
+.grp files and the run report has group_hits, group_builds, group_splits.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: Option B of the recompilation cost: one object for about N functions, opt-in with AOT_GROUP
+Issue: Sunshine-Off/NX2Linux#18
+
+---
+ dm/tools/aot_cost.py                  |   5 +-
+ dm/tools/aot_lift.py                  | 143 +++++++++++++++---
+ dm/tools/horizon_run.py               |   7 +-
+ dm/tools/tests/test_aot_cache.py      |   5 +-
+ dm/tools/tests/test_aot_cost.py       |  12 ++
+ dm/tools/tests/test_aot_group.py      | 199 ++++++++++++++++++++++++++
+ dm/tools/tests/test_aot_lift_batch.py |   4 +
+ 7 files changed, 352 insertions(+), 23 deletions(-)
+ create mode 100644 dm/tools/tests/test_aot_group.py
+
+diff --git a/dm/tools/aot_cost.py b/dm/tools/aot_cost.py
+index 03c19761..282fc998 100644
+--- a/dm/tools/aot_cost.py
++++ b/dm/tools/aot_cost.py
+@@ -212,7 +212,7 @@ def cache_stats(a):
+         sys.exit(f'[RED] aot_cost: {root} has no obj/ folder: it is not an AOT cache. A cache is the folder given as --cache or AOT_CACHE, with obj/ and lib/ inside (a folder of .elf and .manifest.json files holds modules)'
+                  + (f'. Next to it: {", ".join(near)}' if near else ''))
+     if not shutil.which('llvm-readelf'): sys.exit('[RED] aot_cost: needs llvm-readelf')
+-    kinds = {'.o': [], '.syms': [], '.fail': []}
++    kinds = {'.o': [], '.syms': [], '.fail': [], '.grp': []}   # .grp: the list of a group of functions compiled into one object (AOT_GROUP)
+     for p in objd.rglob('*'):
+         if p.suffix in kinds and p.is_file(): kinds[p.suffix].append(p)
+     lib = list((root / 'lib').glob('*.so')) if (root / 'lib').is_dir() else []
+@@ -232,7 +232,8 @@ def cache_stats(a):
+ def cache_text(res):
+     mb = lambda n: f'{n / 1e6:,.1f} MB'
+     f = res['files']
+-    lines = [f"{res['cache']}: {f['.o']['count']} objects ({mb(f['.o']['bytes'])}), {f['.syms']['count']} symbol lists ({mb(f['.syms']['bytes'])}), {f['.fail']['count']} failures ({mb(f['.fail']['bytes'])}), {res['libraries']['count']} finished libraries ({mb(res['libraries']['bytes'])})",
++    groups = f" {f['.grp']['count']} groups ({mb(f['.grp']['bytes'])})," if f['.grp']['count'] else ''
++    lines = [f"{res['cache']}: {f['.o']['count']} objects ({mb(f['.o']['bytes'])}), {f['.syms']['count']} symbol lists ({mb(f['.syms']['bytes'])}), {f['.fail']['count']} failures ({mb(f['.fail']['bytes'])}),{groups} {res['libraries']['count']} finished libraries ({mb(res['libraries']['bytes'])})",
+              'object size in bytes: ' + ', '.join(f'{k} {v}' for k, v in res['object_sizes'].items())]
+     s = res['sample']
+     tot = sum(s['sections'].values()) or 1
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index 74da7f94..edf5d361 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -215,6 +215,35 @@ def needs_symbols(path, symbols):
+     return [m for m in symbols if m in have]
+ 
+ 
++LLVM_LINK = 'llvm-link'
++
++
++def group_size():
++    """AOT_GROUP: about how many functions share one compiled object. 0 (the default, and any value under 2): one object per function"""
++    try: n = int(os.environ.get('AOT_GROUP', '0'))
++    except ValueError: return 0
++    return n if n >= 2 else 0
++
++
++def group_units(items, size):
++    """The functions (address first in each item) cut into groups of about size, in address order. A group ends before a function whose address hashes to a multiple of size, or at 4 times size,
++    so the boundaries depend on the addresses and not on how many functions come before: adding, removing or changing one function changes its group and at most the next one"""
++    groups, cur = [], []
++    for f in sorted(items, key=lambda f: f[0]):
++        if cur and (int.from_bytes(hashlib.sha256(b'group|%x' % f[0]).digest()[:4], 'big') % size == 0 or len(cur) >= 4 * size): groups.append(cur); cur = []
++        cur.append(f)
++    return groups + ([cur] if cur else [])
++
++
++def ref_symbols(text):
++    """The names the IR of a lifted function uses (calls and references), declarations left out: what its compiled object can leave undefined"""
++    names = set()
++    for line in text.splitlines():
++        if line.startswith('declare ') or re.match(r'@[\w.$]+ = (external|extern_weak)', line): continue
++        names.update(re.findall(r'@([\w.$]+)', line))
++    return names
++
++
+ class Aot:
+     def __init__(self, functions, tmp=None, jit=False, jit_entries=0, jit_ticks=0, jit_depth=8, stub_unliftable=False, jobs=None, cache=None, overrides=(), inline_mem=None):
+         """functions: [(address, bytes)] or [(entry address, bytes, address of the first byte)]: the three-item form lifts from an entry inside the bytes (the targets of a jump table, jump_tables.py).
+@@ -237,9 +266,13 @@ class Aot:
+         lls, self.unlifted = {}, {}
+         cache = cache or os.environ.get('AOT_CACHE') or None
+         self.cache_hits = self.cache_misses = 0
+-        if cache:
++        gsize = group_size()
++        objcache = cache or (os.path.join(d, 'objcache') if gsize else None)   # grouping goes through the object folder: with no cache it is a folder of this build
++        self.group_hits = self.group_builds = self.group_splits = 0
++        if objcache:
+             tk = toolchain_key() + ('|inline' if inline_mem else '')
+             fkeys = {a: hashlib.sha256(f'{tk}|{a:x}|{o:x}|'.encode() + c).hexdigest() for a, c, o in functions}
++        if cache:
+             runtime = ''.join(hashlib.sha256(Path(HERE / f).read_bytes()).hexdigest() for f in ('aot_runtime.cpp', 'aot_runtime.h') + (('aot_jit.cpp',) if jit else ()))
+             key0 = hashlib.sha256(f'{tk}|{int(jit)}|{int(stub_unliftable)}|{runtime}|{os.environ.get("DYNARMIC_DIR") if jit else ""}|{sorted(replaced)}|'.encode() + ''.join(sorted(fkeys.values())).encode()).hexdigest()
+             cached_so, cached_meta = os.path.join(cache, 'lib', f'{key0}.so'), os.path.join(cache, 'lib', f'{key0}.json')
+@@ -249,13 +282,13 @@ class Aot:
+                 self._attach(cached_so, jit, jit_entries, jit_ticks, jit_depth)
+                 return
+         jobs = jobs or (min(16, os.cpu_count() or 1) if len(functions) > 8 else 1)   # remill-lift and clang each handle one function at a time: many functions go through a pool
+-        def lift_items(items):   # -> [(addr, ll, error or None)]: one remill-lift process for the whole list when the lifter has --batch
++        def lift_items(items, inline=True):   # -> [(addr, ll, error or None)]: one remill-lift process for the whole list when the lifter has --batch
+             reqs = [(code, origin, os.path.join(d, f'f{n}_{addr:x}.ll'), addr if addr != origin else None) for addr, code, origin in items]
+             out = []
+             for (addr, code, origin), (_, _, ll, entry), first in zip(items, reqs, _lift_batch(reqs)):
+                 try:
+                     lift_function(code, origin, ll, entry, first)
+-                    if inline_mem: inline_accessors(ll)
++                    if inline_mem and inline: inline_accessors(ll)
+                     out.append((addr, ll, None))
+                 except LiftError as e: out.append((addr, ll, e))
+             return out
+@@ -263,34 +296,101 @@ class Aot:
+         def compile_ll(ll, obj):
+             r = subprocess.run(['clang++', '-c', '-O2', '-fPIC', '-Wno-override-module', ll, '-o', obj], capture_output=True, text=True, errors='replace')
+             if r.returncode: raise LinkError(f'build of {ll} failed:\n' + r.stderr[-1500:])
+-        if cache:
+-            def paths_of(addr): return os.path.join(cache, 'obj', fkeys[addr][:2], fkeys[addr])
+-            found, pending = {}, []   # what the cache already holds (an object, or the reason a function cannot be lifted), and what it lacks
+-            for item in functions:
+-                base_path = paths_of(item[0])
+-                if os.path.exists(base_path + '.o'): found[item[0]] = (item[0], base_path + '.o', None, True)
+-                elif os.path.exists(base_path + '.fail'): found[item[0]] = (item[0], None, Path(base_path + '.fail').read_text(), True)
++        uses, group_of, group_items = {}, {}, {}   # for the functions of a grouped object: the symbols each leaves undefined, its group, and the functions of every group
++        if objcache:
++            def paths_of(key): return os.path.join(objcache, 'obj', key[:2], key)
++            found, pending, pending_groups = {}, [], []   # found: address -> (address, object key, object path, why it cannot be lifted, was in the cache)
++            def look_single(item):
++                base_path = paths_of(fkeys[item[0]])
++                if os.path.exists(base_path + '.o'): found[item[0]] = (item[0], item[0], base_path + '.o', None, True)
++                elif os.path.exists(base_path + '.fail'): found[item[0]] = (item[0], item[0], None, Path(base_path + '.fail').read_text(), True)
+                 else: pending.append(item)
++            def read_group(gkey, group):   # True when the cache holds the group: as one object, or split into one per function
++                try: meta = json.loads(Path(paths_of(gkey) + '.grp').read_text())
++                except (OSError, ValueError): return False
++                if meta.get('split'):
++                    for item in group: look_single(item)
++                    return True
++                obj = paths_of(gkey) + '.o'
++                if meta['defs'] and not os.path.exists(obj): return False
++                for item in group:
++                    a = item[0]
++                    if str(a) in meta['fail']: found[a] = (a, gkey, None, meta['fail'][str(a)], True)
++                    else: found[a] = (a, gkey, obj, None, True); uses[a] = meta['uses'].get(str(a), []); group_of[a] = gkey
++                group_items[gkey] = group
++                self.group_hits += 1
++                return True
++            for group in (group_units(functions, gsize) if gsize else [[f] for f in functions]):
++                if not gsize: look_single(group[0]); continue
++                gkey = hashlib.sha256(('group|' + '|'.join(fkeys[f[0]] for f in group)).encode()).hexdigest()
++                if not read_group(gkey, group): pending_groups.append((gkey, group))
+             def fill(chunk):   # lifts the functions of the chunk together, compiles each, and records objects and failures under their keys
+                 res = []
+                 for addr, ll, e in lift_items(chunk):
+-                    base_path = paths_of(addr)
+-                    if e is not None: _atomic(base_path + '.fail', str(e).encode()); res.append((addr, None, str(e), False)); continue
++                    base_path = paths_of(fkeys[addr])
++                    if e is not None: _atomic(base_path + '.fail', str(e).encode()); res.append((addr, addr, None, str(e), False)); continue
+                     tmp_obj = ll[:-3] + '.o'
+                     compile_ll(ll, tmp_obj)
+                     _atomic(base_path + '.syms', ' '.join(undefined_symbols(tmp_obj)).encode())
+                     _atomic(base_path + '.o', Path(tmp_obj).read_bytes())
+                     os.unlink(ll); os.unlink(tmp_obj)
+-                    res.append((addr, base_path + '.o', None, False))
++                    res.append((addr, addr, base_path + '.o', None, False))
+                 return res
++            def fill_group(task):   # -> (key, group, entries, symbols each function uses, why it was split or None)
++                gkey, group = task
++                base_path = paths_of(gkey)
++                lifted = lift_items(group, inline=False)
++                ok = [(a, ll) for a, ll, e in lifted if e is None]
++                fails = {str(a): str(e) for a, ll, e in lifted if e is not None}
++                use, made = {}, []
++                try:
++                    if ok:
++                        texts = {a: Path(ll).read_text() for a, ll in ok}
++                        if len(ok) == 1: merged = ok[0][1]
++                        else:
++                            merged = os.path.join(d, f'g{n}_{group[0][0]:x}.ll'); made.append(merged)
++                            r = subprocess.run([LLVM_LINK, '-S', *[ll for _, ll in ok], '-o', merged], capture_output=True, text=True, errors='replace')
++                            if r.returncode: raise LinkError('llvm-link failed:\n' + r.stderr[-800:])
++                        if inline_mem: inline_accessors(merged)
++                        tmp_obj = merged[:-3] + '.o'; made.append(tmp_obj)
++                        compile_ll(merged, tmp_obj)
++                        undef = set(undefined_symbols(tmp_obj))
++                        use = {str(a): sorted(ref_symbols(t) & undef) for a, t in texts.items()}
++                except (LinkError, OSError) as e:   # a group that cannot be merged or compiled becomes one object per function, which is what an ungrouped build does
++                    for p in made + [ll for _, ll in ok]:
++                        if os.path.exists(p): os.unlink(p)
++                    _atomic(base_path + '.grp', json.dumps({'split': True, 'why': str(e)[:300]}).encode())
++                    return gkey, group, fill(group), {}, str(e)
++                if ok: _atomic(base_path + '.o', Path(tmp_obj).read_bytes())
++                _atomic(base_path + '.grp', json.dumps({'defs': [a for a, _ in ok], 'uses': use, 'fail': fails}).encode())   # last: the group is in the cache once this is there
++                for p in made + [ll for _, ll in ok]:
++                    if os.path.exists(p): os.unlink(p)
++                return gkey, group, [(a, gkey, base_path + '.o', None, False) if str(a) not in fails else (a, gkey, None, fails[str(a)], False) for a, _, _ in group], use, None
++            def split_group(gkey):   # one function of the group cannot go into an object with the others: the group is kept as one object per function
++                group = group_items[gkey]
++                _atomic(paths_of(gkey) + '.grp', json.dumps({'split': True, 'why': 'a function of the group needs a symbol the runtime does not define'}).encode())
++                for item in group: lls.pop(item[0], None); uses.pop(item[0], None); group_of.pop(item[0], None)
++                objs.pop(gkey, None)
++                for a, key, path, why, hit in fill(group):
++                    if path: lls[a] = objs[key] = path
++                self.group_splits += 1
++            tasks = [(fill_group, g) for g in pending_groups] + [(fill, c) for c in chunks(pending)]
+             with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
+-                for res in ex.map(fill, chunks(pending)):
++                for task, out in zip(tasks, ex.map(lambda t: t[0](t[1]), tasks)):
++                    if task[0] is fill:
++                        for r in out: found[r[0]] = r
++                        continue
++                    gkey, group, res, use, why = out
+                     for r in res: found[r[0]] = r
++                    if why: self.group_splits += 1; continue
++                    self.group_builds += 1; group_items[gkey] = group
++                    for r in res:
++                        if r[2]: uses[r[0]] = use.get(str(r[0]), []); group_of[r[0]] = gkey
+             done = [found[item[0]] for item in functions]
+-            objs = {}
+-            for addr, path, why, hit in done:
++            objs = {}   # object key (the address of a function, or the key of a group) -> object path
++            for addr, key, path, why, hit in done:
+                 self.cache_hits += hit; self.cache_misses += not hit
+-                if path: lls[addr] = objs[addr] = path
++                if path: lls[addr] = objs[key] = path
+                 else:
+                     if not stub_unliftable: raise LiftError(why)
+                     self.unlifted[addr] = why
+@@ -341,8 +441,15 @@ class Aot:
+                 lacking = [m for m in missing if not m.startswith('sub_')]   # a sub_ symbol is a function nobody gave: that stays an error
+                 bad = {}
+                 if lacking:
+-                    with concurrent.futures.ThreadPoolExecutor(jobs) as ex: found = list(ex.map(lambda kv: (kv[0], needs_symbols(kv[1], lacking)), list(lls.items())))
++                    def blame(kv):   # the symbols of lacking that the function behind this object uses
++                        a, p = kv
++                        return a, ([m for m in lacking if m in uses[a]] if a in uses else needs_symbols(p, lacking))
++                    with concurrent.futures.ThreadPoolExecutor(jobs) as ex: found = list(ex.map(blame, list(lls.items())))
+                     bad = {a: miss for a, miss in found if miss}
++                    grouped = {group_of[a] for a in bad if a in group_of}
++                    if grouped:   # an object cannot lose one function: those groups become one object per function, and the next round finds the functions by their own objects
++                        for gkey in grouped: split_group(gkey)
++                        continue
+                 for a, miss in bad.items():
+                     self.unlifted[a] = f'function {a:#x}: its code needs ' + ', '.join(miss) + ', which the runtime does not define'
+                     del lls[a]; objs.pop(a, None)
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 16f86fd6..4e20a20c 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -7,6 +7,7 @@ import argparse, os, sys, time
+ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
++import aot_lift
+ import elf_module as em
+ import horizon_hle, horizon_overrides
+ 
+@@ -44,7 +45,8 @@ def main():
+         ovr.update(work); origin.update({s: 'game profile' for s in work})
+     t = time.time()
+     hz.aot = ms.build(jit=a.jit, overrides=ovr, cache=a.cache)
+-    print(f'built in {time.time() - t:.0f} s ({hz.aot.cache_hits} cached, {hz.aot.cache_misses} built, {len(hz.aot.unlifted)} not translated)', flush=True)
++    print(f'built in {time.time() - t:.0f} s ({hz.aot.cache_hits} cached, {hz.aot.cache_misses} built, {len(hz.aot.unlifted)} not translated)'
++          + (f', objects grouped: {hz.aot.group_builds} built, {hz.aot.group_hits} found, {hz.aot.group_splits} split' if aot_lift.group_size() else ''), flush=True)
+     built_in = time.time() - t
+     def run_extra():
+         import aot_report
+@@ -57,7 +59,8 @@ def main():
+         total = sum(len(m.functions) + len(m.jump_targets) for m in ms.modules)
+         by_addr = {ms.exports[s]: (s, o) for s, o in origin.items() if s in ms.exports}
+         static = survey.classify(hz.aot.unlifted, total, by_addr, a.jit)
+-        static.update(game=game.name, known_profile=game.known, modules={m.name: len(m.functions) for m in ms.modules}, build_seconds=built_in, cache_hits=hz.aot.cache_hits, cache_misses=hz.aot.cache_misses)
++        static.update(game=game.name, known_profile=game.known, modules={m.name: len(m.functions) for m in ms.modules}, build_seconds=built_in, cache_hits=hz.aot.cache_hits, cache_misses=hz.aot.cache_misses,
++                      group_hits=hz.aot.group_hits, group_builds=hz.aot.group_builds, group_splits=hz.aot.group_splits)
+         aot_report.write(a.report_json, aot_report.build(static, runtime, seconds=seconds, frames=getattr(hz, 'frames_presented', 0) if runtime is not None else None, jit=a.jit,
+                                                           extra=run_extra() if runtime is not None else None))
+         print(f'[report] {a.report_json}', flush=True)
+diff --git a/dm/tools/tests/test_aot_cache.py b/dm/tools/tests/test_aot_cache.py
+index 2475c138..e4414652 100644
+--- a/dm/tools/tests/test_aot_cache.py
++++ b/dm/tools/tests/test_aot_cache.py
+@@ -4,7 +4,7 @@
+   · a function Remill cannot lift is remembered with its reason (no second attempt), and a function that needs a runtime symbol nobody defines is stubbed from the symbols recorded beside its object;
+   · the toolchain is part of every key.
+ Needs REMILL_BUILD, clang++ and unicorn; skipped otherwise."""
+-import struct, sys, tempfile, time, unittest
++import os, struct, sys, tempfile, time, unittest
+ from pathlib import Path
+ 
+ HERE = Path(__file__).resolve().parent
+@@ -25,6 +25,9 @@ class Cache(unittest.TestCase):
+         cls.code, cls.ranges = fixture()
+ 
+     def setUp(self):   # a cache of its own per test: hits and misses depend on what the test before left
++        saved = os.environ.get('AOT_GROUP')   # these tests are about one object per function (a changed function misses itself and not its group): test_aot_group.py is the grouped mode
++        os.environ['AOT_GROUP'] = '0'
++        self.addCleanup(lambda: os.environ.pop('AOT_GROUP', None) if saved is None else os.environ.__setitem__('AOT_GROUP', saved))
+         self.dir = tempfile.TemporaryDirectory()
+         self.cache = str(Path(self.dir.name) / 'cache')
+ 
+diff --git a/dm/tools/tests/test_aot_cost.py b/dm/tools/tests/test_aot_cost.py
+index 92b6ea31..75433197 100644
+--- a/dm/tools/tests/test_aot_cost.py
++++ b/dm/tools/tests/test_aot_cost.py
+@@ -125,6 +125,18 @@ class CacheStats(unittest.TestCase):
+             res = ac.cache_stats(argparse.Namespace(cache=str(root), sample=4, seed=1, no_compress=True))
+         self.assertNotIn('compressed', res['sample'])
+ 
++    def test_the_group_lists_of_a_grouped_cache_are_counted(self):
++        import argparse
++        with tempfile.TemporaryDirectory() as d:
++            root = self.make_cache(d, 4)
++            for i in range(3): (root / 'obj' / '00' / (f'{i:02x}' * 32 + '.grp')).write_text('{"defs": []}')
++            res = ac.cache_stats(argparse.Namespace(cache=str(root), sample=4, seed=1, no_compress=True))
++            (Path(d) / 'other').mkdir()
++            plain = self.make_cache(Path(d) / 'other', 2)
++            res_plain = ac.cache_stats(argparse.Namespace(cache=str(plain), sample=2, seed=1, no_compress=True))
++        self.assertEqual(res['files']['.grp']['count'], 3); self.assertIn('3 groups', ac.cache_text(res))
++        self.assertEqual(res_plain['files']['.grp']['count'], 0); self.assertNotIn('groups', ac.cache_text(res_plain))
++
+     def test_a_folder_that_is_not_a_cache_is_an_explicit_exit(self):
+         import argparse
+         with tempfile.TemporaryDirectory() as d, self.assertRaises(SystemExit) as cm: ac.cache_stats(argparse.Namespace(cache=d, sample=1, seed=1, no_compress=False))
+diff --git a/dm/tools/tests/test_aot_group.py b/dm/tools/tests/test_aot_group.py
+new file mode 100644
+index 00000000..577d0393
+--- /dev/null
++++ b/dm/tools/tests/test_aot_group.py
+@@ -0,0 +1,199 @@
++"""Grouping the compiled objects (aot_lift.Aot with AOT_GROUP=N, issue #18, option B).
++A cache holds one object, a .syms and a .fail per function: 622,259 objects of 4 KB on average took 6.3 GB on disk for 2.7 GB of content, because every small file takes a 4 KB block,
++and each object repeats its ELF headers and symbol table (25% of its bytes). With AOT_GROUP=N about N functions are lifted, merged by llvm-link and compiled into one object, with a .grp beside it.
++  · the boundaries of the groups depend on the addresses only, so one changed function misses its group and not the ones after it;
++  · a grouped build runs the same code as an ungrouped one and leaves far fewer files;
++  · a function Remill cannot lift, and a function that needs a symbol the runtime does not define, are handled as before, the second by splitting its group into one object per function;
++  · a group that cannot be merged or compiled is split the same way, and the build goes on.
++Needs REMILL_BUILD, clang++, llvm-link and unicorn; skipped otherwise. Group size is set by the tests, never by the environment they run in."""
++import json, os, shutil, struct, sys, tempfile, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_ref as ref
++from test_aot_t3 import SP, READY, MEM
++from test_aot_lift_batch import Counting, MOVZ_X0, CLS_X0_X0, functions, has_batch
++
++BASE = 0x10000
++NEEDS = READY and shutil.which('llvm-link')
++
++
++def files(cache, suffix): return sorted(p for p in Path(cache).rglob('*' + suffix) if p.is_file())
++
++
++class Units(unittest.TestCase):
++    """The grouping itself: no Remill needed"""
++    def setUp(self): self.addrs = [(BASE + 0x40 * i, b'', BASE + 0x40 * i) for i in range(5000)]
++
++    def test_group_size_comes_from_the_environment_and_a_bad_value_means_none(self):
++        saved = os.environ.pop('AOT_GROUP', None)
++        try:
++            self.assertEqual(aot_lift.group_size(), 0)
++            for value, want in (('64', 64), ('1', 0), ('0', 0), ('-5', 0), ('many', 0), ('2', 2)):
++                os.environ['AOT_GROUP'] = value
++                self.assertEqual(aot_lift.group_size(), want, value)
++        finally:
++            if saved is None: os.environ.pop('AOT_GROUP', None)
++            else: os.environ['AOT_GROUP'] = saved
++
++    def test_groups_are_about_the_size_asked_and_never_more_than_four_times_it(self):
++        groups = aot_lift.group_units(self.addrs, 64)
++        sizes = [len(g) for g in groups]
++        self.assertEqual(sum(sizes), 5000); self.assertLessEqual(max(sizes), 256)
++        self.assertTrue(40 <= 5000 / len(groups) <= 100, 5000 / len(groups))
++        self.assertEqual([f[0] for g in groups for f in g], [f[0] for f in self.addrs], 'the order is the address order')
++
++    def test_one_function_more_or_less_changes_at_most_two_groups(self):
++        before = {tuple(f[0] for f in g) for g in aot_lift.group_units(self.addrs, 64)}
++        for i in (3, 1234, 4999):
++            fewer = self.addrs[:i] + self.addrs[i + 1:]
++            after = {tuple(f[0] for f in g) for g in aot_lift.group_units(fewer, 64)}
++            self.assertLessEqual(len(after - before), 2, i); self.assertLessEqual(len(before - after), 2, i)
++
++    def test_the_order_of_the_input_does_not_matter(self):
++        a = aot_lift.group_units(self.addrs, 32); b = aot_lift.group_units(list(reversed(self.addrs)), 32)
++        self.assertEqual([[f[0] for f in g] for g in a], [[f[0] for f in g] for g in b])
++
++
++@unittest.skipUnless(NEEDS, 'needs REMILL_BUILD, clang++, llvm-link and unicorn')
++class Grouped(unittest.TestCase):
++    def setUp(self):
++        self.dir = tempfile.TemporaryDirectory(); self.root = Path(self.dir.name)
++        self.saved = {k: os.environ.get(k) for k in ('AOT_GROUP', 'AOT_LIFT_BATCH')}
++        os.environ['AOT_GROUP'] = '8'
++
++    def tearDown(self):
++        for k, v in self.saved.items():
++            if v is None: os.environ.pop(k, None)
++            else: os.environ[k] = v
++        aot_lift.LLVM_LINK = 'llvm-link'
++        self.dir.cleanup()
++
++    def build(self, fs, cache='c', **kw): return aot_lift.Aot(fs, cache=str(self.root / cache) if cache else None, **kw)
++
++    def check(self, a, fs, picks=(0, 1, 17, -1)):
++        for i in picks:
++            addr, code = fs[i][0], fs[i][1]
++            self.assertEqual(a.run(addr, {'x30': ref.STOP}, 0, SP)['x0'], (i % len(fs)) + 1, f'function {i}')
++
++    def test_a_grouped_build_runs_the_same_code_and_leaves_far_fewer_files(self):
++        fs = functions(64)
++        a = self.build(fs, jobs=4)
++        try:
++            self.check(a, fs)
++            self.assertEqual((a.cache_hits, a.cache_misses), (0, 64)); self.assertEqual(a.group_splits, 0)
++        finally: a.close()
++        objs, grps = files(self.root / 'c', '.o'), files(self.root / 'c', '.grp')
++        self.assertGreaterEqual(len(grps), 3); self.assertEqual(len(objs), len(grps), 'one object per group')
++        self.assertLessEqual(len(objs), 16, 'against 64 objects, 64 .syms files')
++        self.assertEqual(files(self.root / 'c', '.syms'), [], 'no file per function')
++
++    def test_the_second_build_hits_every_group_and_a_changed_function_misses_its_group_only(self):
++        fs = functions(64)
++        self.build(fs).close()
++        more = fs + [(BASE + 0x40 * 64, struct.pack('<2I', MOVZ_X0 | (65 << 5), aot_lift.RET))]   # a library of other functions, so that the objects are what is looked up
++        a = self.build(more)
++        try:
++            self.assertGreaterEqual(a.cache_hits, 50, 'the groups of the first build are found')
++            self.assertGreaterEqual(a.group_hits, 3)
++        finally: a.close()
++        changed = list(fs); changed[10] = (fs[10][0], struct.pack('<2I', MOVZ_X0 | (99 << 5), aot_lift.RET))
++        b = self.build(changed)
++        try:
++            members = next(len(g) for g in aot_lift.group_units(changed, 8) if fs[10][0] in [f[0] for f in g])
++            self.assertEqual(b.cache_misses, members); self.assertEqual(b.group_builds, 1)
++            self.assertEqual(b.run(fs[10][0], {'x30': ref.STOP}, 0, SP)['x0'], 99)
++        finally: b.close()
++
++    def test_an_unliftable_function_is_remembered_with_the_group_and_gives_the_same_reason(self):
++        g = (BASE + 0x40 * 5 + 4 * 0x1000, struct.pack('<2I', CLS_X0_X0, aot_lift.RET))
++        fs = functions(20) + [g]
++        os.environ['AOT_GROUP'] = '0'
++        alone = self.build(fs, cache=None, stub_unliftable=True); why = alone.unlifted[g[0]]; alone.close()
++        os.environ['AOT_GROUP'] = '8'
++        a = self.build(fs, stub_unliftable=True)
++        try: self.assertEqual(a.unlifted[g[0]], why); self.check(a, fs, (0, 7, 19))
++        finally: a.close()
++        if has_batch():
++            groups = aot_lift.group_units(fs, 8)
++            other = next(grp for grp in groups if all(f[0] != g[0] for f in grp))   # a group that does not hold the unliftable function
++            changed = [(f[0], struct.pack('<2I', MOVZ_X0 | (77 << 5), aot_lift.RET)) if f[0] == other[0][0] else f for f in fs]
++            with Counting() as c:
++                b = self.build(changed, stub_unliftable=True)
++                try: self.assertEqual(b.unlifted[g[0]], why); self.assertEqual(b.group_builds, 1)
++                finally: b.close()
++                self.assertEqual(c.starts, 1, 'only the group that changed is lifted again, the failure of the other one is remembered')
++        with self.assertRaises(aot_lift.LiftError) as e: self.build(fs, cache='c2', stub_unliftable=False)
++        self.assertIn('cls', str(e.exception))
++
++    def test_a_function_that_needs_an_undefined_symbol_is_stubbed_and_its_group_is_split(self):
++        fs = functions(16)
++        target = fs[9][0]
++        real = aot_lift.lift_function
++        def lift_function(code, address, ll, entry=None, lifted=None):
++            real(code, address, ll, entry, lifted)
++            if address == target:
++                with open(ll, 'a') as f: f.write('\ndeclare void @nx_missing_symbol()\ndefine void @nx_user() { call void @nx_missing_symbol() ret void }\n')
++        aot_lift.lift_function = lift_function
++        try: a = self.build(fs, stub_unliftable=True)
++        finally: aot_lift.lift_function = real
++        try:
++            self.assertEqual(list(a.unlifted), [target]); self.assertIn('nx_missing_symbol', a.unlifted[target])
++            self.assertGreaterEqual(a.group_splits, 1)
++            self.check(a, fs, (0, 8, 10, 15))
++        finally: a.close()
++
++    def test_a_group_that_cannot_be_merged_is_split_and_the_build_goes_on(self):
++        fs = functions(24)
++        aot_lift.LLVM_LINK = str(self.root / 'no-such-llvm-link')
++        a = self.build(fs)
++        try:
++            self.assertGreaterEqual(a.group_splits, 1); self.check(a, fs, (0, 11, 23))
++        finally: a.close()
++        self.assertTrue(files(self.root / 'c', '.syms'), 'the split groups have an object and a .syms per function')
++        aot_lift.LLVM_LINK = 'llvm-link'
++        more = fs + [(BASE + 0x40 * 99, struct.pack('<2I', MOVZ_X0 | (100 << 5), aot_lift.RET))]
++        before = {tuple(f[0] for f in g) for g in aot_lift.group_units(fs, 8)}
++        untouched = sum(len(g) for g in aot_lift.group_units(more, 8) if tuple(f[0] for f in g) in before)
++        b = self.build(more)
++        try:
++            self.assertGreater(untouched, 0); self.assertEqual(b.cache_hits, untouched, 'a split group is read back from its per-function objects')
++            self.assertEqual(b.group_builds, 1)
++        finally: b.close()
++
++    def test_functions_of_a_group_are_not_inlined_into_each_other(self):
++        """A call between two functions of one object stays a call: the code is the one an ungrouped build makes"""
++        from nso_asm import STP_PRE, LDP_POST
++        import arm64_fixture as fx
++        callee = next(a for a in range(BASE + 0x140, BASE + 0x2000, 0x40) if len(aot_lift.group_units([(a - 0x40, b'', 0), (a, b'', 0)], 100)) == 1)
++        caller = callee - 0x40
++        fs = [(caller, struct.pack('<5I', STP_PRE(29, 30, 31, -16), fx.BL(caller + 4, callee), LDP_POST(29, 30, 31, 16), aot_lift.RET, aot_lift.RET)),
++              (callee, struct.pack('<2I', MOVZ_X0 | (5 << 5), aot_lift.RET))]
++        os.environ['AOT_GROUP'] = '100'
++        self.assertEqual(len(aot_lift.group_units(fs, 100)), 1, 'both functions are in one group')
++        a = self.build(fs)
++        for b, data in MEM.items(): a.map(b, len(data), data)
++        try: self.assertEqual(a.run(caller, {'x30': ref.STOP}, 0, SP)['x0'], 5)
++        finally: a.close()
++        obj = files(self.root / 'c', '.o')[0]
++        import subprocess
++        relocs = subprocess.run(['llvm-readelf', '-r', str(obj)], capture_output=True, text=True).stdout
++        self.assertIn(f'sub_{callee:x}', relocs, 'the call to the callee is still there')
++
++    def test_ungrouped_stays_the_default(self):
++        os.environ.pop('AOT_GROUP')
++        a = self.build(functions(12))
++        a.close()
++        self.assertEqual(files(self.root / 'c', '.grp'), []); self.assertEqual(len(files(self.root / 'c', '.o')), 12)
++
++    def test_a_grouped_build_without_a_cache_works_too(self):
++        fs = functions(30)
++        a = self.build(fs, cache=None, jobs=2)
++        try: self.check(a, fs, (0, 15, 29))
++        finally: a.close()
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/dm/tools/tests/test_aot_lift_batch.py b/dm/tools/tests/test_aot_lift_batch.py
+index 98e94cab..d15c17f2 100644
+--- a/dm/tools/tests/test_aot_lift_batch.py
++++ b/dm/tools/tests/test_aot_lift_batch.py
+@@ -66,10 +66,14 @@ class Batch(unittest.TestCase):
+         self.dir = tempfile.TemporaryDirectory()
+         self.root = Path(self.dir.name)
+         self.saved_env = os.environ.get('AOT_LIFT_BATCH')
++        self.saved_group = os.environ.get('AOT_GROUP')   # one object per function is what these tests count: the grouped mode is test_aot_group.py
++        os.environ['AOT_GROUP'] = '0'
+ 
+     def tearDown(self):
+         if self.saved_env is None: os.environ.pop('AOT_LIFT_BATCH', None)
+         else: os.environ['AOT_LIFT_BATCH'] = self.saved_env
++        if self.saved_group is None: os.environ.pop('AOT_GROUP', None)
++        else: os.environ['AOT_GROUP'] = self.saved_group
+         self.dir.cleanup()
+ 
+     def build(self, fs, cache=None, **kw):

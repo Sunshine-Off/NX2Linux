@@ -106,3 +106,4 @@ file	class	note
 0124-linux-host-aot-cost-py-measures-what-a-recompile.patch	linux	Measurement tool, nothing in the build changes
 0125-linux-host-aot-lift-lifts-the-functions-a-build.patch	linux	Linux AOT lift, needs Remill patch 0011 (fork-only)
 0126-linux-host-aot-cost-cache-stats-names-the-caches.patch	linux	Measurement tool, nothing in the build changes
+0129-linux-host-aot-group-n-compiles-about-n-lifted-f.patch	linux	Opt-in AOT build option (AOT_GROUP), off by default
