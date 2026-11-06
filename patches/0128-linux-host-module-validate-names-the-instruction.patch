@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Thu, 5 Nov 2026 23:41:51 +0100
+Subject: [PATCH] Linux host: module_validate names the instruction Unicorn
+ stopped on in a fault that differs (#15)
+
+Unicorn cannot execute everything Remill lifts (half-precision fmov, LSE
+atomics, pointer authentication). When it stops with an exception while the
+recompiled code does not fault, the report said only UC_ERR_EXCEPTION. The
+detail now names the mnemonic (never the operands) of the instruction at
+Unicorn's program counter, with svc handled since Unicorn is already past it.
+Three functions of Xenoblade 2 sdk need this to be explained.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: A fault that differs says which instruction Unicorn stopped on
+Issue: Sunshine-Off/NX2Linux#15
+
+---
+ dm/tools/module_validate.py                 | 16 ++++++-
+ dm/tools/tests/test_module_validate.py      | 18 ++++++++
+ dm/tools/tests/test_module_validate_stop.py | 47 +++++++++++++++++++++
+ 3 files changed, 79 insertions(+), 2 deletions(-)
+ create mode 100644 dm/tools/tests/test_module_validate_stop.py
+
+diff --git a/dm/tools/module_validate.py b/dm/tools/module_validate.py
+index c6596b47..cfb70c6a 100644
+--- a/dm/tools/module_validate.py
++++ b/dm/tools/module_validate.py
+@@ -180,6 +180,17 @@ def inputs(rng, mod, k):
+     return [dict({f'x{i}': one() for i in range(8)}, nzcv=rng.randrange(16), v={f'v{i}': rng.choice(VPOOL) | rng.choice(VPOOL) << 64 for i in range(32)}) for _ in range(k)]
+ 
+ 
++def stop_instruction(pc, img, base):
++    """The mnemonic (never the operands) of the instruction Unicorn stopped on, from its program counter and the module image. Unicorn leaves the counter on the instruction that raised the exception,
++    except for svc where it is already on the next one. '?' when the counter is outside the image or not word aligned"""
++    import capstone
++    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
++    def at(a):
++        off = a - base
++        return next((i.mnemonic for i in md.disasm(bytes(img[off:off + 4]), a)), '.byte') if a % 4 == 0 and 0 <= off <= len(img) - 4 else '?'
++    return 'svc' if at(pc - 4) == 'svc' else at(pc)
++
++
+ def worker(a):
+     """Run a batch of functions: AOT next to Unicorn; prints one JSON line per function"""
+     import aot_lift
+@@ -212,14 +223,15 @@ def worker(a):
+             for i in range(32): uc.reg_write(UC_ARM64_REG_Q0 + i, vr[f'v{i}'])
+             uc.reg_write(UC_ARM64_REG_FPCR, 0); uc.reg_write(UC_ARM64_REG_FPSR, 0)
+             uc.reg_write(ref.xreg(30), STOP); uc.reg_write(UC_ARM64_REG_SP, STACK + STACK_SIZE - 0x100); uc.reg_write(UC_ARM64_REG_NZCV, nz << 28)
++            stopped = None
+             try: uc.emu_start(mod.base + s, STOP, count=200000); fault = None
+-            except UcError as e: fault = str(e)
++            except UcError as e: fault = str(e); stopped = stop_instruction(uc.reg_read(UC_ARM64_REG_PC), img, mod.base)
+             if fault is None and uc.reg_read(UC_ARM64_REG_PC) != STOP: counts['budget'] += 1; continue
+             aot.reset()
+             got = aot.run(mod.base + s, dict(inp, x30=STOP), nz, STACK + STACK_SIZE - 0x100, vregs=vr)
+             if fault is not None or 'fault' in got:
+                 if fault is not None and 'fault' in got: counts['both-fault'] += 1
+-                else: counts['fault-differs'] += 1; r['detail'] = f'inputs {inp} nzcv {nz:04b}: unicorn {fault!r}, aot {got.get("fault")!r}'
++                else: counts['fault-differs'] += 1; r['detail'] = f'inputs {inp} nzcv {nz:04b}: unicorn {fault!r}{f" on {stopped}" if stopped else ""}, aot {got.get("fault")!r}'
+                 continue
+             want = {f'x{i}': uc.reg_read(ref.xreg(i)) for i in range(31)}; want['sp'] = uc.reg_read(UC_ARM64_REG_SP); want['nzcv'] = uc.reg_read(UC_ARM64_REG_NZCV) >> 28
+             want.update({f'v{i}': uc.reg_read(UC_ARM64_REG_Q0 + i) for i in range(32)})
+diff --git a/dm/tools/tests/test_module_validate.py b/dm/tools/tests/test_module_validate.py
+index c5906eb1..40a56ec0 100644
+--- a/dm/tools/tests/test_module_validate.py
++++ b/dm/tools/tests/test_module_validate.py
+@@ -48,4 +48,22 @@ class Validate(unittest.TestCase):
+         self.assertGreaterEqual(sum(1 for r in rows if r['status'] == 'equal'), 3)
+ 
+ 
++@unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++, unicorn and capstone')
++class UnicornCannotRun(unittest.TestCase):
++    """An instruction Remill lifts and Unicorn cannot execute (a half-precision fmov): Unicorn stops, the recompiled code goes on, and the report says on which instruction"""
++    def test_a_fault_that_differs_names_the_instruction_unicorn_stopped_on(self):
++        RET = 0xD65F03C0
++        spec = dict(name='a', funcs=[mf.Fn('fmov_half', True, lambda c, me: [0x1EEE1000, RET]), mf.Fn('plain', True, lambda c, me: [0x91000400, RET])], imports=[], data=[], inits=[])
++        with tempfile.TemporaryDirectory() as d:
++            exefs, work = Path(d) / 'ExeFS', Path(d) / 'work'; exefs.mkdir()
++            (exefs / 'a').write_bytes(mf.build(spec)[0])
++            p = subprocess.run([mv.worker_python(), '-I', str(TOOL), 'diff', str(exefs), str(work), 'a', '--functions', '10', '--cases', '4', '--batch', '1', '--jobs', '2'],
++                               capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=f'{TOOL.parent}:{HERE}'), timeout=300)
++            rows = {r['status']: r for r in json.loads((work / 'a.diff.json').read_text())}
++        if 'mismatch' not in rows: self.skipTest('this Remill does not lift a half-precision fmov, so there is no case where Unicorn stops and the recompiled code does not')
++        self.assertNotEqual(p.returncode, 0, 'a fault that differs is not a pass')
++        self.assertIn('UC_ERR_EXCEPTION', rows['mismatch']['detail']); self.assertIn(' on fmov, ', rows['mismatch']['detail'])
++        self.assertEqual(rows['equal']['counts']['equal'], 4)
++
++
+ if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_module_validate_stop.py b/dm/tools/tests/test_module_validate_stop.py
+new file mode 100644
+index 00000000..31edfedf
+--- /dev/null
++++ b/dm/tools/tests/test_module_validate_stop.py
+@@ -0,0 +1,47 @@
++"""module_validate.stop_instruction: when Unicorn stops with an exception while the recompiled code does not fault, the report names the instruction Unicorn stopped on (issue #15).
++Unicorn cannot execute everything Remill lifts, so a 'fault differs' case is only worth reading with the instruction next to it. It is the mnemonic only, never the operands.
++No Remill and no game data: instructions assembled by hand, run by Unicorn. Needs unicorn and capstone; skipped otherwise."""
++import struct, sys, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++try:
++    import capstone
++    from unicorn import Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM
++    from unicorn.arm64_const import UC_ARM64_REG_PC, UC_ARM64_REG_CPACR_EL1
++    READY = True
++except ImportError: READY = False
++import module_validate as mv
++
++NOP, RET, SVC, UDF, FMOV_H, LDADD = 0xD503201F, 0xD65F03C0, 0xD4000001, 0x00000000, 0x1EEE1000, 0xF8210002   # fmov h0, #1.0 and ldadd x1, x2, [x0] are not executable in Unicorn
++BASE = 0x1000
++
++
++def stops_on(word):
++    """(mnemonic the tool reports, address of the instruction) for a function nop, <word>, ret run by Unicorn"""
++    img = struct.pack('<3I', NOP, word, RET)
++    uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM); uc.mem_map(BASE, 0x1000); uc.mem_write(BASE, img); uc.reg_write(UC_ARM64_REG_CPACR_EL1, 3 << 20)
++    with unittest.TestCase().assertRaises(UcError): uc.emu_start(BASE, BASE + len(img))
++    return mv.stop_instruction(uc.reg_read(UC_ARM64_REG_PC), img, BASE)
++
++
++@unittest.skipUnless(READY, 'needs unicorn and capstone')
++class Stop(unittest.TestCase):
++    def test_it_names_the_instruction_unicorn_cannot_execute(self):
++        self.assertEqual(stops_on(FMOV_H), 'fmov')
++        self.assertEqual(stops_on(LDADD), 'ldadd')
++        self.assertEqual(stops_on(UDF), 'udf')
++
++    def test_unicorn_stops_after_an_svc_and_the_report_still_says_svc(self):
++        self.assertEqual(stops_on(SVC), 'svc')
++
++    def test_an_address_outside_the_image_is_a_question_mark(self):
++        img = struct.pack('<2I', NOP, RET)
++        self.assertEqual(mv.stop_instruction(BASE + 0x2000, img, BASE), '?')
++        self.assertEqual(mv.stop_instruction(BASE - 4, img, BASE), '?')
++        self.assertEqual(mv.stop_instruction(BASE + 6, img, BASE), '?')   # not word aligned
++
++
++if __name__ == '__main__':
++    unittest.main()
