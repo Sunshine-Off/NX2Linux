@@ -191,6 +191,11 @@ class CommandLine(unittest.TestCase):
         return subprocess.run([sys.executable, str(TOOLS / 'ab_bench.py'), *args], capture_output=True, text=True, timeout=60)
 
     def test_it_wants_a_command(self): self.assertNotEqual(self.cli('run', '--env-a', 'X=0', '--env-b', 'X=1').returncode, 0)
+    def test_an_empty_first_word_names_the_unset_variable(self):
+        r = self.cli('run', '--env-a', 'X=0', '--env-b', 'X=1', '--', '', '-I', 'x.py'); self.assertNotEqual(r.returncode, 0); self.assertIn('NX2_PYTHON', r.stderr)
+    def test_a_command_that_does_not_exist_is_named(self):
+        r = self.cli('run', '--env-a', 'X=0', '--env-b', 'X=1', '--', '/nonexistent/python', 'x.py'); self.assertNotEqual(r.returncode, 0); self.assertIn('cannot find the command', r.stderr)
+
     def test_it_wants_two_different_variants(self): self.assertIn('same', self.cli('run', '--env-a', 'X=0', '--env-b', 'X=0', '--', 'true').stderr)
     def test_it_wants_two_marks(self): self.assertIn('--marks', self.cli('run', '--env-a', 'X=0', '--env-b', 'X=1', '--marks', '110,30', '--', 'true').stderr)
     def test_it_refuses_two_blocks(self): self.assertIn('at least 6', self.cli('run', '--env-a', 'X=0', '--env-b', 'X=1', '--blocks', '2', '--', 'true').stderr)

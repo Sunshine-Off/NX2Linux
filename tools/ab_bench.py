@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -191,6 +192,8 @@ def main(argv=None):
     if a.cmd == 'report': print(table(json.loads(Path(a.file).read_text()))); return 0
     cmd = a.command[1:] if a.command and a.command[0] == '--' else a.command
     if not cmd: p.error('give the command after --')
+    if not cmd[0].strip(): p.error('the first word of the command is empty: a shell variable in it is not set (NX2_PYTHON comes from the env.sh of the toolchain: source it in this terminal)')
+    if shutil.which(cmd[0]) is None: p.error(f'cannot find the command {cmd[0]!r}')
     try: marks = tuple(float(x) for x in a.marks.split(','))
     except ValueError: p.error('--marks wants two numbers like 30,110')
     if len(marks) != 2 or not 0 <= marks[0] < marks[1]: p.error('--marks wants two numbers like 30,110, the first below the second')
