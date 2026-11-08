@@ -110,3 +110,4 @@ file	class	note
 0129-linux-host-aot-group-n-compiles-about-n-lifted-f.patch	linux	Opt-in AOT build option (AOT_GROUP), off by default
 0130-linux-host-the-validator-counts-a-misaligned-exc.patch	linux	Measurement tool, nothing in the build changes
 0131-linux-host-a-hook-for-svc-handlers-in-c-and-the.patch	linux	Native svc hook and the loader of libnx2linux_sync, off by default
+0132-linux-host-arbitratelock-arbitrateunlock.patch	linux	Opt-in native kernel calls (NX2LINUX_SVC_NATIVE), off by default

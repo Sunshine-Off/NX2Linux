@@ -1,0 +1,628 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 8 Nov 2026 12:59:35 +0100
+Subject: [PATCH] Linux host: ArbitrateLock, ArbitrateUnlock,
+ WaitProcessWideKeyAtomic and SignalProcessWideKey can run in C (#19)
+
+With NX2LINUX_SVC_NATIVE=1 and libnx2linux_sync.so built, the four calls on
+mutex words and keys are answered by the library, behind the svc hook of the
+previous patch. They are one group because they share the waiter queues.
+The library keeps what Horizon.svc keeps: the count of each call, the last
+call of each thread (thread_report reads it) and its last 16. A run that
+asks for NX2LINUX_SVC_PROFILE, NX2LINUX_SVC_RING or --verbose stays in
+Python and says so. Off by default. Tests: both implementations run the
+same scenarios and must give the same answers and words, then both are
+run under contention, and the calls run through the real AOT runtime.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: The four mutex and condition-key kernel calls run in C behind NX2LINUX_SVC_NATIVE, off by default, to take them out of the GIL
+Issue: Sunshine-Off/NX2Linux#19
+
+---
+ dm/tools/horizon_hle.py               |   3 +-
+ dm/tools/horizon_run.py               |   1 +
+ dm/tools/horizon_sync.py              |  59 ++++-
+ dm/tools/tests/test_aot_svc_native.py | 106 +++++++++
+ dm/tools/tests/test_horizon_sync.py   | 313 +++++++++++++++++++++++++-
+ docs/linux/architecture.md            |   2 +-
+ 6 files changed, 468 insertions(+), 16 deletions(-)
+ create mode 100644 dm/tools/tests/test_aot_svc_native.py
+
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index e358f30c..a1a44305 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -154,7 +154,8 @@ class Horizon:
+     # ---- plumbing ----
+     def thread_report(self):
+         now = time.monotonic(); out = []
+-        for tid, (name, orig, fp, lr, at) in sorted(self.thread_state.items()):
++        state = self.native.merge_state(self.thread_state) if self.native else self.thread_state   # a call made in C is in the library, not in thread_state
++        for tid, (name, orig, fp, lr, at) in sorted(state.items()):
+             regs = [0] * 31; regs[29], regs[30] = fp, lr
+             try: chain = self.where(regs, 14 if tid in (1, 3, 4) else 5)
+             except Exception: chain = '?'
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 4e20a20c..dc8acdc8 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -75,6 +75,7 @@ def main():
+     # the boot runs on this thread; the game's own threads do the rest. A timer ends the run.
+     import threading
+     def report():
++        if hz.native: hz.native.pull_stats()   # the calls made in C join the counts of hz.stats
+         print('frames presented:', getattr(hz, 'frames_presented', 0), '| svc calls:', hz.stats, '| not translated functions called:', hz.aot.stat('unlifted_calls'))
+         if hasattr(hz, 'nvn'): hz.nvn.pull_stats()
+         hz.svc_profile_report()
+diff --git a/dm/tools/horizon_sync.py b/dm/tools/horizon_sync.py
+index 0121e042..d7956993 100644
+--- a/dm/tools/horizon_sync.py
++++ b/dm/tools/horizon_sync.py
+@@ -2,12 +2,17 @@
+ NX2LINUX_SVC_NATIVE=1 asks for the C path, anything else (the default) keeps every call in Python. The value is read once, when the run attaches, and never changes during a run: a thread parked on the Python side would never be woken
+ by a signal sent on the C side, so the two paths must not mix. A library that is not built, or that does not fit this host, leaves the Python path and says so. NX2LINUX_SYNC_LIB names the library
+ (default ~/.cache/nx2linux/build-host/libnx2linux_sync.so, where `cmake -S linux/host -B ~/.cache/nx2linux/build-host` puts it).
+-Step a1: the library answers no call yet, so a run with the switch on behaves exactly as with it off."""
++The library answers the four calls on mutex words and keys (ArbitrateLock, ArbitrateUnlock, WaitProcessWideKeyAtomic, SignalProcessWideKey), together or not at all: they share their waiter queues. WaitSynchronization and
++the events stay in Python (issue 19, step a3). What Horizon.svc keeps for a call, the library keeps too: the count of each call, the last call of each thread (thread_report) and its last 16.
++The tools that look inside Python's handling of a call cannot see a call made in C, so a run that asks for one stays on Python and says so: NX2LINUX_SVC_PROFILE, NX2LINUX_SVC_RING and --verbose."""
+ import ctypes as C
+ import os
+ from pathlib import Path
+ 
+-ABI = 1
++from horizon_hle import SVC_NAMES
++
++ABI = 2
++CALLS = tuple(range(0x1a, 0x1e))   # the svc numbers the library takes over: ArbitrateLock, ArbitrateUnlock, WaitProcessWideKeyAtomic, SignalProcessWideKey
+ 
+ 
+ def library_path(environ=None):
+@@ -22,10 +27,19 @@ def requested(environ=None):
+     return {'0': False, '1': True}.get(v)
+ 
+ 
++class Last(C.Structure): _fields_ = [('num', C.c_uint32), ('pad', C.c_uint32), ('at', C.c_uint64), ('fp', C.c_uint64), ('lr', C.c_uint64), ('t', C.c_double)]
++class Call(C.Structure): _fields_ = [('num', C.c_uint32), ('pad', C.c_uint32), ('at', C.c_uint64), ('x0', C.c_uint64), ('x1', C.c_uint64), ('t', C.c_double)]
++
++
+ class Native:
+     """The loaded library, bound to one Horizon. `calls` are the svc numbers it took over"""
+     def __init__(self, hz, lib, path):
+-        self.hz, self.lib, self.path, self.calls = hz, lib, path, []
++        self.hz, self.lib, self.path, self.calls, self.pulled, self.pulled_invalid = hz, lib, path, [], {}, 0
++        lib.nx2sync_count.argtypes = [C.c_int]; lib.nx2sync_count.restype = C.c_uint64
++        lib.nx2sync_invalid.argtypes = []; lib.nx2sync_invalid.restype = C.c_uint64
++        lib.nx2sync_last.argtypes = [C.c_uint32, C.POINTER(Last)]; lib.nx2sync_last.restype = C.c_int
++        lib.nx2sync_recent.argtypes = [C.c_uint32, C.POINTER(Call), C.c_int]; lib.nx2sync_recent.restype = C.c_int
++        lib.nx2sync_waiters.argtypes = [C.c_int, C.c_uint64]; lib.nx2sync_waiters.restype = C.c_int
+         lib.nx2sync_bind.argtypes = [C.c_uint32, C.c_uint32]; lib.nx2sync_bind.restype = C.c_int
+         lib.nx2sync_current.argtypes = []; lib.nx2sync_current.restype = C.c_uint32
+         lib.nx2sync_handles.argtypes = [C.c_int]; lib.nx2sync_handles.restype = C.c_int
+@@ -36,6 +50,30 @@ class Native:
+         t = thread or self.hz.main_thread_obj
+         self.lib.nx2sync_bind(t.tid, getattr(t, 'handle', 0) or 0)
+ 
++    def pull_stats(self):
++        """Add the calls made in C since the last time to hz.stats, where Horizon.svc counts the others (the report prints them)"""
++        names = SVC_NAMES
++        for num in self.calls:
++            n = self.lib.nx2sync_count(num); d = n - self.pulled.get(num, 0); self.pulled[num] = n
++            if d: self.hz.stats[names.get(num, f'svc{num:#x}')] = self.hz.stats.get(names.get(num, f'svc{num:#x}'), 0) + d
++        bad = self.lib.nx2sync_invalid(); self.hz.invalid = getattr(self.hz, 'invalid', 0) + bad - self.pulled_invalid; self.pulled_invalid = bad
++
++    def merge_state(self, state):
++        """state: Horizon.thread_state {tid: (call name, address of the svc, x29, x30, time)}. A thread whose last call was made in C is there with that call, when it is newer than the Python one"""
++        names = SVC_NAMES
++        out = dict(state)
++        for tid in {1, *(t.tid for t in self.hz.handles.values() if hasattr(t, 'tid'))}:
++            last = Last()
++            if self.lib.nx2sync_last(tid, C.byref(last)) and (tid not in out or last.t > out[tid][4]):
++                out[tid] = (names.get(last.num, f'svc{last.num:#x}'), last.at, last.fp, last.lr, last.t)
++        return out
++
++    def recent(self, tid, limit=16):
++        """The last calls of a thread made in C, oldest first: [(call name, address of the svc, time)]"""
++        buf = (Call * limit)()
++        names = SVC_NAMES
++        return [(names.get(buf[i].num, f'svc{buf[i].num:#x}'), buf[i].at, buf[i].t) for i in range(self.lib.nx2sync_recent(tid, buf, limit))]
++
+ 
+ def install(hz, environ=None):
+     """Called by Horizon.attach before the guest runs. Returns the Native bound to hz, or None when the calls stay in Python"""
+@@ -44,6 +82,10 @@ def install(hz, environ=None):
+         hz.log(f'[svc] NX2LINUX_SVC_NATIVE={(os.environ if environ is None else environ).get("NX2LINUX_SVC_NATIVE")!r} is not 0 or 1: the synchronisation calls stay in Python')
+         return None
+     if not want: return None
++    why = [name for name, on in (('NX2LINUX_SVC_PROFILE', hz.svc_prof is not None), ('NX2LINUX_SVC_RING', hz.ring is not None), ('--verbose', hz.verbose)) if on]
++    if why:
++        hz.log(f'[svc] NX2LINUX_SVC_NATIVE=1 but {", ".join(why)} looks inside the Python handling of the calls: they stay in Python')
++        return None
+     path = library_path(environ)
+     if not path:
+         hz.log('[svc] NX2LINUX_SVC_NATIVE=1 but libnx2linux_sync.so is not built (cmake -S linux/host -B ~/.cache/nx2linux/build-host && cmake --build ~/.cache/nx2linux/build-host): the synchronisation calls stay in Python')
+@@ -57,10 +99,13 @@ def install(hz, environ=None):
+         if lib.nx2sync_init(C.cast(aot.aot_peek, C.c_void_p).value, C.cast(aot.aot_cas32, C.c_void_p).value): raise OSError('init failed')
+         n = Native(hz, lib, path)
+         fn = C.cast(lib.nx2sync_svc, C.c_void_p).value
+-        for num in range(256):
+-            if lib.nx2sync_handles(num):
+-                if hz.aot.register_native_svc(num, fn, None): raise OSError(f'svc {num:#x} is taken')
+-                n.calls.append(num)
++        want_calls = [num for num in range(256) if lib.nx2sync_handles(num)]
++        if want_calls != list(CALLS): raise OSError(f'the library takes svc {want_calls}, this host expects {list(CALLS)}')
++        for num in want_calls:
++            if hz.aot.register_native_svc(num, fn, None):
++                for done in n.calls: hz.aot.register_native_svc(done, None)   # all four or none
++                raise OSError(f'svc {num:#x} is taken')
++            n.calls.append(num)
+     except (OSError, AttributeError) as e:
+         hz.log(f'[svc] cannot use {path}: {e}. The synchronisation calls stay in Python')
+         return None
+diff --git a/dm/tools/tests/test_aot_svc_native.py b/dm/tools/tests/test_aot_svc_native.py
+new file mode 100644
+index 00000000..2e3013c2
+--- /dev/null
++++ b/dm/tools/tests/test_aot_svc_native.py
+@@ -0,0 +1,106 @@
++"""The native synchronisation calls through the real AOT runtime (issue 19): recompiled guest functions that make the svc, the library answering them in C, several host threads. A thread that waits for a key is
++woken by another thread's signal and its mutex word comes back, the Python handler never sees these calls, and a thread that is blocked in C does not stop the others.
++Needs REMILL_BUILD, clang++ and unicorn (like test_aot_svc) and libnx2linux_sync.so (cmake -S linux/host -B ~/.cache/nx2linux/build-host, or NX2LINUX_SYNC_LIB); skipped otherwise."""
++import struct, sys, threading, time, types, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
++import aot_lift
++import arm64_fixture as fx
++import horizon_sync as hs
++from test_aot_t3 import READY, DATA, STACK, STACK_SIZE
++
++LIB = hs.library_path()
++WAITFN, SIGNALFN, LOCKFN, UNLOCKFN, OTHERFN = 0x100, 0x120, 0x140, 0x160, 0x180
++M = (1 << 64) - 1
++STACKS = [STACK + 0x4000 * i for i in range(1, 5)]
++
++
++def image():
++    img = bytearray(0x1000)
++    def put(at, words): img[at:at + 4 * len(words)] = struct.pack('<%dI' % len(words), *words)
++    put(WAITFN, [fx.SVC(0x1c), fx.RET])
++    put(SIGNALFN, [fx.SVC(0x1d), fx.RET])
++    put(LOCKFN, [fx.SVC(0x1a), fx.RET])
++    put(UNLOCKFN, [fx.SVC(0x1b), fx.RET])
++    put(OTHERFN, [fx.SVC(0x2A), fx.RET])
++    return bytes(img)
++
++
++@unittest.skipUnless(READY and LIB, 'needs REMILL_BUILD, clang++, unicorn and libnx2linux_sync.so')
++class NativeThroughTheRuntime(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        img = image()
++        cls.a = aot_lift.Aot([(f, img[f:f + 8]) for f in (WAITFN, SIGNALFN, LOCKFN, UNLOCKFN, OTHERFN)])
++        cls.a.map(0, len(img), img); cls.a.map(DATA, 0x2000, bytes(0x2000)); cls.a.map(STACK, STACK_SIZE, bytes(STACK_SIZE))
++        cls.python_calls = []
++        def python_handler(num, r, orig):
++            cls.python_calls.append(num)
++            if num == 0x2A: r[0] = 0x2A2A
++            else: r[0] = 0xF001
++        cls.a.set_svc_handler(python_handler)
++        cls.log = []
++        hz = types.SimpleNamespace(aot=cls.a, log=cls.log.append, svc_prof=None, ring=None, verbose=False, main_thread_obj=types.SimpleNamespace(tid=1, handle=0))
++        cls.native = hs.install(hz, {'NX2LINUX_SVC_NATIVE': '1', 'NX2LINUX_SYNC_LIB': LIB})
++
++    @classmethod
++    def tearDownClass(cls): cls.a.close()
++
++    def setUp(self): self.python_calls.clear()
++
++    def word(self, i): return struct.unpack('<I', self.a.peek(DATA + 4 * i, 4))[0]
++    def setword(self, i, v): self.assertEqual(self.a.lib.aot_poke(DATA + 4 * i, struct.pack('<I', v), 4), 0)
++    def addr(self, i): return DATA + 4 * i
++
++    def run_guest(self, fn, regs, stack, tid=None):
++        if tid is not None: self.native.lib.nx2sync_bind(tid, 0)
++        return self.a.run(fn, dict(regs, x30=0xFFFF0000), 0, stack)
++
++    def test_it_is_installed(self):
++        self.assertIsNotNone(self.native, self.log); self.assertEqual(self.native.calls, [0x1a, 0x1b, 0x1c, 0x1d])
++
++    def test_unlock_in_c_clears_the_word_and_python_never_sees_it(self):
++        self.setword(0, 0xD001)
++        r = self.run_guest(UNLOCKFN, {'x0': self.addr(0)}, STACKS[0])
++        self.assertEqual((r['x0'], self.word(0)), (0, 0)); self.assertEqual(self.python_calls, [])
++
++    def test_a_call_that_is_not_one_of_the_four_still_goes_to_python(self):
++        r = self.run_guest(OTHERFN, {'x0': 1}, STACKS[0])
++        self.assertEqual(r['x0'], 0x2A2A); self.assertEqual(self.python_calls, [0x2A])
++
++    def test_wait_times_out_with_the_mutex_taken_again(self):
++        self.setword(1, 0xD001)
++        r = self.run_guest(WAITFN, {'x0': self.addr(1), 'x1': self.addr(5), 'x2': 0xD001, 'x3': 10_000_000}, STACKS[0])
++        self.assertEqual((r['x0'], self.word(1)), (0xEA01, 0xD001)); self.assertEqual(self.python_calls, [])
++
++    def test_a_thread_blocked_in_c_is_woken_by_a_signal_from_another_thread(self):
++        self.setword(2, 0xD002)
++        res = {}
++        def waiter():
++            res['r'] = self.run_guest(WAITFN, {'x0': self.addr(2), 'x1': self.addr(6), 'x2': 0xD002, 'x3': 30_000_000_000}, STACKS[1], tid=41)
++        th = threading.Thread(target=waiter); th.start()
++        end = time.monotonic() + 10
++        while self.native.lib.nx2sync_waiters(1, self.addr(6)) != 1 and time.monotonic() < end: time.sleep(0.001)
++        self.assertEqual(self.native.lib.nx2sync_waiters(1, self.addr(6)), 1)
++        self.assertEqual(self.word(2), 0)                                       # the waiter released its mutex
++        sig = self.run_guest(SIGNALFN, {'x0': self.addr(6), 'x1': 1}, STACKS[2], tid=42)   # this thread is not blocked: the call went through while another waits
++        self.assertEqual(sig['x0'], 0)
++        th.join(10); self.assertFalse(th.is_alive())
++        self.assertEqual((res['r']['x0'], self.word(2)), (0, 0xD002)); self.assertEqual(self.python_calls, [])
++
++    def test_lock_waits_for_unlock_and_gets_the_word(self):
++        self.setword(3, 0xD001 | 0x40000000)                                    # held by 0xD001, listeners
++        res = {}
++        th = threading.Thread(target=lambda: res.update(r=self.run_guest(LOCKFN, {'x0': 0xD001, 'x1': self.addr(3), 'x2': 0xD003}, STACKS[3], tid=43)))
++        th.start()
++        end = time.monotonic() + 10
++        while self.native.lib.nx2sync_waiters(0, self.addr(3)) != 1 and time.monotonic() < end: time.sleep(0.001)
++        self.assertEqual(self.native.lib.nx2sync_waiters(0, self.addr(3)), 1)
++        self.run_guest(UNLOCKFN, {'x0': self.addr(3)}, STACKS[2], tid=44)
++        th.join(10); self.assertFalse(th.is_alive())
++        self.assertEqual((res['r']['x0'], self.word(3)), (0, 0xD003)); self.assertEqual(self.python_calls, [])
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_horizon_sync.py b/dm/tools/tests/test_horizon_sync.py
+index 04bc5e32..9a9f4863 100644
+--- a/dm/tools/tests/test_horizon_sync.py
++++ b/dm/tools/tests/test_horizon_sync.py
+@@ -1,4 +1,5 @@
+-"""The switch and the loader of the native synchronisation calls (horizon_sync.py, issue 19, step a1) and Horizon.bind. No game and no Remill: a Horizon on a fake guest memory, and the real libnx2linux_sync.so
++"""The native synchronisation calls (horizon_sync.py, svcsync.c, issue 19): the switch and the loader, Horizon.bind, and the four calls on mutex words and keys run on the Python path and on the C library with
++the same scenarios, which must give the same answers and the same words, then both under contention. No game and no Remill: a Horizon on a fake guest memory, and the real libnx2linux_sync.so
+ when it is built (cmake -S linux/host -B ~/.cache/nx2linux/build-host, or NX2LINUX_SYNC_LIB), else those tests are skipped."""
+ import ctypes as C, io, os, sys, tempfile, threading, types, unittest
+ from pathlib import Path
+@@ -94,18 +95,296 @@ class Bind(unittest.TestCase):
+         self.assertEqual(seen, [('native', t.tid), t])
+ 
+ 
++
++class Refusals(unittest.TestCase):
++    """The library is there but this run looks inside the Python handling of the calls: they stay in Python and the log says which tool asked"""
++    def test_the_svc_profile_the_ring_and_verbose_keep_python(self):
++        for attr, value, name in (('svc_prof', {}, 'NX2LINUX_SVC_PROFILE'), ('ring', [], 'NX2LINUX_SVC_RING'), ('verbose', True, '--verbose')):
++            hz, aot, out = horizon(); setattr(hz, attr, value)
++            self.assertIsNone(hs.install(hz, {'NX2LINUX_SVC_NATIVE': '1', 'NX2LINUX_SYNC_LIB': '/nonexistent'}))
++            self.assertIn(name, out.getvalue()); self.assertEqual(aot.registered, [])
++
++
++# ---- the four calls, on both implementations ----
++import struct, time
++LISTENERS = 0x40000000
++LOCK, UNLOCK, WAIT, SIGNAL = 0x1a, 0x1b, 0x1c, 0x1d
++FOREVER = (1 << 64) - 1
++
++
++class Mem:
++    """Guest memory of 64 words at 0x1000, shared by both implementations. A word that is not there fails like the runtime's peek does (AssertionError) and its compare-exchange answers a value that is not the expected one"""
++    BASE, N = 0x1000, 64
++    def __init__(self): self.words, self.lock = [0] * self.N, threading.Lock()
++    def idx(self, a): return (a - self.BASE) // 4 if a % 4 == 0 and self.BASE <= a < self.BASE + 4 * self.N else None
++    def w(self, i): return self.BASE + 4 * i
++    def peek(self, a, n):
++        i = self.idx(a); assert i is not None and n == 4, f'peek {a:#x}'
++        with self.lock: return struct.pack('<I', self.words[i])
++    def poke(self, a, data, n):
++        i = self.idx(a)
++        if i is None: return 1
++        with self.lock: self.words[i] = struct.unpack('<I', bytes(data[:4]))[0]
++        return 0
++    def cas(self, a, e, d):
++        i = self.idx(a)
++        if i is None: return (e ^ 1) & 0xFFFFFFFF
++        with self.lock:
++            old = self.words[i]
++            if old == e: self.words[i] = d & 0xFFFFFFFF
++            return old
++    def get(self, i):
++        with self.lock: return self.words[i]
++    def set(self, i, v):
++        with self.lock: self.words[i] = v
++
++
++class PyImpl:
++    """The Python path: Horizon.svc"""
++    name = 'python'
++    def __init__(self, mem):
++        self.mem = mem
++        class A(FakeAot):
++            def __init__(a):
++                super().__init__(); a.lib = types.SimpleNamespace(aot_cas32=mem.cas, aot_poke=mem.poke)
++            def peek(a, addr, n): return mem.peek(addr, n)
++        ms = types.SimpleNamespace(aot=A(), modules=[], TLS=0x1000, STOP=0xFFFF0000)
++        self.hz = hh.Horizon(ms, out=io.StringIO()); self.threads = {}
++    def enter(self, ident):
++        t = self.threads.get(ident) or self.threads.setdefault(ident, hh.KThread(self.hz, 0, 0, 0, 44, 0x5000 + 0x200 * ident))
++        self.hz.bind(t)
++    def leave(self): self.hz.bind(None)
++    def call(self, num, x0=0, x1=0, x2=0, x3=0):
++        r = [0] * 31; r[0], r[1], r[2], r[3] = x0, x1, x2, x3
++        self.hz.svc(num, r, 0x4000 + num)
++        return r[0]
++    def waiters(self, on_key, addr): return len((self.hz.key_waiters if on_key else self.hz.mutex_waiters).get(addr, []))
++    def close(self): pass
++
++
++class CImpl:
++    """The C library, with the same memory (through ctypes callbacks, as the runtime's functions are for it)"""
++    name = 'c'
++    def __init__(self, mem):
++        self.mem = mem
++        self.lib = C.CDLL(LIB)
++        self.peek = PEEK(lambda a, d, n: self._peek(a, d, n)); self.cas = CAS(mem.cas)
++        self.lib.nx2sync_init.argtypes = [C.c_void_p, C.c_void_p]
++        assert self.lib.nx2sync_init(C.cast(self.peek, C.c_void_p).value, C.cast(self.cas, C.c_void_p).value) == 0
++        self.lib.nx2sync_svc.argtypes = [C.c_int, C.POINTER(C.c_uint64), C.c_uint64, C.c_void_p]; self.lib.nx2sync_svc.restype = C.c_int
++        self.lib.nx2sync_bind.argtypes = [C.c_uint32, C.c_uint32]
++        self.lib.nx2sync_waiters.argtypes = [C.c_int, C.c_uint64]
++        self.ids = {}
++    def _peek(self, a, d, n):
++        try: data = self.mem.peek(a, n)
++        except AssertionError: return 1
++        C.memmove(d, data, n); return 0
++    def enter(self, ident): self.lib.nx2sync_bind(2 + ident, 0)
++    def leave(self): self.lib.nx2sync_bind(0, 0)
++    def call(self, num, x0=0, x1=0, x2=0, x3=0):
++        r = (C.c_uint64 * 31)(x0, x1, x2, x3)
++        assert self.lib.nx2sync_svc(num, r, 0x4000 + num, None) == 1
++        return r[0]
++    def waiters(self, on_key, addr): return self.lib.nx2sync_waiters(on_key, addr)
++    def close(self): pass
++
++
++def until(cond, what, limit=10.0):
++    end = time.monotonic() + limit
++    while not cond():
++        if time.monotonic() > end: raise AssertionError(f'timed out waiting for {what}')
++        time.sleep(0.0005)
++
++
++def scenario_no_waiters(impl):
++    m, out = impl.mem, []
++    m.set(0, 0xD001)
++    out.append(('unlock', impl.call(UNLOCK, m.w(0)), m.get(0)))
++    m.set(0, 0xD001)
++    out.append(('lock, word is not owner+listeners', impl.call(LOCK, 0xD009, m.w(0), 0xD002), m.get(0)))
++    out.append(('signal nobody', impl.call(SIGNAL, m.w(5), 1)))
++    out.append(('unlock invalid', impl.call(UNLOCK, 0x9000)))
++    out.append(('lock invalid', impl.call(LOCK, 1, 0x9000, 2)))
++    out.append(('wait invalid', impl.call(WAIT, 0x9000, m.w(5), 1, FOREVER)))
++    out.append(('waiters', impl.waiters(1, m.w(5)), impl.waiters(0, 0x9000)))
++    return out
++
++
++def scenario_timeouts(impl):
++    m, out = impl.mem, []
++    m.set(0, 0xD001)
++    out.append(('timeout 0', impl.call(WAIT, m.w(0), m.w(5), 0xD001, 0), m.get(0)))
++    t0 = time.monotonic()
++    out.append(('timeout 20 ms', impl.call(WAIT, m.w(0), m.w(5), 0xD001, 20_000_000), m.get(0)))
++    out.append(('waited at least 20 ms', time.monotonic() - t0 >= 0.02))
++    out.append(('waiters', impl.waiters(1, m.w(5))))
++    return out
++
++
++def scenario_signal_order(impl):
++    m, out, done, res = impl.mem, [], {}, {}
++    def waiter(i):
++        impl.enter(10 + i); res[i] = impl.call(WAIT, m.w(i), m.w(10), 0xD100 + i, FOREVER); done[i] = True; impl.leave()
++    ths = []
++    for i in range(3):
++        m.set(i, 0xD100 + i)
++        th = threading.Thread(target=waiter, args=(i,)); th.start(); ths.append(th)
++        until(lambda: impl.waiters(1, m.w(10)) == i + 1, f'waiter {i} to queue')   # in the queue before the next starts
++    out.append(('mutexes released', [m.get(i) for i in range(3)]))
++    out.append(('signal 2', impl.call(SIGNAL, m.w(10), 2)))
++    until(lambda: 0 in done and 1 in done, 'two waiters to wake')
++    time.sleep(0.03)
++    out.append(('third still waits', 2 in done, impl.waiters(1, m.w(10))))
++    out.append(('woken, mutex taken again', res[0], res[1], m.get(0), m.get(1)))
++    out.append(('signal all', impl.call(SIGNAL, m.w(10), 0)))
++    until(lambda: 2 in done, 'the last waiter')
++    out.append(('last', res[2], m.get(2), impl.waiters(1, m.w(10))))
++    for th in ths: th.join(10)
++    th = threading.Thread(target=waiter, args=(3,)); m.set(3, 0xD103); th.start()
++    until(lambda: impl.waiters(1, m.w(10)) == 1, 'a waiter')
++    out.append(('signal with a negative count wakes it', impl.call(SIGNAL, m.w(10), 0xFFFFFFFF)))
++    th.join(10); out.append(('woken', res[3], m.get(3)))
++    return out
++
++
++def scenario_handoff(impl):
++    m, out, got = impl.mem, [], {}
++    m.set(0, 0xD001)
++    def locker(ident, tag):
++        impl.enter(ident)
++        while True:   # the lock of libnx on the calls
++            cur = m.cas(m.w(0), 0, tag)
++            if cur == 0: break
++            if not cur & LISTENERS:
++                if m.cas(m.w(0), cur, cur | LISTENERS) != cur: continue
++            impl.call(LOCK, cur & ~LISTENERS, m.w(0), tag)
++            if m.get(0) & ~LISTENERS == tag: break
++        got[tag] = True; impl.leave()
++    ths = []
++    for ident, tag in ((31, 0xD002), (32, 0xD003)):
++        th = threading.Thread(target=locker, args=(ident, tag)); th.start(); ths.append(th)
++        until(lambda: impl.waiters(0, m.w(0)) == len(ths), 'a locker to queue')
++    out.append(('listeners bit set', m.get(0)))
++    out.append(('unlock', impl.call(UNLOCK, m.w(0))))
++    until(lambda: 0xD002 in got, 'the first locker')
++    out.append(('first got it, another waits', m.get(0), 0xD003 in got))
++    out.append(('unlock again', impl.call(UNLOCK, m.w(0))))
++    until(lambda: 0xD003 in got, 'the second locker')
++    out.append(('second got it, nobody waits', m.get(0)))
++    out.append(('unlock last', impl.call(UNLOCK, m.w(0)), m.get(0)))
++    for th in ths: th.join(10)
++    return out
++
++
++def contention(impl, threads=4, rounds=300):
++    """A mutex and a condition variable built from the calls, as libnx does: exclusion, and every item produced is consumed exactly once"""
++    m, shared, errors = impl.mem, [0], []
++    def lock(self):
++        while True:
++            cur = m.cas(m.w(20), 0, self)
++            if cur == 0: return
++            if not cur & LISTENERS:
++                if m.cas(m.w(20), cur, cur | LISTENERS) != cur: continue
++            impl.call(LOCK, cur & ~LISTENERS, m.w(20), self)
++            if m.get(20) & ~LISTENERS == self: return
++    def unlock(self):
++        if m.cas(m.w(20), self, 0) != self: impl.call(UNLOCK, m.w(20))
++    def worker(i):
++        impl.enter(100 + i); self = 0xD300 + i
++        try:
++            for r in range(rounds):
++                lock(self); v = shared[0]
++                if r % 32 == 0: time.sleep(0)
++                shared[0] = v + 1; unlock(self)
++        except BaseException as e: errors.append(e)
++    ths = [threading.Thread(target=worker, args=(i,)) for i in range(threads)]
++    for th in ths: th.start()
++    for th in ths: th.join(60)
++    assert not any(th.is_alive() for th in ths), 'the mutex workers did not finish'
++    assert not errors, errors
++    assert shared[0] == threads * rounds, f'{shared[0]} of {threads * rounds}: exclusion failed'
++    assert m.get(20) == 0 and impl.waiters(0, m.w(20)) == 0
++    # the bounded queue: capacity 3, two producers and two consumers, items numbered
++    q, state = [], {'sum': 0, 'n': 0}; items = rounds // 2
++    def producer(i):
++        impl.enter(200 + i); self = 0xD400 + i
++        try:
++            for k in range(1, items + 1):
++                lock(self)
++                while len(q) == 3: assert impl.call(WAIT, m.w(20), m.w(32), self, FOREVER) == 0
++                q.append(k); impl.call(SIGNAL, m.w(31), 1); unlock(self)
++        except BaseException as e: errors.append(e)
++    def consumer(i):
++        impl.enter(300 + i); self = 0xD500 + i
++        try:
++            for _ in range(items):
++                lock(self)
++                while not q: assert impl.call(WAIT, m.w(20), m.w(31), self, FOREVER) == 0
++                v = q.pop(0); impl.call(SIGNAL, m.w(32), 1); unlock(self)
++                with m.lock: state['sum'] += v; state['n'] += 1
++        except BaseException as e: errors.append(e)
++    ths = [threading.Thread(target=producer, args=(i,)) for i in range(2)] + [threading.Thread(target=consumer, args=(i,)) for i in range(2)]
++    for th in ths: th.start()
++    for th in ths: th.join(60)
++    assert not any(th.is_alive() for th in ths), 'the queue workers did not finish: a lost wakeup or a deadlock'
++    assert not errors, errors
++    assert state['n'] == 2 * items and state['sum'] == 2 * items * (items + 1) // 2, state
++    assert not q and m.get(20) == 0
++    assert impl.waiters(1, m.w(31)) == impl.waiters(1, m.w(32)) == impl.waiters(0, m.w(20)) == 0
++
++
++SCENARIOS = (scenario_no_waiters, scenario_timeouts, scenario_signal_order, scenario_handoff)
++
++
++@unittest.skipUnless(LIB, 'libnx2linux_sync.so is not built (cmake -S linux/host -B ~/.cache/nx2linux/build-host, or NX2LINUX_SYNC_LIB)')
++class Differential(unittest.TestCase):
++    def run_on(self, cls, scenario):
++        impl = cls(Mem())
++        try: return scenario(impl)
++        finally: impl.close()
++
++    def test_every_scenario_gives_the_same_answers_and_words_as_python(self):
++        for sc in SCENARIOS:
++            with self.subTest(sc.__name__):
++                py, c = self.run_on(PyImpl, sc), self.run_on(CImpl, sc)
++                self.assertEqual(c, py)
++                self.assertTrue(py)
++
++    def test_the_scenarios_are_not_empty_promises(self):
++        r = self.run_on(CImpl, scenario_no_waiters)
++        self.assertIn(('unlock invalid', 0xCC01), r); self.assertIn(('wait invalid', 0xCC01), r)
++        r = self.run_on(CImpl, scenario_timeouts); self.assertEqual(r[0], ('timeout 0', 0xEA01, 0xD001))
++        r = self.run_on(CImpl, scenario_handoff); self.assertEqual(r[0], ('listeners bit set', 0xD001 | LISTENERS)); self.assertEqual(r[2][1], 0xD002 | LISTENERS)
++
++    def test_contention_on_the_python_path(self): contention(PyImpl(Mem()))
++    def test_contention_on_the_c_library(self): contention(CImpl(Mem()), threads=8, rounds=600)
++
++
+ @unittest.skipUnless(LIB, 'libnx2linux_sync.so is not built (cmake -S linux/host -B ~/.cache/nx2linux/build-host, or NX2LINUX_SYNC_LIB)')
+ class RealLibrary(unittest.TestCase):
+-    def test_the_library_loads_and_takes_no_call_in_step_a1(self):
++    def install(self):
+         hz, aot, out = horizon()
+         n = hs.install(hz, {'NX2LINUX_SVC_NATIVE': '1', 'NX2LINUX_SYNC_LIB': LIB})
+-        self.assertIsNotNone(n, out.getvalue())
+-        self.assertEqual(n.calls, []); self.assertEqual(aot.registered, [])
+-        self.assertIn('0 kernel calls in C', out.getvalue())
++        self.assertIsNotNone(n, out.getvalue()); hz.native = n
++        return hz, aot, n, out
++
++    def test_the_four_calls_are_registered_together(self):
++        hz, aot, n, out = self.install()
++        self.assertEqual(n.calls, [0x1a, 0x1b, 0x1c, 0x1d]); self.assertEqual([x[0] for x in aot.registered], [0x1a, 0x1b, 0x1c, 0x1d])
++        self.assertEqual(len({x[1] for x in aot.registered}), 1)   # one function for the four
++        self.assertIn('4 kernel calls in C', out.getvalue())
++
++    def test_none_is_registered_when_one_is_taken(self):
++        hz, aot, out = horizon(); taken = []
++        def register(num, fn, ctx=None):
++            if num == 0x1c and fn: return 1
++            (taken.append if fn else taken.remove)(num); return 0
++        aot.register_native_svc = register
++        self.assertIsNone(hs.install(hz, {'NX2LINUX_SVC_NATIVE': '1', 'NX2LINUX_SYNC_LIB': LIB}))
++        self.assertEqual(taken, []); self.assertIn('is taken', out.getvalue())
+ 
+     def test_each_host_thread_acts_for_the_logical_thread_bound_to_it(self):
+-        hz, _, out = horizon(); n = hs.install(hz, {'NX2LINUX_SVC_NATIVE': '1', 'NX2LINUX_SYNC_LIB': LIB}); self.assertIsNotNone(n, out.getvalue())
+-        hz.native = n
++        hz, _, n, _ = self.install()
+         self.assertEqual(n.lib.nx2sync_current(), 1)   # install bound the booting thread to the main thread
+         a, b = hh.KThread(hz, 0, 0, 0, 44, 0x5000), hh.KThread(hz, 0, 0, 0, 44, 0x6000); got = {}
+         def work(t):
+@@ -117,5 +396,25 @@ class RealLibrary(unittest.TestCase):
+         for t in (a, b): self.assertEqual((got[t.tid, 'before'], got[t.tid, 'after'], got[t.tid, 'main']), (1, t.tid, 1))
+         self.assertEqual(n.lib.nx2sync_current(), 1)
+ 
++    def test_a_call_in_c_is_counted_and_reaches_the_report_and_the_thread_state(self):
++        hz, aot, n, _ = self.install()
++        mem = Mem()
++        n.lib.nx2sync_init.argtypes = [C.c_void_p, C.c_void_p]
++        peek = PEEK(lambda a, d, k: (C.memmove(d, mem.peek(a, k), k), 0)[1]); cas = CAS(mem.cas)
++        self.assertEqual(n.lib.nx2sync_init(C.cast(peek, C.c_void_p).value, C.cast(cas, C.c_void_p).value), 0)
++        t = hh.KThread(hz, 0, 0, 0, 44, 0x5000); t.handle = hz.new_handle(t); hz.bind(t)
++        regs = (C.c_uint64 * 31)(mem.w(5), 1); regs[29], regs[30] = 0x77, 0x88
++        before = n.lib.nx2sync_count(0x1d)
++        n.lib.nx2sync_svc.argtypes = [C.c_int, C.POINTER(C.c_uint64), C.c_uint64, C.c_void_p]
++        self.assertEqual(n.lib.nx2sync_svc(0x1d, regs, 0x4242, None), 1)
++        hz.stats['SignalProcessWideKey'] = 3          # three made in Python
++        n.pull_stats(); n.pull_stats()                # twice: the second adds nothing
++        self.assertEqual(hz.stats['SignalProcessWideKey'], 3 + n.lib.nx2sync_count(0x1d) - 0)
++        self.assertEqual(n.lib.nx2sync_count(0x1d), before + 1)
++        state = n.merge_state(hz.thread_state)
++        self.assertEqual(state[t.tid][:4], ('SignalProcessWideKey', 0x4242, 0x77, 0x88))
++        self.assertEqual([c[:2] for c in n.recent(t.tid)], [('SignalProcessWideKey', 0x4242)])
++        self.assertIn(f'thread {t.tid}: SignalProcessWideKey', hz.thread_report())
++
+ 
+ if __name__ == '__main__': unittest.main()
+diff --git a/docs/linux/architecture.md b/docs/linux/architecture.md
+index 67238eaf..14495f0d 100644
+--- a/docs/linux/architecture.md
++++ b/docs/linux/architecture.md
+@@ -31,7 +31,7 @@ The host is a Python program with C libraries. It is not a C program under `dm/h
+ 
+ - Python `horizon_*.py` implement the OS services (threads, fibres, SVC, file system, HID, time, account, display, audio) and the NVN graphics API. `nvn_*.py` record and replay NVN commands and translate shaders to SPIR-V.
+ - C libraries built from `linux/host/`: `libnx2linux_display.so` (SDL3 window and events), `libnx2linux_gpu.so` (Vulkan renderer), `libnx2linux_audio.so` (mixing and output), `libnx2linux_movie.so` (VP8/VP9 by libvpx, Vorbis by stb_vorbis). They are built by CMake in `build-host` under `~/.cache/nx2linux`.
+-- `libnx2linux_sync.so` is the start of the kernel synchronisation calls in C (issue 19). It is built by the same CMake project and used only when `NX2LINUX_SVC_NATIVE=1`, which is off by default. In its first step it answers no call, so a run behaves as without it.
++- `libnx2linux_sync.so` answers the four kernel calls on mutex words and condition keys in C (issue 19): `ArbitrateLock`, `ArbitrateUnlock`, `WaitProcessWideKeyAtomic` and `SignalProcessWideKey`. They are one group, all in C or all in Python. It is built by the same CMake project and used only when `NX2LINUX_SVC_NATIVE=1`, which is off by default and is read once at the start of a run. `NX2LINUX_SVC_PROFILE`, `NX2LINUX_SVC_RING` and `--verbose` look inside the Python handling of these calls, so a run that asks for one stays in Python. `WaitSynchronization` and the events are still in Python. The gain in frames per second is unknown until it is measured on Xenoblade 2.
+ - Games that render with OpenGL use `gl_vulkan.c`, a GL 4.5 core context that Mesa Zink runs on Vulkan. It is not connected to a game's imports yet (see Balatro below).
+ 
+ ## Decisions

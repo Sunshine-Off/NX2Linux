@@ -25,8 +25,8 @@ SANITIZERS = re.compile(r'[a-z]+(,[a-z]+)*')
 # what a sanitizer prints when it found something (ASan, LSan, UBSan)
 REPORT = re.compile(r'ERROR: (?:Address|Leak|Memory|Thread)Sanitizer|runtime error:|SUMMARY: \w*Sanitizer')
 # the libraries linux/host builds for Python, each of which must have been built with the sanitizer
-LIBRARIES = ('libnx2linux_gpu.so', 'libnx2linux_audio.so', 'libnx2linux_display.so', 'libnx2linux_movie.so')
-ENV_OF_LIBRARY = {'libnx2linux_gpu.so': 'NX2LINUX_GPU_LIB', 'libnx2linux_audio.so': 'NX2LINUX_AUDIO_LIB', 'libnx2linux_display.so': 'NX2LINUX_DISPLAY_LIB'}
+LIBRARIES = ('libnx2linux_gpu.so', 'libnx2linux_audio.so', 'libnx2linux_display.so', 'libnx2linux_movie.so', 'libnx2linux_sync.so')
+ENV_OF_LIBRARY = {'libnx2linux_gpu.so': 'NX2LINUX_GPU_LIB', 'libnx2linux_audio.so': 'NX2LINUX_AUDIO_LIB', 'libnx2linux_display.so': 'NX2LINUX_DISPLAY_LIB', 'libnx2linux_sync.so': 'NX2LINUX_SYNC_LIB'}
 # capstone's Python binding opens libcapstone with RTLD_DEEPBIND, which the sanitizer runtime refuses (it ends the process). A sitecustomize on PYTHONPATH removes the request in the test process only.
 SITECUSTOMIZE = 'import os\nif hasattr(os, "RTLD_DEEPBIND"): del os.RTLD_DEEPBIND\n'
 
@@ -50,6 +50,7 @@ CASES: tuple[Case, ...] = (
     # the AOT runtime: guest memory, atomics, services, the import table, the cache, the address table, system registers, the lifted code of GCC output
     Case('aot', 'test_aot_memory'),
     Case('aot', 'test_aot_svc'),
+    Case('aot', 'test_aot_svc_native'),
     Case('aot', 'test_aot_atomics'),
     Case('aot', 'test_aot_stub'),
     Case('aot', 'test_aot_cache'),
@@ -66,6 +67,7 @@ CASES: tuple[Case, ...] = (
     Case('host', 'test_horizon_gpu'),
     Case('host', 'test_horizon_nvn'),
     Case('host', 'test_nvn_rec'),
+    Case('host', 'test_horizon_sync'),
     Case('host', 'test_gpuprof'),
     Case('host', 'test_horizon_audio'),
     Case('host', 'test_horizon_movie'),
