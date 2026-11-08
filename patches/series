@@ -114,3 +114,4 @@
 0133-linux-host-nx2linux-frame-marks-prints-the-frame.patch
 0134-linux-host-count-what-the-mutex-and-key-calls-di.patch
 0135-linux-host-the-library-tests-skip-a-libnx2linux.patch
+0137-linux-host-a-host-log-and-structured-crash-repor.patch
