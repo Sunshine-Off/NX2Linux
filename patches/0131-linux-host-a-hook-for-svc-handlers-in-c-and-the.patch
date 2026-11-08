@@ -1,0 +1,505 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 8 Nov 2026 12:46:39 +0100
+Subject: [PATCH] Linux host: a hook for svc handlers in C and the start of
+ libnx2linux_sync (#19)
+
+An svc number can now have a handler written in C that runs before the
+Python one and answers handled or not handled. The AOT code and the JIT code
+go through the same aot_svc_dispatch, so a path cannot be missed. Horizon.bind
+is the one place that says which logical thread a host thread acts for (a
+guest thread, a fiber when it starts and at every switch). horizon_sync.py
+loads libnx2linux_sync.so when NX2LINUX_SVC_NATIVE=1 (off by default) and
+falls back to Python, saying why, when it is not built or does not fit.
+The library answers no call yet, so nothing changes in a run.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: Prepare the kernel synchronisation calls in C: a native svc hook, Horizon.bind and the loader of libnx2linux_sync, off by default
+Issue: Sunshine-Off/NX2Linux#19
+
+---
+ dm/tools/aot_jit.cpp                |   2 +-
+ dm/tools/aot_lift.py                |  10 +++
+ dm/tools/aot_runtime.cpp            |  22 ++++-
+ dm/tools/aot_runtime.h              |   6 ++
+ dm/tools/horizon_fiber.py           |   4 +-
+ dm/tools/horizon_hle.py             |  11 ++-
+ dm/tools/horizon_sync.py            |  69 ++++++++++++++++
+ dm/tools/tests/test_aot_svc.py      |  79 +++++++++++++++++-
+ dm/tools/tests/test_horizon_sync.py | 121 ++++++++++++++++++++++++++++
+ docs/linux/architecture.md          |   1 +
+ 10 files changed, 319 insertions(+), 6 deletions(-)
+ create mode 100644 dm/tools/horizon_sync.py
+ create mode 100644 dm/tools/tests/test_horizon_sync.py
+
+diff --git a/dm/tools/aot_jit.cpp b/dm/tools/aot_jit.cpp
+index 7e1751fa..a81bfba7 100644
+--- a/dm/tools/aot_jit.cpp
++++ b/dm/tools/aot_jit.cpp
+@@ -272,7 +272,7 @@ int run_jit(State *st, uint64_t pc, Memory *m, int is_jump, char *err, size_t er
+             aot_count(AOT_S_SVC);
+             uint64_t regs[31];
+             for (int i = 0; i < 31; i++) regs[i] = c.jit->GetRegister(i);
+-            aot_svc_handler((int)c.svc_num, regs, c.jit->GetPC() - 4);
++            aot_svc_dispatch((int)c.svc_num, regs, c.jit->GetPC() - 4);
+             for (int i = 0; i < 31; i++) c.jit->SetRegister(i, regs[i]);
+             continue;
+         }
+diff --git a/dm/tools/aot_lift.py b/dm/tools/aot_lift.py
+index edf5d361..2df4a59d 100644
+--- a/dm/tools/aot_lift.py
++++ b/dm/tools/aot_lift.py
+@@ -521,6 +521,16 @@ class Aot:
+         self._svc = self.SVC(cb)   # kept alive: the library holds only the raw pointer
+         slot.value = ctypes.cast(self._svc, ctypes.c_void_p).value
+ 
++    SVC_NATIVE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint64, ctypes.c_void_p)
++
++    def register_native_svc(self, num, fn, ctx=None):
++        """A service handler written in C for svc number num, run before the Python handler (set_svc_handler): fn is a function pointer (an int, from a library loaded in this process, or a SVC_NATIVE callback kept alive
++        by the caller) with the signature int fn(int num, uint64_t *regs, uint64_t orig_addr, void *ctx). It returns 1 when it did the call and 0 when it did not: then nothing has changed and the Python handler does it.
++        Returns 0, or 1 when num is out of range or taken. Call it before the guest runs. fn None removes the handler"""
++        L = self.lib
++        L.aot_register_svc_native.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]; L.aot_register_svc_native.restype = ctypes.c_int
++        return L.aot_register_svc_native(num, fn, ctx)
++
+     IMPORT = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p)
+ 
+     def register_import(self, addr, fn, name):
+diff --git a/dm/tools/aot_runtime.cpp b/dm/tools/aot_runtime.cpp
+index afe8a3aa..e9abee6e 100644
+--- a/dm/tools/aot_runtime.cpp
++++ b/dm/tools/aot_runtime.cpp
+@@ -275,6 +275,25 @@ Memory *__remill_jump(State &st, uint64_t pc, Memory *m) {   // br: a tail call,
+ 
+ // svc: Remill lifts it to an asynchronous hyper call carrying the number; the registers go to the Horizon service handler (the shape of svc_dispatch) and its results come back into them
+ AotSvcHandler aot_svc_handler;
++namespace { struct SvcNativeEnt { std::atomic<AotSvcNative> fn; void *ctx; }; SvcNativeEnt g_svc_native[AOT_SVC_MAX]; std::mutex g_svc_native_mu; }
++extern "C" {
++int aot_register_svc_native(int num, AotSvcNative fn, void *ctx) {
++    if ((unsigned)num >= AOT_SVC_MAX) return 1;
++    std::lock_guard<std::mutex> g(g_svc_native_mu);
++    SvcNativeEnt &e = g_svc_native[num];
++    if (!fn) { e.fn.store(nullptr, std::memory_order_release); return 0; }
++    if (e.fn.load()) return 1;
++    e.ctx = ctx; e.fn.store(fn, std::memory_order_release);   // the context first: a reader that sees fn sees it
++    return 0;
++}
++void aot_svc_dispatch(int num, uint64_t *regs, uint64_t at) {
++    if ((unsigned)num < AOT_SVC_MAX) {
++        SvcNativeEnt &e = g_svc_native[num];
++        if (AotSvcNative f = e.fn.load(std::memory_order_acquire)) { if (f(num, regs, at, e.ctx)) return; }
++    }
++    aot_svc_handler(num, regs, at);
++}
++}
+ Memory *__remill_async_hyper_call(State &st, uint64_t pc, Memory *m) {
+     if (st.hyper_call == AsyncHyperCall::kInvalid) return m;   // SYS (cache maintenance: DC, IC) is lifted as an asynchronous hyper call that sets none: it already moved PC on
+     if (st.hyper_call != AsyncHyperCall::kAArch64SupervisorCall)
+@@ -287,7 +306,7 @@ Memory *__remill_async_hyper_call(State &st, uint64_t pc, Memory *m) {
+     XREGS(X)
+ #undef X
+     st.hyper_call = AsyncHyperCall::kInvalid;   // consumed: the next asynchronous hyper call that sets none (SYS: dc, ic) must not look like this svc again
+-    aot_svc_handler(num, regs, at);
++    aot_svc_dispatch(num, regs, at);
+     if (g_exit_requested) { g_exit_requested = false; fail("thread exited"); }
+ #define X(i) st.gpr.x##i.qword = regs[i];
+     XREGS(X)
+@@ -366,6 +385,7 @@ int aot_unmap(uint64_t base) {
+ void aot_unregister_imports();
+ void aot_unmap_all() {
+     aot_unregister_imports();
++    for (SvcNativeEnt &e : g_svc_native) e.fn.store(nullptr);   // the native service handlers go with the regions, like the imports
+     std::lock_guard<std::mutex> g(g_regions_mu);
+     for (unsigned i = 0, n = g_nregions.load(); i < n; i++) { const Region &r = g_regions[i]; const uint64_t lo = r.base & ~(PAGE - 1), hi = (r.base + (r.size.load() ? r.size.load() : 1) + PAGE - 1) & ~(PAGE - 1); mmap(nx2_gbase + lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0); g_regions[i].size = 0; g_regions[i].host = nullptr; }
+     g_nregions.store(0);
+diff --git a/dm/tools/aot_runtime.h b/dm/tools/aot_runtime.h
+index 1f7c670c..b02af8a1 100644
+--- a/dm/tools/aot_runtime.h
++++ b/dm/tools/aot_runtime.h
+@@ -33,6 +33,12 @@ extern AotFallback aot_fallback;
+ // Its return value is not used: a service answers in the registers, as on the console. Without a handler an svc is an explicit error.
+ typedef uint64_t (*AotSvcHandler)(int num, uint64_t *regs, uint64_t orig_addr);
+ extern AotSvcHandler aot_svc_handler;
++// Native service handlers (issue 19): an svc number may have a handler written in C that runs before aot_svc_handler. It answers 1 when it did the call (the registers are the results, as for the Python handler)
++// and 0 when it did not, and then nothing has changed and aot_svc_handler runs as if it were not there. Registered before the guest runs, then only read. Both the AOT code and the JIT code go through aot_svc_dispatch.
++#define AOT_SVC_MAX 256
++typedef int (*AotSvcNative)(int num, uint64_t *regs, uint64_t orig_addr, void *ctx);
++int aot_register_svc_native(int num, AotSvcNative fn, void *ctx);   // 0, or 1 when num is out of range or already has a handler. fn null removes the handler
++void aot_svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr);
+ // Imports of a loaded module (elf_module.py): an address in guest space that is no code but a host function, as the GOT of a module points at the HLE functions of the real loader. Calling it
+ // (blr, br, or a call from JIT code) runs fn(regs, ctx) with x0..x30 (it writes its answers back there); fn null: the import is unresolved and calling it is an explicit error naming it.
+ typedef void (*AotImportFn)(uint64_t *regs, void *ctx);
+diff --git a/dm/tools/horizon_fiber.py b/dm/tools/horizon_fiber.py
+index f6e6ec4a..c96a3619 100644
+--- a/dm/tools/horizon_fiber.py
++++ b/dm/tools/horizon_fiber.py
+@@ -38,7 +38,7 @@ class Fibers:
+         entry = regs['x30']
+         def main():
+             rec = self.current()
+-            hz.local.thread = logical
++            hz.bind(logical)
+             r = hz.aot.run(entry, regs, 0, ctx + CTX_SIZE, tls[0], tls[1], vregs=vregs, snapshot=False)
+             if 'fault' in r and r['fault'] != 'thread exited':
+                 chain = [0] * 31; chain[29], chain[30] = r.get('x29', 0), r.get('x30', 0)
+@@ -66,7 +66,7 @@ def dispatch(hz, r):
+         F.spawn(target, tls, logical)   # a fresh fiber: `target` is the context FiberImplByHorizon::Initialize built
+     cur.sem.acquire()   # until some fiber switches back to this one
+     hz.aot.set_tls(*cur.tls)
+-    hz.local.thread = cur.logical
++    hz.bind(cur.logical)
+     r[0] = 0   # the context restore leaves x0 = 0 (it was saved as 0)
+ 
+ 
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index aa170881..e358f30c 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -74,7 +74,7 @@ class KThread(Obj):
+ 
+     def main(self):
+         hz = self.hz
+-        hz.local.thread = self
++        hz.bind(self)
+         try:
+             self.result = hz.aot.run(self.entry, {'x0': self.arg, 'x1': self.handle, 'x30': hz.ms.STOP}, 0, self.stack_top, self.tlr + 0x800, self.tlr, snapshot=False)
+             if 'fault' in self.result and self.result['fault'] != 'thread exited':
+@@ -140,6 +140,7 @@ class Horizon:
+         self.ring = collections.deque(maxlen=200000) if os.environ.get('NX2LINUX_SVC_RING') else None   # the last synchronisation svcs, for a hang report
+         self.main_thread_obj = KThread(self, 0, 0, 0, 44, ms.TLS)
+         self.main_thread_obj.tid = 1
++        self.native = None   # horizon_sync.Native when the synchronisation calls run in C
+         self._init_kernel()
+         import horizon_fiber
+         horizon_fiber.install_state(self)
+@@ -178,8 +179,16 @@ class Horizon:
+ 
+     def attach(self):
+         self.aot.set_svc_handler(self.svc)
++        import horizon_sync
++        self.native = horizon_sync.install(self)   # the kernel calls in C, when NX2LINUX_SVC_NATIVE=1 and the library is there (issue 19)
+         return self
+ 
++    def bind(self, thread):
++        """The calling host thread acts for this logical thread from now on (None: the main thread). The one place that sets it: a guest thread when it starts, a fiber when it starts and at every switch to it.
++        The native synchronisation calls (horizon_sync.py) need to know it too"""
++        self.local.thread = thread
++        if self.native: self.native.bind(thread)
++
+     def new_handle(self, obj):
+         h = self._next_handle; self._next_handle += 1; self.handles[h] = obj; return h
+ 
+diff --git a/dm/tools/horizon_sync.py b/dm/tools/horizon_sync.py
+new file mode 100644
+index 00000000..0121e042
+--- /dev/null
++++ b/dm/tools/horizon_sync.py
+@@ -0,0 +1,69 @@
++"""The kernel synchronisation calls in C (NX2Linux Phase 3, issue 19): the loader of linux/host/svcsync.c (libnx2linux_sync.so) and the one place where the host tells it which logical thread a host thread acts for.
++NX2LINUX_SVC_NATIVE=1 asks for the C path, anything else (the default) keeps every call in Python. The value is read once, when the run attaches, and never changes during a run: a thread parked on the Python side would never be woken
++by a signal sent on the C side, so the two paths must not mix. A library that is not built, or that does not fit this host, leaves the Python path and says so. NX2LINUX_SYNC_LIB names the library
++(default ~/.cache/nx2linux/build-host/libnx2linux_sync.so, where `cmake -S linux/host -B ~/.cache/nx2linux/build-host` puts it).
++Step a1: the library answers no call yet, so a run with the switch on behaves exactly as with it off."""
++import ctypes as C
++import os
++from pathlib import Path
++
++ABI = 1
++
++
++def library_path(environ=None):
++    env = os.environ if environ is None else environ
++    p = env.get('NX2LINUX_SYNC_LIB') or str(Path.home() / '.cache/nx2linux/build-host/libnx2linux_sync.so')
++    return p if os.path.exists(p) else None
++
++
++def requested(environ=None):
++    """True, False, or None when the value is not 0 or 1 (the run then stays on Python and says so)"""
++    v = (os.environ if environ is None else environ).get('NX2LINUX_SVC_NATIVE', '0').strip()
++    return {'0': False, '1': True}.get(v)
++
++
++class Native:
++    """The loaded library, bound to one Horizon. `calls` are the svc numbers it took over"""
++    def __init__(self, hz, lib, path):
++        self.hz, self.lib, self.path, self.calls = hz, lib, path, []
++        lib.nx2sync_bind.argtypes = [C.c_uint32, C.c_uint32]; lib.nx2sync_bind.restype = C.c_int
++        lib.nx2sync_current.argtypes = []; lib.nx2sync_current.restype = C.c_uint32
++        lib.nx2sync_handles.argtypes = [C.c_int]; lib.nx2sync_handles.restype = C.c_int
++        lib.nx2sync_abi.argtypes = []; lib.nx2sync_abi.restype = C.c_int
++
++    def bind(self, thread):
++        """The calling host thread acts for this logical thread (a KThread), or for the main thread when None"""
++        t = thread or self.hz.main_thread_obj
++        self.lib.nx2sync_bind(t.tid, getattr(t, 'handle', 0) or 0)
++
++
++def install(hz, environ=None):
++    """Called by Horizon.attach before the guest runs. Returns the Native bound to hz, or None when the calls stay in Python"""
++    want = requested(environ)
++    if want is None:
++        hz.log(f'[svc] NX2LINUX_SVC_NATIVE={(os.environ if environ is None else environ).get("NX2LINUX_SVC_NATIVE")!r} is not 0 or 1: the synchronisation calls stay in Python')
++        return None
++    if not want: return None
++    path = library_path(environ)
++    if not path:
++        hz.log('[svc] NX2LINUX_SVC_NATIVE=1 but libnx2linux_sync.so is not built (cmake -S linux/host -B ~/.cache/nx2linux/build-host && cmake --build ~/.cache/nx2linux/build-host): the synchronisation calls stay in Python')
++        return None
++    try:
++        lib = C.CDLL(path)
++        lib.nx2sync_abi.restype = C.c_int
++        if lib.nx2sync_abi() != ABI: raise OSError(f'interface {lib.nx2sync_abi()}, this host wants {ABI}')
++        aot = hz.aot.lib
++        lib.nx2sync_init.argtypes = [C.c_void_p, C.c_void_p]; lib.nx2sync_init.restype = C.c_int
++        if lib.nx2sync_init(C.cast(aot.aot_peek, C.c_void_p).value, C.cast(aot.aot_cas32, C.c_void_p).value): raise OSError('init failed')
++        n = Native(hz, lib, path)
++        fn = C.cast(lib.nx2sync_svc, C.c_void_p).value
++        for num in range(256):
++            if lib.nx2sync_handles(num):
++                if hz.aot.register_native_svc(num, fn, None): raise OSError(f'svc {num:#x} is taken')
++                n.calls.append(num)
++    except (OSError, AttributeError) as e:
++        hz.log(f'[svc] cannot use {path}: {e}. The synchronisation calls stay in Python')
++        return None
++    hz.log(f'[svc] native synchronisation: {len(n.calls)} kernel calls in C ({path})')
++    n.bind(None)   # the thread that boots the game is the main thread
++    return n
+diff --git a/dm/tools/tests/test_aot_svc.py b/dm/tools/tests/test_aot_svc.py
+index 4cb53a94..b27a8255 100644
+--- a/dm/tools/tests/test_aot_svc.py
++++ b/dm/tools/tests/test_aot_svc.py
+@@ -5,7 +5,7 @@
+   · host threads run guest threads concurrently, each with its own registers, thread pointers and service calls;
+   · code one thread rewrites is recompiled by every other thread's JIT, also when that thread is in the middle of running it (hypotheses.md H15).
+ Needs REMILL_BUILD (with the SVC and TPIDRRO patch), DYNARMIC_DIR, clang++ and unicorn; skipped otherwise."""
+-import os, struct, sys, threading, time, unittest
++import ctypes, os, struct, sys, threading, time, unittest
+ from pathlib import Path
+ 
+ HERE = Path(__file__).resolve().parent
+@@ -170,6 +170,83 @@ class Svc(unittest.TestCase):
+         self.assertEqual(self.a.stat('svc_calls') - before, 8 * 50)
+ 
+ 
++
++class Native:
++    """A service handler in C for svc 0x2A (here a ctypes callback: what a library's function pointer is to the runtime). It answers x0 * 5 and x1 = 0x77, or declines"""
++    def __init__(self, a, answer=True):
++        self.a, self.answer, self.calls = a, answer, []
++        def fn(num, regs, orig, ctx):
++            self.calls.append((num, orig, regs[0], ctx))
++            if not self.answer: return 0
++            regs[0] = (regs[0] * 5) & M; regs[1] = 0x77
++            return 1
++        self.cb = a.SVC_NATIVE(fn)   # kept alive: the runtime holds only the raw pointer
++    def register(self, num=0x2A, ctx=0x1234): return self.a.register_native_svc(num, ctypes.cast(self.cb, ctypes.c_void_p).value, ctx)
++    def remove(self, num=0x2A): return self.a.register_native_svc(num, None)
++
++
++class NativeSvcChecks:
++    """What a native service handler promises, in AOT code and in JIT code. Needs self.a, self.h and self.call(regs) -> result of the guest function that makes svc 0x2A"""
++    def tearDown(self): self.a.register_native_svc(0x2A, None)
++
++    def test_a_native_handler_that_answers_replaces_the_python_one(self):
++        n = Native(self.a); self.assertEqual(n.register(), 0)
++        got = self.call({'x0': 6, 'x1': 1})
++        self.assertEqual((got['x0'], got['x1']), (30, 0x77))
++        self.assertEqual(self.h.log, [])   # the Python handler never ran
++        self.assertEqual(len(n.calls), 1); self.assertEqual(n.calls[0][0], 0x2A); self.assertEqual(n.calls[0][3], 0x1234)   # the number, the context
++        self.assertGreater(self.a.stat('svc_calls'), 0)
++
++    def test_a_native_handler_that_declines_leaves_the_call_to_python_unchanged(self):
++        want = self.call({'x0': 6, 'x1': 1}); self.assertEqual(self.h.log, [(0x2A, self.entry, 6)])   # no native yet: the Python result
++        n = Native(self.a, answer=False); n.register()
++        got = self.call({'x0': 6, 'x1': 1})
++        self.assertEqual(len(n.calls), 1)
++        self.assertEqual({k: got[k] for k in ('x0', 'x1')}, {k: want[k] for k in ('x0', 'x1')})
++        self.assertEqual(self.h.log, [(0x2A, self.entry, 6)])
++
++    def test_the_handler_is_per_number(self):
++        n = Native(self.a); n.register(0x2B)
++        got = self.call({'x0': 6, 'x1': 1})
++        self.assertEqual(n.calls, []); self.assertEqual(self.h.log, [(0x2A, self.entry, 6)])
++        self.a.register_native_svc(0x2B, None)
++
++    def test_removing_it_gives_the_call_back_to_python(self):
++        n = Native(self.a); n.register(); self.call({'x0': 1}); self.assertEqual(self.h.log, [])
++        self.assertEqual(n.remove(), 0)
++        self.call({'x0': 1}); self.assertEqual(self.h.log, [(0x2A, self.entry, 1)])
++
++    def test_a_number_out_of_range_or_taken_is_refused(self):
++        n = Native(self.a)
++        self.assertEqual(n.register(256), 1); self.assertEqual(n.register(-1), 1)
++        self.assertEqual(n.register(), 0); self.assertEqual(n.register(), 1)   # the second handler for the number
++
++
++@unittest.skipUnless(READY, 'needs REMILL_BUILD, clang++ and unicorn')
++class NativeSvc(NativeSvcChecks, unittest.TestCase):
++    entry = ECHO
++    @classmethod
++    def setUpClass(cls): cls.a, cls.h = aot_lib([(ECHO, 2)])
++    @classmethod
++    def tearDownClass(cls): cls.a.close()
++    def call(self, regs): return run(self.a, self.h, ECHO, regs)
++
++    def test_closing_the_library_drops_the_handlers(self):
++        a, h = aot_lib([(ECHO, 2)]); n = Native(a); n.register()
++        a.lib.aot_unmap_all()   # what close() does first
++        self.assertEqual(n.register(), 0)   # free again
++        a.close()
++
++@unittest.skipUnless(JIT_READY, 'needs REMILL_BUILD, DYNARMIC_DIR, clang++ and unicorn')
++class NativeJitSvc(NativeSvcChecks, unittest.TestCase):
++    """The same promises when the svc is executed by the JIT: it goes through the same dispatch"""
++    entry = ECHO
++    @classmethod
++    def setUpClass(cls): cls.a, cls.h = aot_lib(['indirect'], jit=True)
++    @classmethod
++    def tearDownClass(cls): cls.a.close()
++    def call(self, regs): return run(self.a, self.h, RANGES['indirect'][0], dict(regs, x1=ECHO, x2=RETONLY))
++
+ @unittest.skipUnless(JIT_READY, 'needs REMILL_BUILD, DYNARMIC_DIR, clang++ and unicorn')
+ class JitSvc(unittest.TestCase):
+     @classmethod
+diff --git a/dm/tools/tests/test_horizon_sync.py b/dm/tools/tests/test_horizon_sync.py
+new file mode 100644
+index 00000000..04bc5e32
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_sync.py
+@@ -0,0 +1,121 @@
++"""The switch and the loader of the native synchronisation calls (horizon_sync.py, issue 19, step a1) and Horizon.bind. No game and no Remill: a Horizon on a fake guest memory, and the real libnx2linux_sync.so
++when it is built (cmake -S linux/host -B ~/.cache/nx2linux/build-host, or NX2LINUX_SYNC_LIB), else those tests are skipped."""
++import ctypes as C, io, os, sys, tempfile, threading, types, unittest
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE.parent)); sys.path.insert(0, str(HERE))
++import horizon_hle as hh
++import horizon_sync as hs
++from test_horizon_hle import FakeAot
++
++LIB = hs.library_path()
++PEEK = C.CFUNCTYPE(C.c_int, C.c_uint64, C.c_void_p, C.c_uint64)
++CAS = C.CFUNCTYPE(C.c_uint32, C.c_uint64, C.c_uint32, C.c_uint32)
++
++
++class WithLib(FakeAot):
++    """The two functions the library gets from the AOT runtime, and the registration of native svc handlers"""
++    def __init__(self):
++        super().__init__()
++        self.peek_cb, self.cas_cb = PEEK(lambda a, d, n: 0), CAS(lambda a, e, d: e)
++        self.lib = types.SimpleNamespace(aot_peek=self.peek_cb, aot_cas32=self.cas_cb, aot_poke=self.lib.aot_poke)
++        self.registered = []
++    def register_native_svc(self, num, fn, ctx=None): self.registered.append((num, fn, ctx)); return 0
++
++
++def horizon():
++    aot = WithLib()
++    ms = types.SimpleNamespace(aot=aot, modules=[], TLS=0x1000, STOP=0xFFFF0000)
++    out = io.StringIO()
++    return hh.Horizon(ms, out=out), aot, out
++
++
++class Switch(unittest.TestCase):
++    def test_off_by_default_and_silent(self):
++        hz, aot, out = horizon()
++        self.assertIsNone(hs.install(hz, {})); self.assertEqual(out.getvalue(), ''); self.assertEqual(aot.registered, [])
++
++    def test_zero_is_off(self):
++        hz, _, out = horizon(); self.assertIsNone(hs.install(hz, {'NX2LINUX_SVC_NATIVE': '0'})); self.assertEqual(out.getvalue(), '')
++
++    def test_a_value_that_is_not_0_or_1_stays_in_python_and_says_so(self):
++        for v in ('yes', '2', ''):
++            hz, _, out = horizon()
++            self.assertIsNone(hs.install(hz, {'NX2LINUX_SVC_NATIVE': v})); self.assertIn('is not 0 or 1', out.getvalue())
++
++    def test_a_library_that_is_not_built_stays_in_python_and_says_so(self):
++        hz, _, out = horizon()
++        self.assertIsNone(hs.install(hz, {'NX2LINUX_SVC_NATIVE': '1', 'NX2LINUX_SYNC_LIB': '/nonexistent/libnx2linux_sync.so'}))
++        self.assertIn('is not built', out.getvalue()); self.assertIn('stay in Python', out.getvalue())
++
++    def test_a_file_that_is_not_a_library_stays_in_python_and_says_so(self):
++        with tempfile.NamedTemporaryFile(suffix='.so') as f:
++            f.write(b'not an ELF file'); f.flush()
++            hz, aot, out = horizon()
++            self.assertIsNone(hs.install(hz, {'NX2LINUX_SVC_NATIVE': '1', 'NX2LINUX_SYNC_LIB': f.name}))
++            self.assertIn('cannot use', out.getvalue()); self.assertEqual(aot.registered, [])
++
++    def test_attach_installs_the_native_path_only_when_asked(self):
++        hz, aot, out = horizon(); aot.set_svc_handler = lambda fn: None
++        old = os.environ.pop('NX2LINUX_SVC_NATIVE', None)
++        try: self.assertIs(hz.attach(), hz); self.assertIsNone(hz.native)
++        finally:
++            if old is not None: os.environ['NX2LINUX_SVC_NATIVE'] = old
++
++
++class Bind(unittest.TestCase):
++    def test_bind_sets_the_logical_thread_of_the_host_thread(self):
++        hz, _, _ = horizon(); t = hh.KThread(hz, 0, 0, 0, 44, 0x5000)
++        self.assertIsNone(hz.current())
++        hz.bind(t); self.assertIs(hz.current(), t)
++        hz.bind(None); self.assertIsNone(hz.current())
++
++    def test_bind_is_per_host_thread(self):
++        hz, _, _ = horizon(); t = hh.KThread(hz, 0, 0, 0, 44, 0x5000); seen = []
++        hz.bind(t)
++        th = threading.Thread(target=lambda: seen.append(hz.current())); th.start(); th.join()
++        self.assertEqual(seen, [None]); self.assertIs(hz.current(), t)
++
++    def test_the_native_path_is_told_every_time(self):
++        hz, _, _ = horizon(); calls = []
++        hz.native = types.SimpleNamespace(bind=lambda t: calls.append(t))
++        t = hh.KThread(hz, 0, 0, 0, 44, 0x5000)
++        hz.bind(t); hz.bind(None)
++        self.assertEqual(calls, [t, None])
++
++    def test_a_guest_thread_binds_itself_when_it_starts(self):
++        hz, aot, _ = horizon(); seen = []
++        class A(WithLib):
++            def run(self, *a, **k): seen.append(hz.current()); return {}
++        hz.aot = hz.ms.aot = A()
++        hz.native = types.SimpleNamespace(bind=lambda t: seen.append(('native', t.tid if t else None)))
++        t = hh.KThread(hz, 0x100, 0, 0x300000, 44, 0x5000); t.start(); t.py.join(10)
++        self.assertEqual(seen, [('native', t.tid), t])
++
++
++@unittest.skipUnless(LIB, 'libnx2linux_sync.so is not built (cmake -S linux/host -B ~/.cache/nx2linux/build-host, or NX2LINUX_SYNC_LIB)')
++class RealLibrary(unittest.TestCase):
++    def test_the_library_loads_and_takes_no_call_in_step_a1(self):
++        hz, aot, out = horizon()
++        n = hs.install(hz, {'NX2LINUX_SVC_NATIVE': '1', 'NX2LINUX_SYNC_LIB': LIB})
++        self.assertIsNotNone(n, out.getvalue())
++        self.assertEqual(n.calls, []); self.assertEqual(aot.registered, [])
++        self.assertIn('0 kernel calls in C', out.getvalue())
++
++    def test_each_host_thread_acts_for_the_logical_thread_bound_to_it(self):
++        hz, _, out = horizon(); n = hs.install(hz, {'NX2LINUX_SVC_NATIVE': '1', 'NX2LINUX_SYNC_LIB': LIB}); self.assertIsNotNone(n, out.getvalue())
++        hz.native = n
++        self.assertEqual(n.lib.nx2sync_current(), 1)   # install bound the booting thread to the main thread
++        a, b = hh.KThread(hz, 0, 0, 0, 44, 0x5000), hh.KThread(hz, 0, 0, 0, 44, 0x6000); got = {}
++        def work(t):
++            got[t.tid, 'before'] = n.lib.nx2sync_current(); hz.bind(t); got[t.tid, 'after'] = n.lib.nx2sync_current()
++            hz.bind(None); got[t.tid, 'main'] = n.lib.nx2sync_current()
++        ths = [threading.Thread(target=work, args=(t,)) for t in (a, b)]
++        for th in ths: th.start()
++        for th in ths: th.join()
++        for t in (a, b): self.assertEqual((got[t.tid, 'before'], got[t.tid, 'after'], got[t.tid, 'main']), (1, t.tid, 1))
++        self.assertEqual(n.lib.nx2sync_current(), 1)
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/docs/linux/architecture.md b/docs/linux/architecture.md
+index deb4d466..67238eaf 100644
+--- a/docs/linux/architecture.md
++++ b/docs/linux/architecture.md
+@@ -31,6 +31,7 @@ The host is a Python program with C libraries. It is not a C program under `dm/h
+ 
+ - Python `horizon_*.py` implement the OS services (threads, fibres, SVC, file system, HID, time, account, display, audio) and the NVN graphics API. `nvn_*.py` record and replay NVN commands and translate shaders to SPIR-V.
+ - C libraries built from `linux/host/`: `libnx2linux_display.so` (SDL3 window and events), `libnx2linux_gpu.so` (Vulkan renderer), `libnx2linux_audio.so` (mixing and output), `libnx2linux_movie.so` (VP8/VP9 by libvpx, Vorbis by stb_vorbis). They are built by CMake in `build-host` under `~/.cache/nx2linux`.
++- `libnx2linux_sync.so` is the start of the kernel synchronisation calls in C (issue 19). It is built by the same CMake project and used only when `NX2LINUX_SVC_NATIVE=1`, which is off by default. In its first step it answers no call, so a run behaves as without it.
+ - Games that render with OpenGL use `gl_vulkan.c`, a GL 4.5 core context that Mesa Zink runs on Vulkan. It is not connected to a game's imports yet (see Balatro below).
+ 
+ ## Decisions
