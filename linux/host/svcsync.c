@@ -65,6 +65,10 @@ static nx2sync_peek_fn g_peek;
 static nx2sync_cas32_fn g_cas32;
 static queue *g_mq[BUCKETS], *g_kq[BUCKETS];              /* the queues of the mutex words and of the keys, by address */
 static _Atomic uint64_t g_count[256], g_invalid;
+/* What each call did, counted as Horizon.detail does in horizon_hle.py (the names are in DETAIL there, in this order) */
+enum { D_LOCK_QUEUED, D_LOCK_AT_ONCE, D_UNLOCK_HANDED, D_UNLOCK_NONE, D_WAIT_RELEASE_HANDED, D_WAIT_SIGNALLED, D_WAIT_TIMEOUT, D_RELOCK_QUEUED, D_SIGNAL_WOKE, D_SIGNAL_NOBODY, D_N };
+static _Atomic uint64_t g_detail[D_N];
+static void detail(int i, uint64_t n) { atomic_fetch_add_explicit(&g_detail[i], n, memory_order_relaxed); }
 static __thread nx2sync_rec *t_rec;
 
 static int64_t now_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec; }
@@ -137,11 +141,12 @@ static void park(nx2sync_rec *me, int64_t deadline) {   /* wait on the thread's 
 }
 
 /* ArbitrateUnlock: hand the mutex word to the first waiter (keeping the listeners bit while others wait), or clear it. 0, or 1 when the word cannot be read */
-static int unlock_mutex(uint64_t addr) {
+static int unlock_mutex(uint64_t addr, int *handed) {
     queue *q = q_find(g_mq, addr, 0);
     nx2sync_rec *t = NULL; int more = 0;
     if (q) { node *n = q->head; t = n->rec; more = n->next != NULL; n_remove(n); }
     uint32_t nv = t ? (t->tag | (more ? LISTENERS : 0)) : 0;
+    *handed = t != NULL;
     if (cas_to(addr, nv)) return 1;
     if (t) { t->granted = 1; pthread_cond_signal(&t->cv); }
     return 0;
@@ -156,6 +161,7 @@ static int lock_mutex(nx2sync_rec *me, uint64_t addr, uint32_t tag) {
         if (!(v & LISTENERS)) { if (g_cas32(addr, v, v | LISTENERS) != v) continue; }
         me->granted = 0; me->tag = tag;
         if (n_push(g_mq, addr, &me->mn)) return 1;
+        detail(D_RELOCK_QUEUED, 1);
         while (!me->granted) park(me, -1);
         return 0;
     }
@@ -172,9 +178,10 @@ static void note(nx2sync_rec *me, int num, const uint64_t *regs, uint64_t at, do
 static uint64_t do_arbitrate_lock(nx2sync_rec *me, uint64_t *r) {   /* (owner thread handle, mutex addr, requesting thread's tag) */
     uint32_t owner = (uint32_t)r[0], tag = (uint32_t)r[2], v; uint64_t addr = r[1];
     if (rd32(addr, &v)) return R_INVALID_ADDRESS;
-    if (v != (owner | LISTENERS)) return 0;   /* the word changed under the caller: nothing to wait for */
+    if (v != (owner | LISTENERS)) { detail(D_LOCK_AT_ONCE, 1); return 0; }   /* the word changed under the caller: nothing to wait for */
     me->granted = 0; me->tag = tag;
     if (n_push(g_mq, addr, &me->mn)) return R_INVALID_ADDRESS;
+    detail(D_LOCK_QUEUED, 1);
     while (!me->granted) park(me, -1);
     return 0;
 }
@@ -182,14 +189,17 @@ static uint64_t do_arbitrate_lock(nx2sync_rec *me, uint64_t *r) {   /* (owner th
 static uint64_t do_wait_key(nx2sync_rec *me, uint64_t *r) {   /* (mutex addr, key addr, tag, timeout): release the mutex, wait for the key, take the mutex again */
     uint64_t mutex = r[0], key = r[1], timeout = r[3]; uint32_t tag = (uint32_t)r[2];
     int64_t deadline = (timeout >= (1ull << 62)) ? -1 : now_ns() + (int64_t)timeout;   /* 2^62 ns is 146 years: the same as for ever */
-    if (unlock_mutex(mutex)) return R_INVALID_ADDRESS;
+    int handed = 0;
+    if (unlock_mutex(mutex, &handed)) return R_INVALID_ADDRESS;
+    if (handed) detail(D_WAIT_RELEASE_HANDED, 1);
     me->signaled = 0;
     if (n_push(g_kq, key, &me->kn)) return R_INVALID_ADDRESS;
     uint64_t result = 0;
     while (!me->signaled) {
-        if (deadline >= 0 && now_ns() >= deadline) { n_remove(&me->kn); result = R_TIMEOUT; break; }
+        if (deadline >= 0 && now_ns() >= deadline) { n_remove(&me->kn); result = R_TIMEOUT; detail(D_WAIT_TIMEOUT, 1); break; }
         park(me, deadline);
     }
+    if (result == 0) detail(D_WAIT_SIGNALLED, 1);
     if (lock_mutex(me, mutex, tag)) return R_INVALID_ADDRESS;
     return result;
 }
@@ -198,14 +208,16 @@ static uint64_t do_signal_key(uint64_t *r) {   /* (key addr, count): wake that m
     uint64_t key = r[0]; uint32_t count = (uint32_t)r[1];
     if (count >= 0x80000000u) count = 0;
     queue *q = q_find(g_kq, key, 0);
-    for (uint32_t woken = 0; q && q->head && (count == 0 || woken < count); woken++) {
+    uint32_t woken = 0;
+    for (; q && q->head && (count == 0 || woken < count); woken++) {
         nx2sync_rec *t = q->head->rec;
         node *n = q->head;
         int last = n->next == NULL;
         n_remove(n);   /* frees the queue with its last waiter */
         t->signaled = 1; pthread_cond_signal(&t->cv);
-        if (last) break;
+        if (last) { woken++; break; }
     }
+    if (woken) detail(D_SIGNAL_WOKE, woken); else detail(D_SIGNAL_NOBODY, 1);
     return 0;
 }
 
@@ -251,7 +263,7 @@ int nx2sync_svc(int num, uint64_t *regs, uint64_t at, void *ctx) {
     note(me, num, regs, at, t);
     switch (num) {
     case SVC_ARBITRATE_LOCK: result = do_arbitrate_lock(me, regs); break;
-    case SVC_ARBITRATE_UNLOCK: result = unlock_mutex(regs[0]) ? R_INVALID_ADDRESS : 0; break;
+    case SVC_ARBITRATE_UNLOCK: { int handed = 0; result = unlock_mutex(regs[0], &handed) ? R_INVALID_ADDRESS : 0; if (result == 0) detail(handed ? D_UNLOCK_HANDED : D_UNLOCK_NONE, 1); break; }
     case SVC_WAIT_KEY: result = do_wait_key(me, regs); break;
     default: result = do_signal_key(regs); break;
     }
@@ -264,6 +276,9 @@ int nx2sync_svc(int num, uint64_t *regs, uint64_t at, void *ctx) {
 /* The numbers the host reads for its reports. */
 uint64_t nx2sync_count(int num) { return num >= 0 && num < 256 ? atomic_load_explicit(&g_count[num], memory_order_relaxed) : 0; }
 uint64_t nx2sync_invalid(void) { return atomic_load_explicit(&g_invalid, memory_order_relaxed); }
+
+/* What the calls did, in the order of DETAIL in horizon_hle.py: the count at index i (0 to 9), 0 for any other. */
+uint64_t nx2sync_detail(int i) { return i >= 0 && i < D_N ? atomic_load_explicit(&g_detail[i], memory_order_relaxed) : 0; }
 
 /* The last call of a logical thread: 1 and *out filled, or 0 when it made none through this library. */
 int nx2sync_last(uint32_t tid, nx2sync_last_t *out) {
@@ -299,4 +314,4 @@ int nx2sync_waiters(int on_key, uint64_t addr) {
 }
 
 /* The number of the interface, for the host to check before it registers anything. */
-int nx2sync_abi(void) { return 2; }
+int nx2sync_abi(void) { return 3; }

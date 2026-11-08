@@ -112,3 +112,5 @@ file	class	note
 0131-linux-host-a-hook-for-svc-handlers-in-c-and-the.patch	linux	Native svc hook and the loader of libnx2linux_sync, off by default
 0132-linux-host-arbitratelock-arbitrateunlock.patch	linux	Opt-in native kernel calls (NX2LINUX_SVC_NATIVE), off by default
 0133-linux-host-nx2linux-frame-marks-prints-the-frame.patch	linux	Measurement aid, nothing changes without NX2LINUX_FRAME_MARKS
+0134-linux-host-count-what-the-mutex-and-key-calls-di.patch	linux	Counters in the report, nothing else changes
+0135-linux-host-the-library-tests-skip-a-libnx2linux.patch	linux	Test-only change

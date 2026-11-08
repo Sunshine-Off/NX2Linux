@@ -21,6 +21,7 @@ int nx2sync_handles(int num);
 int nx2sync_svc(int num, uint64_t *regs, uint64_t at, void *ctx);
 uint64_t nx2sync_count(int num);
 uint64_t nx2sync_invalid(void);
+uint64_t nx2sync_detail(int i);
 int nx2sync_last(uint32_t tid, last_t *out);
 int nx2sync_recent(uint32_t tid, call_t *out, int max);
 int nx2sync_waiters(int on_key, uint64_t addr);
@@ -108,6 +109,29 @@ static void test_no_waiter_cases(void) {
     CHECK(svc(LOCK, 1, 0x9000, 2, 0) == R_INVALID_ADDRESS);
     CHECK(svc(WAIT, 0x9000, W(5), 1, FOREVER) == R_INVALID_ADDRESS);
     CHECK(nx2sync_waiters(1, W(5)) == 0 && nx2sync_waiters(0, 0x9000) == 0);
+}
+
+enum { LOCK_QUEUED, LOCK_AT_ONCE, UNLOCK_HANDED, UNLOCK_NONE, WAIT_RELEASE_HANDED, WAIT_SIGNALLED, WAIT_TIMEOUT, RELOCK_QUEUED, SIGNAL_WOKE, SIGNAL_NOBODY };
+static uint64_t D[10];
+static void snap(void) { for (int i = 0; i < 10; i++) D[i] = nx2sync_detail(i); }
+static uint64_t since(int i) { return nx2sync_detail(i) - D[i]; }
+
+static void test_detail_of_the_simple_cases(void) {
+    memset((void *)mem, 0, sizeof mem);
+    snap();
+    atomic_store(&mem[0], 0xD001);
+    svc(UNLOCK, W(0), 0, 0, 0);                    /* nobody waits */
+    svc(UNLOCK, W(0), 0, 0, 0);
+    svc(LOCK, 0xD009, W(0), 0xD002, 0);            /* the word is not owner + listeners: returned at once */
+    svc(SIGNAL, W(5), 1, 0, 0);                    /* nobody to wake */
+    atomic_store(&mem[1], 0xD001);
+    svc(WAIT, W(1), W(5), 0xD001, 0);              /* timed out at once */
+    CHECK(since(UNLOCK_NONE) == 2 && since(UNLOCK_HANDED) == 0);
+    CHECK(since(LOCK_AT_ONCE) == 1 && since(LOCK_QUEUED) == 0);
+    CHECK(since(SIGNAL_NOBODY) == 1 && since(SIGNAL_WOKE) == 0);
+    CHECK(since(WAIT_TIMEOUT) == 1 && since(WAIT_SIGNALLED) == 0);
+    svc(UNLOCK, 0x9000, 0, 0, 0);                  /* an invalid address is counted by neither */
+    CHECK(since(UNLOCK_NONE) == 2);
 }
 
 static void test_timeouts(void) {
@@ -266,7 +290,7 @@ static void test_condition_contention(void) {
 
 int main(void) {
     alarm(120);                                    /* a deadlock is a failed test, not a hung one */
-    CHECK(nx2sync_abi() == 2);
+    CHECK(nx2sync_abi() == 3);
     uint64_t regs[31] = {5, 6, 7};
     CHECK(nx2sync_svc(WAIT, regs, 0x1000, NULL) == 0 && regs[0] == 5 && regs[1] == 6);   /* not initialised: not handled, nothing changed */
     CHECK(nx2sync_init(NULL, fake_cas) == 1);      /* both ways into guest memory are needed */
@@ -278,6 +302,7 @@ int main(void) {
     CHECK(nx2sync_current() == 1);
     test_binding();
     test_no_waiter_cases();
+    test_detail_of_the_simple_cases();
     test_timeouts();
     test_signal_order_and_count();
     test_mutex_handoff();
