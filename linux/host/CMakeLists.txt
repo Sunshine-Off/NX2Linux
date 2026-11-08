@@ -88,6 +88,12 @@ add_library(nx2linux_gpu SHARED gpu.c nvnrec.c)
 target_compile_options(nx2linux_gpu PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(nx2linux_gpu PRIVATE nx2linux_host Vulkan::Vulkan pthread PkgConfig::SDL3)
 
+# The kernel synchronisation calls in C, for the host (ctypes): engine/dm/tools/horizon_sync.py. It needs neither SDL nor Vulkan
+add_library(nx2linux_sync SHARED svcsync.c)
+target_compile_features(nx2linux_sync PRIVATE c_std_11)
+target_compile_options(nx2linux_sync PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(nx2linux_sync PRIVATE pthread)
+
 if(BUILD_TESTING)
     add_executable(nx2linux_sdl_host_test tests/test_sdl_host.c)
     target_compile_features(nx2linux_sdl_host_test PRIVATE c_std_11)
@@ -98,6 +104,12 @@ if(BUILD_TESTING)
     set_tests_properties(nx2linux_sdl_host_smoke PROPERTIES
         ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy"
     )
+
+    add_executable(nx2linux_sync_test tests/test_svcsync.c)
+    target_compile_features(nx2linux_sync_test PRIVATE c_std_11)
+    target_compile_options(nx2linux_sync_test PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(nx2linux_sync_test PRIVATE nx2linux_sync pthread)
+    add_test(NAME nx2linux_sync COMMAND nx2linux_sync_test)
 
     add_executable(nx2linux_vulkan_test tests/test_vulkan_renderer.c)
     target_compile_features(nx2linux_vulkan_test PRIVATE c_std_11)
