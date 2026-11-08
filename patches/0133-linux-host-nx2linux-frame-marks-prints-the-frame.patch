@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 8 Nov 2026 13:08:18 +0100
+Subject: [PATCH] Linux host: NX2LINUX_FRAME_MARKS prints the frames presented
+ at chosen seconds of a run (#19)
+
+The rate between two marks leaves the loading out of a comparison between two
+variants of a run. tools/ab_bench.py reads the lines. Nothing changes without
+the variable.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: Print the frames presented at chosen seconds of a run, so that an A B B A comparison leaves the loading out
+Issue: Sunshine-Off/NX2Linux#19
+
+---
+ dm/tools/horizon_run.py                  | 18 +++++++++-
+ dm/tools/tests/test_horizon_run_marks.py | 45 ++++++++++++++++++++++++
+ 2 files changed, 62 insertions(+), 1 deletion(-)
+ create mode 100644 dm/tools/tests/test_horizon_run_marks.py
+
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index dc8acdc8..c050e8bd 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -2,8 +2,9 @@
+ """Run a recompiled game on the Linux host (NX2Linux S7bis): load its modules, replace the SDK functions the host provides, start nn::init::Start's sequence and let the game run for a while.
+ Usage: horizon_run.py [--jit] [--report-json FILE] --modules <dir with <name>.manifest.json> --romfs <RomFS.img> --title <id> [--display|--hidden] [--seconds N] [--order a,b,c] [--cache DIR]
+ The game's constants and workarounds come from its profile folder (dm/games/<id>/, see horizon_game.py); a title with none runs on generic defaults and the run says so.
++NX2LINUX_FRAME_MARKS=30,110 prints the frames presented so far at those seconds of the run (tools/ab_bench.py reads them).
+ Needs REMILL_BUILD (the lifter) for functions not in the cache, and DYNARMIC_DIR with --jit (both: tools/setup_toolchain.sh writes an env.sh). The window needs linux/host built (libnx2linux_display.so, see horizon_display.py)."""
+-import argparse, os, sys, time
++import argparse, os, sys, threading, time
+ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
+@@ -12,6 +13,20 @@ import elf_module as em
+ import horizon_hle, horizon_overrides
+ 
+ 
++def parse_marks(text):
++    """NX2LINUX_FRAME_MARKS=30,110 -> [30.0, 110.0]: seconds of the run. Anything that is not a list of numbers gives none"""
++    try: return [float(x) for x in text.split(',') if x.strip()]
++    except ValueError: return []
++
++
++def schedule_frame_marks(hz, marks, say=print):
++    """At each mark (seconds after the run starts) print how many frames were presented so far: `[frames] at 30 s: 412`. The rate between two marks leaves the loading out, which tools/ab_bench.py relies on to compare two variants of a run"""
++    timers = []
++    for m in marks:
++        t = threading.Timer(m, lambda m=m: say(f'[frames] at {m:g} s: {getattr(hz, "frames_presented", 0)}', flush=True)); t.daemon = True; t.start(); timers.append(t)
++    return timers
++
++
+ def main():
+     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+     p.add_argument('--modules', required=True, help='folder holding <name>.manifest.json and <name>.elf')
+@@ -97,6 +112,7 @@ def main():
+         os._exit(0)
+     started = time.time()
+     threading.Timer(a.seconds, stop).start()
++    schedule_frame_marks(hz, parse_marks(os.environ.get('NX2LINUX_FRAME_MARKS', '')))
+     r = hz.boot()
+     print('result', {k: (hex(v) if isinstance(v, int) else v) for k, v in r.items() if k in ('fault', 'x0', 'step')})
+     report()   # the boot thread ended (nnMain returned or faulted); the other guest threads go on until the timer
+diff --git a/dm/tools/tests/test_horizon_run_marks.py b/dm/tools/tests/test_horizon_run_marks.py
+new file mode 100644
+index 00000000..17c9e748
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_run_marks.py
+@@ -0,0 +1,45 @@
++"""NX2LINUX_FRAME_MARKS (horizon_run.py): the frames presented are printed at chosen seconds of the run, for tools/ab_bench.py. No game: a fake Horizon and marks of a few milliseconds."""
++import re, sys, threading, time, types, unittest
++from pathlib import Path
++
++TOOLS = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(TOOLS))
++import horizon_run as hr
++
++
++class Marks(unittest.TestCase):
++    def test_parse(self):
++        self.assertEqual(hr.parse_marks('30,110'), [30.0, 110.0]); self.assertEqual(hr.parse_marks(' 5 , 7.5 '), [5.0, 7.5])
++        self.assertEqual(hr.parse_marks(''), []); self.assertEqual(hr.parse_marks('30,abc'), [])
++
++    def test_the_frames_so_far_are_printed_at_each_mark(self):
++        hz = types.SimpleNamespace(frames_presented=0); lines, done = [], threading.Event()
++        def say(text, flush=False):
++            lines.append(text)
++            if len(lines) == 2: done.set()
++        timers = hr.schedule_frame_marks(hz, [0.05, 0.2], say)
++        hz.frames_presented = 10
++        time.sleep(0.12); hz.frames_presented = 25
++        self.assertTrue(done.wait(5), lines)
++        self.assertEqual(lines, ['[frames] at 0.05 s: 10', '[frames] at 0.2 s: 25'])
++        for t in timers: t.cancel()
++
++    def test_the_line_has_the_shape_ab_bench_reads(self):
++        root_tools = TOOLS.parents[2] / 'tools'
++        if not (root_tools / 'ab_bench.py').is_file(): self.skipTest('tools/ab_bench.py is not next to the engine (it belongs to the NX2Linux repository)')
++        sys.path.insert(0, str(root_tools))
++        import ab_bench
++        lines = []
++        hr.schedule_frame_marks(types.SimpleNamespace(frames_presented=7), [0.01], lambda text, flush=False: lines.append(text))
++        end = time.monotonic() + 5
++        while not lines and time.monotonic() < end: time.sleep(0.005)
++        self.assertEqual(lines, ['[frames] at 0.01 s: 7'])
++        self.assertEqual(ab_bench.MARK.findall('[frames] at 30 s: 7\n[frames] at 110.5 s: 412\n'), [('30', '7'), ('110.5', '412')])
++
++    def test_the_run_reads_the_variable(self):
++        src = (TOOLS / 'horizon_run.py').read_text()
++        self.assertIn("os.environ.get('NX2LINUX_FRAME_MARKS', '')", src)
++        self.assertLess(src.index("threading.Timer(a.seconds, stop).start()"), src.index('schedule_frame_marks(hz, parse_marks('))
++
++
++if __name__ == '__main__': unittest.main()
