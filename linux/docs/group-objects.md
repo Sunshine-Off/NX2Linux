@@ -2,7 +2,7 @@
 
 `AOT_GROUP=N` in the environment makes `aot_lift.Aot` lift about N functions, merge their IR with `llvm-link` and compile the result into **one object**, with a `.grp` file beside it
 (the functions it defines, the symbols each leaves undefined, and the ones Remill could not lift). With `AOT_GROUP` unset, 0 or 1 nothing changes: one object per function, and the existing caches stay valid.
-Grouped objects live under their own keys, so both kinds can sit in one cache. It is off by default because it is not measured on the game yet.
+Grouped objects live under their own keys, so both kinds can sit in one cache. It is off by default: the build is faster and smaller, and a loss of a few percent of the frame rate is not ruled out (see below).
 
 ## How it works
 
@@ -26,11 +26,40 @@ Grouped objects live under their own keys, so both kinds can sit in one cache. I
 | 256 | 6 | 1.37 MB | 1.36 MB | 22.9 s | 16.6 s |
 
 The wall time of this small corpus hides the gain: 13 groups for 14 jobs leave the cores idle, and 3 groups at 256 even more. Xenoblade 2 has 103,000 functions, about 1,600 groups at 64, which keeps every core busy.
-**The effect on the game is not measured.** The whole engine suite also passes with `AOT_GROUP=4` (every fixture grouped), apart from two files that count one object per function and are pinned to that mode.
+The whole engine suite also passes with `AOT_GROUP=4` (every fixture grouped), apart from two files that count one object per function and are pinned to that mode.
 
-## Measuring it on Xenoblade 2
+## Measured on Xenoblade 2
 
-In a cache of its own so that nothing existing is touched, with the same `--jit` as the cold build of 861 s and 1.3 GB:
+A cold build of the whole game with `--jit`, the same Remill (patches 0010 and 0011), the same machine, a cache of its own each time:
+
+| | one object per function | `AOT_GROUP=64` |
+|---|---|---|
+| build time | 860.9 s | **563.6 s (-35%)** |
+| files in `obj/` | about 206,000 | **3,288** (1,644 groups and their `.grp`) |
+| `obj/` on disk | 1.1 GB | **372 MB (-66%)** |
+| `lib/` | 244 MB | 241 MB |
+| groups split | not applicable | **0** of 1,644 |
+
+One build each, so the 35% is an order of magnitude and not a precise figure.
+
+**Frames presented in 120 s of play**, with the same scripted key presses and `--jit` on both, and no other load that we know of:
+
+| series | one object per function | `AOT_GROUP=64` |
+|---|---|---|
+| first, alternating | 1,697 and 1,596 | 1,555 and 1,510 |
+| second, in the order A B B A A B B A | 1,738 1,676 1,671 1,700 | 1,637 and 1,698 |
+
+Two more runs of the second series gave 1,010 and 839 frames with `AOT_GROUP=64`. They ran at the same time as a validation of the `sdk` module that used 14 processes, which the dates of the report files show (11:39 to 11:44 for both), so they are left out. The runs on either side of them give 1,637 and 1,698.
+
+The ten runs that count give 1,680 frames on average without grouping and 1,600 with it, a gap of **about 5%**, which is 1.6 standard errors: with these runs it cannot be told from nothing, and it cannot be ruled out either. The machine code does not explain it:
+on 600 functions of the generated corpus, 597 compile to the same instructions in a group and alone (the 3 others differ by their register allocation, with 12 instructions fewer in all).
+
+**So it stays off by default.** It is worth turning on to build faster and to keep the cache small, if a possible loss of a few percent of the frame rate does not matter.
+To settle the frame rate, run the second series again on an idle machine with six runs of each.
+
+## How to measure it
+
+In a cache of its own so that nothing existing is touched:
 
 ```sh
 source ~/.cache/nx2linux/toolchain-p2/env.sh
@@ -40,5 +69,5 @@ find ~/.cache/nx2linux/aot-xc2-p2-group/obj -type f | wc -l
 du -sh ~/.cache/nx2linux/aot-xc2-p2-group/obj ~/.cache/nx2linux/aot-xc2-p2-group/lib
 ```
 
-Then play it as usual with `AOT_GROUP=64` and the same `--cache`, and compare the picture and the frame rate with the ungrouped cache.
-Without `AOT_GROUP` the same cache folder is read as an ungrouped one, so the first run of the game is a cold build.
+Play it with `AOT_GROUP=64` and the same `--cache`. Without `AOT_GROUP` the same folder is read as an ungrouped one, so the first run is a cold build.
+A run started without the variable in a cache that holds grouped objects writes one object per function next to them, which the sizes above do not count.
