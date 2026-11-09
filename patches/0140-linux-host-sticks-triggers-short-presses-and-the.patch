@@ -1,0 +1,672 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 9 Nov 2026 20:15:11 +0100
+Subject: [PATCH] Linux host: sticks, triggers, short presses and the mouse as
+ a finger (#21)
+
+The game got buttons only. Gamepad buttons arrived as one button because the C
+side passed no button number, the sticks were never read, and a press shorter
+than the time between two reads of the game was lost.
+
+The input now reads the gamepad sticks (radial dead zone) and triggers (ZL and
+ZR), can use the keyboard as sticks (NX2LINUX_KEYS_STICKS=1), keeps a button
+that was released before the game read it until it has been read once and for
+NX2LINUX_MIN_HOLD ms (50, 0 for the old behaviour, at most NX2LINUX_MAX_HOLD),
+and gives the left mouse button as one finger on the touch screen with Start
+and End. The end of the run prints what the game was given.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: The game gets the gamepad sticks and triggers, short presses and a touch finger, which it did not before
+Issue: Sunshine-Off/NX2Linux#21
+
+---
+ dm/tools/horizon_display.py          |   2 +-
+ dm/tools/horizon_gpu.py              |   2 +-
+ dm/tools/horizon_hid.py              |  37 ++--
+ dm/tools/horizon_input.py            | 201 ++++++++++++++++++--
+ dm/tools/horizon_run.py              |   1 +
+ dm/tools/tests/test_horizon_input.py | 275 +++++++++++++++++++++++++--
+ 6 files changed, 474 insertions(+), 44 deletions(-)
+
+diff --git a/dm/tools/horizon_display.py b/dm/tools/horizon_display.py
+index 0a1aa5c5..7a8bd654 100644
+--- a/dm/tools/horizon_display.py
++++ b/dm/tools/horizon_display.py
+@@ -3,7 +3,7 @@ The library is found through NX2LINUX_DISPLAY_LIB, else ~/.cache/nx2linux/build-
+ import ctypes, os
+ from pathlib import Path
+ 
+-EVENTS = {1: 'quit', 2: 'resize', 3: 'key_down', 4: 'key_up', 5: 'pad_added', 6: 'pad_removed', 7: 'pad_down', 8: 'pad_up', 9: 'pad_axis'}
++EVENTS = {1: 'quit', 2: 'resize', 3: 'key_down', 4: 'key_up', 5: 'pad_added', 6: 'pad_removed', 7: 'pad_down', 8: 'pad_up', 9: 'pad_axis', 10: 'mouse_down', 11: 'mouse_up', 12: 'mouse_move'}
+ 
+ 
+ class DisplayError(Exception): pass
+diff --git a/dm/tools/horizon_gpu.py b/dm/tools/horizon_gpu.py
+index 082264b1..430a588f 100644
+--- a/dm/tools/horizon_gpu.py
++++ b/dm/tools/horizon_gpu.py
+@@ -5,7 +5,7 @@ import os
+ from pathlib import Path
+ 
+ MAX_TARGETS = 8
+-EVENTS = {1: 'quit', 2: 'resize', 3: 'key_down', 4: 'key_up', 5: 'pad_added', 6: 'pad_removed', 7: 'pad_down', 8: 'pad_up', 9: 'pad_axis'}   # as horizon_display.EVENTS
++EVENTS = {1: 'quit', 2: 'resize', 3: 'key_down', 4: 'key_up', 5: 'pad_added', 6: 'pad_removed', 7: 'pad_down', 8: 'pad_up', 9: 'pad_axis', 10: 'mouse_down', 11: 'mouse_up', 12: 'mouse_move'}   # as horizon_display.EVENTS
+ 
+ 
+ class GpuError(Exception): pass
+diff --git a/dm/tools/horizon_hid.py b/dm/tools/horizon_hid.py
+index 99883157..697e9301 100644
+--- a/dm/tools/horizon_hid.py
++++ b/dm/tools/horizon_hid.py
+@@ -1,5 +1,5 @@
+-"""nn::hid on the Linux host (NX2Linux S7bis): the Python side of the input half of engine/dm/host/hle_hid.c. The host has no hid service. For now one connected controller (player 1, FullKey when docked,
+-Handheld otherwise) at rest and no touch, mouse or keyboard; horizon_input.py will feed buttons from the SDL window. The structs follow the public Horizon ABI: NpadState = {s64 sampling number;
++"""nn::hid on the Linux host (NX2Linux S7bis): the Python side of the input half of engine/dm/host/hle_hid.c. The host has no hid service. One connected controller (player 1, FullKey when docked,
++Handheld otherwise) and one touch finger, fed by horizon_input.py from the SDL window (buttons, sticks, the mouse). No mouse, keyboard or motion devices. The structs follow the public Horizon ABI: NpadState = {s64 sampling number;
+ u64 buttons; s32 lx, ly, rx, ry; u32 attributes; u32 pad} (0x28 bytes); TouchScreenState<N> = {s64 sampling number; s32 count; s32 reserved; TouchState[N]}."""
+ import struct
+ 
+@@ -13,7 +13,14 @@ NPAD = struct.Struct('<qQiiiiII')
+ 
+ 
+ class HidState:
+-    def __init__(self): self.sampling = 0; self.buttons = 0; self.sticks = (0, 0, 0, 0)
++    """What the game reads. `source` (horizon_input.Input once the window has presented a frame) answers the game's reads, which is where a press shorter than the time between two reads is kept until it has been read. `buttons` and `sticks` are the last view of it, and what a read gives when there is no source"""
++    def __init__(self): self.sampling = 0; self.buttons = 0; self.sticks = (0, 0, 0, 0); self.source = None
++
++    def sample(self):
++        return self.source.sample() if self.source is not None else (self.buttons, self.sticks)
++
++    def touches(self):
++        return self.source.touches() if self.source is not None else []
+ 
+ 
+ def state(hz):
+@@ -26,8 +33,8 @@ def style_of(npad_id): return (STYLE_FULLKEY if opmode() == 1 else STYLE_HANDHEL
+ 
+ def fill(hz, addr, npad_id):
+     s = state(hz); s.sampling += 1
+-    lx, ly, rx, ry = s.sticks
+-    hz.wr(addr, NPAD.pack(s.sampling, s.buttons, lx, ly, rx, ry, ATTR_CONNECTED if style_of(npad_id) else 0, 0))
++    buttons, (lx, ly, rx, ry) = s.sample()
++    hz.wr(addr, NPAD.pack(s.sampling, buttons, lx, ly, rx, ry, ATTR_CONNECTED if style_of(npad_id) else 0, 0))
+ 
+ 
+ noop('_ZN2nn3hid14InitializeNpadEv', 'connect to the hid service; the host takes input from its own state')
+@@ -68,18 +75,26 @@ for _t in ('16NpadJoyDualState', '16NpadJoyLeftState', '17NpadJoyRightState'):
+     hle(f'_ZN2nn3hid12GetNpadStateEPNS0_{_t}ERKj', 'Joy-Con current state: not connected on the host')(_state(-1))
+ 
+ 
+-# ---- touch screen: nothing touches it yet (header only: a sampling number and a count of 0) ----
+-def _touch_header(hz, addr):
++# ---- touch screen: the left mouse button is one finger (horizon_input.Touch). TouchState = {u64 delta time; u32 attributes (1 start, 2 end); u32 finger id; u32 x, y; u32 diameter x, y; u32 rotation angle; u32 reserved} (0x28 bytes) ----
++TOUCH = struct.Struct('<QIIIIIIII')
++TOUCH_DIAMETER = 10
++
++
++def _touch_fill(hz, addr, n):
++    """One TouchScreenState<n>: the header, then the touches of this read. Returns the entry size, so that a caller that writes several knows where the next one goes"""
+     s = state(hz); s.sampling += 1
+-    hz.wr(addr, struct.pack('<qii', s.sampling, 0, 0))
++    touches = s.touches()[:n]
++    hz.wr(addr, struct.pack('<qii', s.sampling, len(touches), 0))
++    for i, (fid, x, y, attrs) in enumerate(touches): hz.wr(addr + 16 + TOUCH.size * i, TOUCH.pack(0, attrs, fid, x, y, TOUCH_DIAMETER, TOUCH_DIAMETER, 0, 0))
++    return 16 + TOUCH.size * n
+ 
+ 
+ noop('_ZN2nn3hid21InitializeTouchScreenEv', 'connect to the hid touch screen')
+ noop('_ZN2nn3hid21InitializeTouchScreenEii', 'connect to the hid touch screen (SDK 18 two-argument version)')
+ for _n in range(1, 17):
+-    hle(f'_ZN2nn3hid19GetTouchScreenStateILm{_n}EEEvPNS0_16TouchScreenStateIXT_EEE', 'touch screen current state: no touches')(lambda hz, r: _touch_header(hz, r[0]))
+-    hle(f'_ZN2nn3hid20GetTouchScreenStatesILm{_n}EEEiPNS0_16TouchScreenStateIXT_EEEi', 'touch screen states: one empty entry')(
+-        lambda hz, r: (_touch_header(hz, r[0]) if (r[1] & 0xFFFFFFFF) > 0 else None, r.__setitem__(0, 1 if (r[1] & 0xFFFFFFFF) > 0 else 0)))
++    hle(f'_ZN2nn3hid19GetTouchScreenStateILm{_n}EEEvPNS0_16TouchScreenStateIXT_EEE', 'touch screen current state: the mouse as one finger')(lambda hz, r, n=_n: _touch_fill(hz, r[0], n))
++    hle(f'_ZN2nn3hid20GetTouchScreenStatesILm{_n}EEEiPNS0_16TouchScreenStateIXT_EEEi', 'touch screen states: one entry, the mouse as one finger')(
++        lambda hz, r, n=_n: (_touch_fill(hz, r[0], n) if (r[1] & 0xFFFFFFFF) > 0 else None, r.__setitem__(0, 1 if (r[1] & 0xFFFFFFFF) > 0 else 0)))
+ 
+ 
+ # ---- mouse, keyboard, gestures: not provided ----
+diff --git a/dm/tools/horizon_input.py b/dm/tools/horizon_input.py
+index 19d4dabf..ca726f8d 100644
+--- a/dm/tools/horizon_input.py
++++ b/dm/tools/horizon_input.py
+@@ -1,7 +1,10 @@
+-"""Input for the Linux host (NX2Linux S7bis): the keyboard and gamepad events of the window become the buttons of NpadState (horizon_hid.py). Keys: X A, Z B, C X, V Y, arrows and Return (Plus),
+-Backspace (Minus), A / S the shoulders, Q / W the triggers. A gamepad uses the physical layout (SDL's east button is Switch A). NX2LINUX_PRESS=A@45:0.3,Plus@60 presses a button at a time in seconds
+-(for how long, 0.2 s by default) without a person: how a title screen is passed in a test run."""
+-import os, time
++"""Input for the Linux host (NX2Linux S7bis, issue 21): the keyboard, gamepad and mouse events of the window become what the game reads from nn::hid (horizon_hid.py): buttons, sticks and one touch.
++Keys: X A, Z B, C X, V Y, arrows and Return (Plus), Backspace (Minus), A / S the shoulders, Q / W the triggers. NX2LINUX_KEYS_STICKS=1 makes the arrows the left stick and I J K L the right stick instead of the D-pad.
++A gamepad uses the physical layout (SDL's east button is Switch A). Its sticks and triggers are read: the sticks with a radial dead zone (NX2LINUX_DEADZONE in percent, 15 by default), the triggers are ZL and ZR above half way. The events carry no gamepad number, so with two gamepads their presses and axes are mixed (the log names the first one seen).
++The left mouse button is a finger on the touch screen, the window is mapped to 1280 by 720.
++A press shorter than the time between two reads of the game used to be lost. Now a button that is released before the game has read it stays visible until it has been read once and for at least NX2LINUX_MIN_HOLD milliseconds (50 by default, 0 gives the old behaviour), and never longer than NX2LINUX_MAX_HOLD milliseconds (500) in case the game does not read.
++NX2LINUX_PRESS=A@45:0.3,Plus@60 presses a button at a time in seconds (for how long, 0.2 s by default) without a person: how a title screen is passed in a test run."""
++import math, os, threading, time
+ 
+ import horizon_hid
+ 
+@@ -9,6 +12,12 @@ BUTTONS = {n: 1 << i for i, n in enumerate(('A', 'B', 'X', 'Y', 'StickL', 'Stick
+ KEYS = {ord('x'): 'A', ord('z'): 'B', ord('c'): 'X', ord('v'): 'Y', ord('a'): 'L', ord('s'): 'R', ord('q'): 'ZL', ord('w'): 'ZR', 0x0D: 'Plus', 0x08: 'Minus', 0x20: 'A', 0x1B: 'B',
+         0x4000004F: 'Right', 0x40000050: 'Left', 0x40000051: 'Down', 0x40000052: 'Up'}
+ GAMEPAD = {0: 'B', 1: 'A', 2: 'Y', 3: 'X', 4: 'Minus', 6: 'Plus', 7: 'StickL', 8: 'StickR', 9: 'L', 10: 'R', 11: 'Up', 12: 'Down', 13: 'Left', 14: 'Right'}   # SDL_GamepadButton
++ARROWS = {0x4000004F: (1, 0), 0x40000050: (-1, 0), 0x40000051: (0, -1), 0x40000052: (0, 1)}   # SDL keys right, left, down, up -> left stick (x, y with y up)
++IJKL = {ord('l'): (1, 0), ord('j'): (-1, 0), ord('k'): (0, -1), ord('i'): (0, 1)}
++AXIS_LX, AXIS_LY, AXIS_RX, AXIS_RY, AXIS_ZL, AXIS_ZR = range(6)   # SDL_GamepadAxis
++STICK_MAX = 32767
++TRIGGER_ON, TRIGGER_OFF = 16384, 8192   # a trigger counts as pressed above half way and as released under a quarter
++SCREEN = (1280, 720)   # the Switch screen, what touch positions are in
+ 
+ 
+ def script():
+@@ -21,26 +30,188 @@ def script():
+     return out
+ 
+ 
++def number(environ, name, default):
++    try: return float(environ[name])
++    except (KeyError, ValueError): return default
++
++
++def radial(x, y, dead):
++    """A stick position (raw SDL axes, y down) as the Switch reads it: dead zone cut, the rest rescaled to the full range, y up"""
++    m = math.hypot(x, y) / STICK_MAX
++    if m <= dead: return 0, 0
++    k = min(1.0, (m - dead) / (1.0 - dead)) / m
++    return max(-STICK_MAX, min(STICK_MAX, round(x * k))), max(-STICK_MAX, min(STICK_MAX, round(-y * k)))
++
++
++class Touch:
++    """One finger. A sample says Start once, then the position while it is down, then End once, then nothing, so a tap shorter than the time between two reads still gives Start and End"""
++    START, END = 1, 2
++
++    def __init__(self, now, max_hold):
++        self.now, self.max_hold = now, max_hold
++        self.down, self.x, self.y, self.fid, self.start_pending, self.end_pending, self.t = False, 0, 0, 0, False, False, 0.0
++        self.taps, self.lost = 0, 0
++
++    def press(self, x, y):
++        self.down, self.x, self.y, self.fid, self.start_pending, self.end_pending, self.t = True, x, y, self.fid + 1, True, False, self.now(); self.taps += 1
++
++    def move(self, x, y):
++        if self.down: self.x, self.y = x, y
++
++    def release(self):
++        if self.down: self.down, self.end_pending, self.t = False, True, self.now()
++
++    def sample(self):
++        """[(finger id, x, y, attributes)]"""
++        if not self.down and (self.start_pending or self.end_pending) and self.now() - self.t > self.max_hold:   # nobody read it: drop it, it would be old news
++            self.start_pending = self.end_pending = False; self.lost += 1
++        if self.down:
++            attrs, self.start_pending = (self.START if self.start_pending else 0), False
++            return [(self.fid, self.x, self.y, attrs)]
++        if self.end_pending:
++            if self.start_pending: self.start_pending = False; return [(self.fid, self.x, self.y, self.START)]   # a tap nobody has seen yet: Start now, End on the next read
++            self.end_pending = False; return [(self.fid, self.x, self.y, self.END)]
++        return []
++
++
+ class Input:
+-    def __init__(self, hz, now=time.monotonic):
+-        self.hz, self.now, self.t0, self.held, self.script = hz, now, now(), 0, script()
++    def __init__(self, hz, now=time.monotonic, environ=None):
++        env = os.environ if environ is None else environ
++        self.hz, self.now, self.t0, self.script = hz, now, now(), script()
++        self.min_hold, self.max_hold = max(0.0, number(env, 'NX2LINUX_MIN_HOLD', 50.0)) / 1000, max(0.0, number(env, 'NX2LINUX_MAX_HOLD', 500.0)) / 1000
++        self.dead = min(0.9, max(0.0, number(env, 'NX2LINUX_DEADZONE', 15.0) / 100))
++        self.keys_sticks = env.get('NX2LINUX_KEYS_STICKS', '') not in ('', '0')
++        self.lock = threading.RLock()
++        self.down = {}        # bit -> the sources holding it (keys, buttons)
++        self.entries = {}     # bit -> [pressed at, read by the game since, released at or None]: what the game sees
++        self.axes, self.key_stick, self.pad = [0] * 6, {}, None
++        self.win = SCREEN     # window size in window units, from the resize events
++        self.touch = Touch(now, self.max_hold)
++        self.stats = {'reads': 0, 'presses': 0, 'kept': 0, 'merged': 0, 'never_read': 0, 'key': 0, 'pad': 0, 'axis': 0, 'mouse': 0}
++        horizon_hid.state(hz).source = self
++
++    # ---- what the game reads ----
++    def sample(self):
++        """(buttons, sticks) for one read of the game. A button released before any read is shown now and not again"""
++        with self.lock:
++            self.stats['reads'] += 1
++            return self.view(True), self.sticks()
++
++    def touches(self):
++        with self.lock: return self.touch.sample()
++
++    def view(self, read):
++        now = self.now(); mask = 0
++        for bit in list(self.entries):
++            e = self.entries[bit]
++            if e[2] is not None:
++                age = now - e[0]
++                if (e[1] and age >= self.min_hold) or age >= self.max_hold:
++                    if not e[1]: self.stats['never_read'] += 1
++                    del self.entries[bit]; continue
++            mask |= bit
++            if read: e[1] = True
++        t = now - self.t0
++        for bit, a, b in self.script:
++            if a <= t < b: mask |= bit
++        return mask
++
++    def sticks(self):
++        lx, ly = radial(self.axes[AXIS_LX], self.axes[AXIS_LY], self.dead); rx, ry = radial(self.axes[AXIS_RX], self.axes[AXIS_RY], self.dead)
++        if not (lx or ly or rx or ry) and self.key_stick:   # the keyboard stands in only when the gamepad's sticks are at rest
++            lx, ly, rx, ry = self.key_sticks()
++        return lx, ly, rx, ry
++
++    def key_sticks(self):
++        def axis(table):
++            x = sum(v[0] for k, v in table.items() if self.key_stick.get(k)); y = sum(v[1] for k, v in table.items() if self.key_stick.get(k))
++            x, y = max(-1, min(1, x)), max(-1, min(1, y)); s = 0.7071 if x and y else 1.0
++            return round(x * s * STICK_MAX), round(y * s * STICK_MAX)
++        return (*axis(ARROWS), *axis(IJKL))
++
++    # ---- what the window says ----
++    def press(self, bit, src):
++        holders = self.down.setdefault(bit, set())
++        if src in holders: return   # a key repeating
++        holders.add(src)
++        e = self.entries.get(bit)
++        if e is not None and e[2] is None: return   # already down through another source
++        if e is not None and not e[1]: self.stats['merged'] += 1   # a second press before the game read the first: one for the game
++        self.entries[bit] = [self.now(), False, None]; self.stats['presses'] += 1
++
++    def release(self, bit, src):
++        holders = self.down.get(bit, set()); holders.discard(src)
++        e = self.entries.get(bit)
++        if holders or e is None or e[2] is not None: return   # another source still holds it
++        now = self.now()
++        if self.min_hold <= 0 or (e[1] and now - e[0] >= self.min_hold): del self.entries[bit]
++        else: e[2] = now; self.stats['kept'] += 1   # released before the game read it, or too fast: it stays until it has been read
+ 
+     def event(self, ev):
+         """One window event: (name, key, ...)"""
+         name, key = ev[0], ev[1]
+-        bit = BUTTONS.get(KEYS.get(key)) if name.startswith('key') else BUTTONS.get(GAMEPAD.get(key)) if name.startswith('pad') and name not in ('pad_added', 'pad_removed', 'pad_axis') else None
+-        if not bit: return
++        with self.lock:
++            if name.startswith('key'): self.stats['key'] += 1; self.key_event(name, key)
++            elif name in ('pad_down', 'pad_up'): self.stats['pad'] += 1; self.pad_button(name.endswith('down'), key)
++            elif name == 'pad_axis': self.stats['axis'] += 1; self.pad_axis(key, ev[2])
++            elif name == 'pad_added': self.pad_added(key)
++            elif name == 'pad_removed': self.pad_removed(key)
++            elif name == 'resize' and ev[2] > 0 and ev[3] > 0: self.win = (ev[2], ev[3])
++            elif name.startswith('mouse'): self.stats['mouse'] += 1; self.mouse(name, key, ev[2], ev[3])
++            self.apply()
++
++    def key_event(self, name, key):
+         down = name.endswith('down')
+-        self.held = self.held | bit if down else self.held & ~bit
+-        self.apply()
++        if self.keys_sticks and (key in ARROWS or key in IJKL): self.key_stick[key] = down; return
++        bit = BUTTONS.get(KEYS.get(key))
++        if bit: (self.press if down else self.release)(bit, ('key', key))
++
++    def pad_button(self, down, button):
++        bit = BUTTONS.get(GAMEPAD.get(button))
++        if bit: (self.press if down else self.release)(bit, ('pad', button))
++
++    def pad_axis(self, axis, value):
++        if axis < AXIS_ZL:
++            self.axes[axis] = value
++            return
++        if axis != AXIS_ZL and axis != AXIS_ZR: return
++        bit = BUTTONS['ZL' if axis == AXIS_ZL else 'ZR']; held = ('pad', 'axis', axis) in self.down.get(bit, set())
++        if value >= TRIGGER_ON and not held: self.press(bit, ('pad', 'axis', axis))
++        elif value < TRIGGER_OFF and held: self.release(bit, ('pad', 'axis', axis))
++
++    def pad_added(self, pad_id):
++        if self.pad is None:
++            self.pad = pad_id; self.say(f'[input] gamepad {pad_id} connected')
++        else: self.say(f'[input] gamepad {pad_id} connected as well as {self.pad}: their events are mixed')
++
++    def pad_removed(self, pad_id):
++        if pad_id != self.pad: return
++        self.pad, self.axes = None, [0] * 6
++        for bit, holders in list(self.down.items()):
++            for src in [s for s in holders if s[0] == 'pad']: self.release(bit, src)
++        self.say(f'[input] gamepad {pad_id} removed')
++
++    def mouse(self, name, x, y, button):
++        tx, ty = x * SCREEN[0] // max(1, self.win[0]), y * SCREEN[1] // max(1, self.win[1])
++        tx, ty = max(0, min(SCREEN[0] - 1, tx)), max(0, min(SCREEN[1] - 1, ty))
++        if name == 'mouse_down' and button == 1: self.touch.press(tx, ty)
++        elif name == 'mouse_up' and button == 1: self.touch.release()
++        elif name == 'mouse_move': self.touch.move(tx, ty)
++
++    def say(self, msg):
++        log = getattr(self.hz, 'log', None)
++        if log: log(msg)
+ 
+     def poll(self):
+         """Applies the scripted presses that are on now"""
+         if self.script: self.apply()
+ 
+     def apply(self):
+-        t = self.now() - self.t0
+-        scripted = 0
+-        for bit, a, b in self.script:
+-            if a <= t < b: scripted |= bit
+-        horizon_hid.state(self.hz).buttons = self.held | scripted
++        """Keeps the buttons and sticks of HidState up to date for whoever looks at them. The game's own reads go through sample()"""
++        s = horizon_hid.state(self.hz)
++        s.buttons, s.sticks = self.view(False), self.sticks()
++
++    def report(self):
++        s = self.stats
++        return (f"input: {s['reads']} reads by the game, {s['presses']} presses, {s['kept']} kept until read, {s['merged']} merged, {s['never_read']} never read, {self.touch.taps} touches ({self.touch.lost} never read) | "
++                f"events: {s['key']} key, {s['pad']} gamepad button, {s['axis']} gamepad axis, {s['mouse']} mouse | gamepad {self.pad if self.pad is not None else 'none seen'}")
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index b43758e1..248840e2 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -93,6 +93,7 @@ def main():
+         if hz.native: hz.native.pull_stats()   # the calls made in C join the counts of hz.stats
+         print('sync detail:', hz.sync_detail_total(), flush=True)
+         print('frames presented:', getattr(hz, 'frames_presented', 0), '| svc calls:', hz.stats, '| not translated functions called:', hz.aot.stat('unlifted_calls'))
++        if getattr(getattr(hz, 'nvn', None), 'input', None): print(hz.nvn.input.report())   # issue 21: what the game was given from the window
+         if hasattr(hz, 'nvn'): hz.nvn.pull_stats()
+         hz.svc_profile_report()
+         if getattr(getattr(hz, 'nvn', None), 'gpu', None): print(hz.nvn.gpu.coverage_text())
+diff --git a/dm/tools/tests/test_horizon_input.py b/dm/tools/tests/test_horizon_input.py
+index c8673f29..54114c23 100644
+--- a/dm/tools/tests/test_horizon_input.py
++++ b/dm/tools/tests/test_horizon_input.py
+@@ -1,34 +1,277 @@
+-"""horizon_input.py: window events and scripted presses become NpadState buttons"""
+-import os, sys, unittest
++"""horizon_input.py (issue 21): window events and scripted presses become what the game reads: buttons kept until read, sticks, triggers, the keyboard as sticks, the mouse as a finger. No game: a fake clock and a fake Horizon."""
++import os, struct, sys, unittest
+ from pathlib import Path
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ import horizon_hid
+ import horizon_input as hi
+ 
++A, B, UP, ZL, ZR = hi.BUTTONS['A'], hi.BUTTONS['B'], hi.BUTTONS['Up'], hi.BUTTONS['ZL'], hi.BUTTONS['ZR']
++M = 32767
+ 
+-class Hz: pass
+ 
++class Hz:
++    def __init__(self): self.mem, self.logs = {}, []
++    def wr(self, addr, data): self.mem[addr] = bytes(data)
++    def log(self, msg): self.logs.append(msg)
+ 
+-class Input(unittest.TestCase):
+-    def test_keys_and_gamepad_buttons_set_and_clear_bits(self):
+-        hz, clock = Hz(), [0.0]
+-        i = hi.Input(hz, now=lambda: clock[0])
+-        i.event(('key_down', ord('x'), 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, hi.BUTTONS['A'])
+-        i.event(('pad_down', 11, 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, hi.BUTTONS['A'] | hi.BUTTONS['Up'])
+-        i.event(('key_up', ord('x'), 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, hi.BUTTONS['Up'])
+-        i.event(('pad_axis', 11, 5, 0)); self.assertEqual(horizon_hid.state(hz).buttons, hi.BUTTONS['Up'])
++
++def make(**env):
++    hz, clock = Hz(), [0.0]
++    env = {k: str(v) for k, v in env.items()}
++    return hi.Input(hz, now=lambda: clock[0], environ=env), hz, clock
++
++
++def read(i, clock, t):
++    clock[0] = t; return i.sample()[0]
++
++
++class Compat(unittest.TestCase):
++    def test_with_no_hold_keys_and_gamepad_buttons_set_and_clear_bits(self):
++        i, hz, clock = make(NX2LINUX_MIN_HOLD=0)
++        i.event(('key_down', ord('x'), 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, A)
++        i.event(('pad_down', 11, 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, A | UP)
++        i.event(('key_up', ord('x'), 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, UP)
++        i.event(('pad_axis', 11, 5, 0)); self.assertEqual(horizon_hid.state(hz).buttons, UP)   # an axis that is none of the six is ignored
+ 
+     def test_a_scripted_press_lasts_its_duration(self):
+         os.environ['NX2LINUX_PRESS'] = 'A@10:0.5,Plus@20'
+         try:
+-            hz, clock = Hz(), [0.0]
+-            i = hi.Input(hz, now=lambda: clock[0])
+-            for t, want in ((9.9, 0), (10.1, hi.BUTTONS['A']), (10.6, 0), (20.1, hi.BUTTONS['Plus']), (20.5, 0)):
++            i, hz, clock = make()
++            for t, want in ((9.9, 0), (10.1, A), (10.6, 0), (20.1, hi.BUTTONS['Plus']), (20.5, 0)):
+                 clock[0] = t; i.poll()
+                 self.assertEqual(horizon_hid.state(hz).buttons, want, t)
+         finally: del os.environ['NX2LINUX_PRESS']
+ 
++    def test_the_gamepad_buttons_are_the_ones_sdl_sends(self):
++        i, hz, clock = make(NX2LINUX_MIN_HOLD=0)
++        for sdl, bit in ((0, 'B'), (1, 'A'), (2, 'Y'), (3, 'X'), (4, 'Minus'), (6, 'Plus'), (9, 'L'), (10, 'R'), (11, 'Up'), (14, 'Right')):
++            i.event(('pad_down', sdl, 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, hi.BUTTONS[bit], sdl); i.event(('pad_up', sdl, 0, 0))
++
++
++class Hold(unittest.TestCase):
++    def test_a_tap_shorter_than_the_time_between_two_reads_is_read_once(self):
++        i, hz, clock = make()
++        clock[0] = 0.0; i.event(('key_down', ord('x'), 0, 0)); clock[0] = 0.01; i.event(('key_up', ord('x'), 0, 0))
++        self.assertEqual(read(i, clock, 0.03), A)    # the game's first read: it sees the press
++        self.assertEqual(read(i, clock, 0.2), 0)     # the next one: released
++        self.assertEqual((i.stats['presses'], i.stats['kept'], i.stats['never_read']), (1, 1, 0))
++
++    def test_a_press_that_was_read_stays_for_the_minimum_time(self):
++        i, hz, clock = make()
++        clock[0] = 0.0; i.event(('key_down', ord('x'), 0, 0)); self.assertEqual(read(i, clock, 0.005), A)
++        clock[0] = 0.02; i.event(('key_up', ord('x'), 0, 0))
++        self.assertEqual(read(i, clock, 0.03), A)   # 30 ms after the press: under the 50 ms
++        self.assertEqual(read(i, clock, 0.06), 0)
++
++    def test_a_long_press_is_released_at_once_after_a_read(self):
++        i, hz, clock = make()
++        clock[0] = 0.0; i.event(('key_down', ord('x'), 0, 0)); read(i, clock, 0.1); read(i, clock, 0.5)
++        clock[0] = 1.0; i.event(('key_up', ord('x'), 0, 0))
++        self.assertEqual(read(i, clock, 1.001), 0); self.assertEqual(i.stats['kept'], 0)
++
++    def test_a_press_nobody_reads_does_not_stick(self):
++        i, hz, clock = make()
++        clock[0] = 0.0; i.event(('key_down', ord('x'), 0, 0)); clock[0] = 0.01; i.event(('key_up', ord('x'), 0, 0))
++        clock[0] = 0.4; i.apply(); self.assertEqual(horizon_hid.state(hz).buttons, A)
++        clock[0] = 0.6; i.apply(); self.assertEqual(horizon_hid.state(hz).buttons, 0); self.assertEqual(i.stats['never_read'], 1)
++
++    def test_a_key_that_repeats_does_not_start_again(self):
++        i, hz, clock = make()
++        i.event(('key_down', ord('x'), 0, 0)); read(i, clock, 0.1); clock[0] = 0.2; i.event(('key_down', ord('x'), 0, 0)); i.event(('key_down', ord('x'), 0, 0))
++        self.assertEqual(i.stats['presses'], 1)
++
++    def test_two_keys_for_one_button_release_it_when_both_are_up(self):
++        i, hz, clock = make(NX2LINUX_MIN_HOLD=0)
++        i.event(('key_down', ord('x'), 0, 0)); i.event(('key_down', 0x20, 0, 0))   # X and space are both A
++        i.event(('key_up', ord('x'), 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, A)
++        i.event(('key_up', 0x20, 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, 0)
++
++    def test_a_second_press_before_a_read_is_merged_and_counted(self):
++        i, hz, clock = make()
++        i.event(('key_down', ord('x'), 0, 0)); clock[0] = 0.005; i.event(('key_up', ord('x'), 0, 0)); clock[0] = 0.01; i.event(('key_down', ord('x'), 0, 0))
++        self.assertEqual(i.stats['merged'], 1); self.assertEqual(i.stats['presses'], 2)
++
++    def test_buttons_are_held_apart(self):
++        i, hz, clock = make()
++        i.event(('key_down', ord('x'), 0, 0)); i.event(('key_down', ord('z'), 0, 0)); clock[0] = 0.01; i.event(('key_up', ord('z'), 0, 0))
++        self.assertEqual(read(i, clock, 0.02), A | B); self.assertEqual(read(i, clock, 0.3), A)
++
++    def test_the_times_come_from_the_environment(self):
++        i, hz, clock = make(NX2LINUX_MIN_HOLD=200, NX2LINUX_MAX_HOLD=1000)
++        self.assertEqual((i.min_hold, i.max_hold), (0.2, 1.0))
++        i, hz, clock = make(NX2LINUX_MIN_HOLD='soon'); self.assertEqual(i.min_hold, 0.05)
++
++
++class Sticks(unittest.TestCase):
++    def sticks(self, i): return i.sample()[1]
++
++    def test_at_rest_and_inside_the_dead_zone_the_sticks_are_zero(self):
++        i, hz, clock = make(); self.assertEqual(self.sticks(i), (0, 0, 0, 0))
++        i.event(('pad_axis', hi.AXIS_LX, 3000, 0)); i.event(('pad_axis', hi.AXIS_LY, -2000, 0)); self.assertEqual(self.sticks(i), (0, 0, 0, 0))
++
++    def test_full_tilt_and_y_is_up(self):
++        i, hz, clock = make()
++        i.event(('pad_axis', hi.AXIS_LX, 32767, 0)); i.event(('pad_axis', hi.AXIS_LY, -32768, 0))   # SDL: right and up
++        lx, ly, rx, ry = self.sticks(i); self.assertEqual((rx, ry), (0, 0))
++        self.assertGreater(lx, 0); self.assertGreater(ly, 0); self.assertLessEqual(max(lx, ly), M)
++        i.event(('pad_axis', hi.AXIS_LX, 0, 0)); i.event(('pad_axis', hi.AXIS_LY, 32767, 0)); self.assertEqual(self.sticks(i)[:2], (0, -M))   # down
++
++    def test_the_dead_zone_is_rescaled_so_the_range_stays_full(self):
++        self.assertEqual(hi.radial(M, 0, 0.15), (M, 0)); self.assertEqual(hi.radial(0, 0, 0.15), (0, 0))
++        x, _ = hi.radial(int(M * 0.16), 0, 0.15); self.assertLess(x, 0.05 * M)   # just outside the zone starts from nothing
++        x, _ = hi.radial(int(M * 0.575), 0, 0.15); self.assertAlmostEqual(x / M, 0.5, delta=0.01)
++
++    def test_the_diagonal_is_not_longer_than_the_circle(self):
++        x, y = hi.radial(M, M, 0.15); self.assertLessEqual(max(abs(x), abs(y)), M)
++        x, y = hi.radial(23170, 23170, 0.0); self.assertAlmostEqual(abs(complex(x, y)), M, delta=2)
++
++    def test_the_right_stick(self):
++        i, hz, clock = make(); i.event(('pad_axis', hi.AXIS_RX, -32768, 0)); lx, ly, rx, ry = self.sticks(i)
++        self.assertEqual((lx, ly, ry), (0, 0, 0)); self.assertEqual(rx, -M)
++
++    def test_the_dead_zone_is_set_by_the_environment(self):
++        i, hz, clock = make(NX2LINUX_DEADZONE=50); i.event(('pad_axis', hi.AXIS_LX, int(M * 0.4), 0)); self.assertEqual(self.sticks(i), (0, 0, 0, 0))
++
++    def test_the_view_of_the_state_follows_the_events(self):
++        i, hz, clock = make(); i.event(('pad_axis', hi.AXIS_LX, 32767, 0)); self.assertEqual(horizon_hid.state(hz).sticks[0], M)
++
++
++class Triggers(unittest.TestCase):
++    def test_a_trigger_is_zl_or_zr_above_half_way_with_hysteresis(self):
++        i, hz, clock = make(NX2LINUX_MIN_HOLD=0)
++        i.event(('pad_axis', hi.AXIS_ZL, 10000, 0)); self.assertEqual(horizon_hid.state(hz).buttons, 0)
++        i.event(('pad_axis', hi.AXIS_ZL, 20000, 0)); self.assertEqual(horizon_hid.state(hz).buttons, ZL)
++        i.event(('pad_axis', hi.AXIS_ZL, 10000, 0)); self.assertEqual(horizon_hid.state(hz).buttons, ZL)   # between the two thresholds: still pressed
++        i.event(('pad_axis', hi.AXIS_ZR, 32767, 0)); self.assertEqual(horizon_hid.state(hz).buttons, ZL | ZR)
++        i.event(('pad_axis', hi.AXIS_ZL, 0, 0)); self.assertEqual(horizon_hid.state(hz).buttons, ZR)
++
++    def test_a_trigger_pressed_and_released_between_reads_is_still_read(self):
++        i, hz, clock = make()
++        i.event(('pad_axis', hi.AXIS_ZR, 32767, 0)); clock[0] = 0.01; i.event(('pad_axis', hi.AXIS_ZR, 0, 0))
++        self.assertEqual(read(i, clock, 0.02), ZR)
++
++
++class KeyboardSticks(unittest.TestCase):
++    LEFT, RIGHT, DOWN, UPK = 0x40000050, 0x4000004F, 0x40000051, 0x40000052
++
++    def test_off_by_default_the_arrows_are_the_dpad(self):
++        i, hz, clock = make(); i.event(('key_down', self.UPK, 0, 0)); self.assertEqual(read(i, clock, 0.01), UP); self.assertEqual(i.sample()[1], (0, 0, 0, 0))
++
++    def test_on_the_arrows_are_the_left_stick_and_ijkl_the_right(self):
++        i, hz, clock = make(NX2LINUX_KEYS_STICKS=1)
++        i.event(('key_down', self.UPK, 0, 0)); self.assertEqual(i.sample(), (0, (0, M, 0, 0)))   # no D-pad bit, stick up
++        i.event(('key_down', self.RIGHT, 0, 0)); lx, ly, rx, ry = i.sample()[1]; self.assertEqual((lx, ly), (23170, 23170))   # a diagonal is not longer than a straight line
++        i.event(('key_up', self.UPK, 0, 0)); i.event(('key_up', self.RIGHT, 0, 0)); self.assertEqual(i.sample()[1], (0, 0, 0, 0))
++        i.event(('key_down', ord('j'), 0, 0)); i.event(('key_down', ord('i'), 0, 0)); self.assertEqual(i.sample()[1][2:], (-23170, 23170))
++
++    def test_opposite_keys_cancel(self):
++        i, hz, clock = make(NX2LINUX_KEYS_STICKS=1); i.event(('key_down', self.LEFT, 0, 0)); i.event(('key_down', self.RIGHT, 0, 0)); self.assertEqual(i.sample()[1], (0, 0, 0, 0))
++
++    def test_a_gamepad_stick_away_from_rest_wins_over_the_keys(self):
++        i, hz, clock = make(NX2LINUX_KEYS_STICKS=1); i.event(('key_down', self.UPK, 0, 0)); i.event(('pad_axis', hi.AXIS_LX, -32768, 0))
++        lx, ly, rx, ry = i.sample()[1]; self.assertEqual((lx, ly), (-M, 0))
++
++
++class Pad(unittest.TestCase):
++    def test_the_first_gamepad_is_named_and_a_second_one_is_said_to_be_mixed_in(self):
++        i, hz, clock = make(); i.event(('pad_added', 3, 0, 0)); i.event(('pad_added', 5, 0, 0))
++        self.assertEqual(i.pad, 3); self.assertIn('gamepad 3 connected', hz.logs[0]); self.assertIn('as well as 3: their events are mixed', hz.logs[1])
++
++    def test_a_removed_gamepad_lets_go_of_its_buttons_and_sticks(self):
++        i, hz, clock = make(NX2LINUX_MIN_HOLD=0); i.event(('pad_added', 3, 0, 0))
++        i.event(('pad_down', 1, 0, 0)); i.event(('key_down', ord('z'), 0, 0)); i.event(('pad_axis', hi.AXIS_LX, 32767, 0)); i.event(('pad_axis', hi.AXIS_ZL, 32767, 0))
++        i.event(('pad_removed', 3, 0, 0))
++        self.assertEqual(horizon_hid.state(hz).buttons, B); self.assertEqual(horizon_hid.state(hz).sticks, (0, 0, 0, 0)); self.assertIsNone(i.pad)
++
++    def test_another_gamepad_removed_changes_nothing(self):
++        i, hz, clock = make(); i.event(('pad_added', 3, 0, 0)); i.event(('pad_removed', 9, 0, 0)); self.assertEqual(i.pad, 3)
++
++
++class Mouse(unittest.TestCase):
++    def test_a_tap_gives_start_then_end_then_nothing(self):
++        i, hz, clock = make()
++        i.event(('mouse_down', 640, 360, 1)); i.event(('mouse_up', 640, 360, 1))
++        self.assertEqual(i.touches(), [(1, 640, 360, hi.Touch.START)]); self.assertEqual(i.touches(), [(1, 640, 360, hi.Touch.END)]); self.assertEqual(i.touches(), [])
++
++    def test_a_held_finger_starts_once_then_follows_the_mouse_then_ends(self):
++        i, hz, clock = make()
++        i.event(('mouse_down', 100, 100, 1)); self.assertEqual(i.touches(), [(1, 100, 100, 1)])
++        i.event(('mouse_move', 200, 150, 0)); self.assertEqual(i.touches(), [(1, 200, 150, 0)])
++        i.event(('mouse_up', 200, 150, 1)); self.assertEqual(i.touches(), [(1, 200, 150, 2)]); self.assertEqual(i.touches(), [])
++        i.event(('mouse_down', 5, 5, 1)); self.assertEqual(i.touches()[0][0], 2)   # the next finger has the next id
++
++    def test_motion_without_a_finger_down_touches_nothing(self):
++        i, hz, clock = make(); i.event(('mouse_move', 10, 10, 0)); self.assertEqual(i.touches(), [])
++
++    def test_only_the_left_button_is_a_finger(self):
++        i, hz, clock = make(); i.event(('mouse_down', 10, 10, 3)); self.assertEqual(i.touches(), [])
++
++    def test_the_window_is_mapped_to_the_switch_screen(self):
++        i, hz, clock = make(); i.event(('resize', 0, 640, 360)); i.event(('mouse_down', 320, 180, 1)); self.assertEqual(i.touches()[0][1:3], (640, 360))
++        i.event(('mouse_up', 0, 0, 1)); i.touches(); i.touches()
++        i.event(('mouse_down', 640, 360, 1)); self.assertEqual(i.touches()[0][1:3], (1279, 719))   # the corner is on the screen, not past it
++        i.event(('mouse_up', 0, 0, 1)); i.touches(); i.touches()
++        i.event(('mouse_down', -5, -5, 1)); self.assertEqual(i.touches()[0][1:3], (0, 0))
++
++    def test_a_tap_nobody_reads_is_dropped_and_counted(self):
++        i, hz, clock = make(); i.event(('mouse_down', 10, 10, 1)); i.event(('mouse_up', 10, 10, 1)); clock[0] = 5.0
++        self.assertEqual(i.touches(), []); self.assertEqual(i.touch.lost, 1)
++
++
++class Hid(unittest.TestCase):
++    def test_a_read_goes_through_the_input_and_the_press_is_kept(self):
++        i, hz, clock = make()
++        clock[0] = 0.0; i.event(('key_down', ord('x'), 0, 0)); clock[0] = 0.01; i.event(('key_up', ord('x'), 0, 0)); i.event(('pad_axis', hi.AXIS_LX, 32767, 0))
++        clock[0] = 0.03; horizon_hid.fill(hz, 0x100, 0)
++        sampling, buttons, lx, ly, rx, ry, attrs, _ = horizon_hid.NPAD.unpack(hz.mem[0x100])
++        self.assertEqual((buttons, lx, attrs), (A, M, 1))
++        clock[0] = 0.3; horizon_hid.fill(hz, 0x100, 0); self.assertEqual(horizon_hid.NPAD.unpack(hz.mem[0x100])[1], 0)
++
++    def test_without_an_input_a_read_gives_the_state_as_set(self):
++        hz = Hz(); s = horizon_hid.state(hz); s.buttons = B; s.sticks = (1, 2, 3, 4); horizon_hid.fill(hz, 0x100, 0)
++        self.assertEqual(horizon_hid.NPAD.unpack(hz.mem[0x100])[1:6], (B, 1, 2, 3, 4)); self.assertEqual(horizon_hid.state(hz).touches(), [])
++
++    def test_a_touch_state_has_the_header_and_the_touch(self):
++        i, hz, clock = make(); i.event(('mouse_down', 640, 360, 1))
++        size = horizon_hid._touch_fill(hz, 0x400, 16)
++        self.assertEqual(size, 16 + 0x28 * 16)
++        sampling, count, _ = struct.unpack('<qii', hz.mem[0x400]); self.assertEqual(count, 1)
++        delta, attrs, fid, x, y, dx, dy, rot, res = horizon_hid.TOUCH.unpack(hz.mem[0x410])
++        self.assertEqual((attrs, fid, x, y), (1, 1, 640, 360)); self.assertEqual(horizon_hid.TOUCH.size, 0x28)
++
++    def test_no_touch_is_a_count_of_zero(self):
++        i, hz, clock = make(); horizon_hid._touch_fill(hz, 0x400, 4); self.assertEqual(struct.unpack('<qii', hz.mem[0x400])[1], 0)
++
++    def test_the_touch_overrides_are_registered_for_every_size(self):
++        import horizon_overrides as ho
++        for n in (1, 16):
++            self.assertIn(f'_ZN2nn3hid20GetTouchScreenStatesILm{n}EEEiPNS0_16TouchScreenStateIXT_EEEi', ho.TABLE)
++            self.assertIn(f'_ZN2nn3hid19GetTouchScreenStateILm{n}EEEvPNS0_16TouchScreenStateIXT_EEE', ho.TABLE)
++
++    def test_the_states_override_returns_one_entry_with_the_touch(self):
++        import horizon_overrides as ho
++        i, hz, clock = make(); i.event(('mouse_down', 10, 20, 1))
++        r = [0x500, 1] + [0] * 29; ho.TABLE['_ZN2nn3hid20GetTouchScreenStatesILm16EEEiPNS0_16TouchScreenStateIXT_EEEi'][0](hz, r)
++        self.assertEqual(r[0], 1); self.assertEqual(struct.unpack('<qii', hz.mem[0x500])[1], 1)
++        r = [0x500, 0] + [0] * 29; ho.TABLE['_ZN2nn3hid20GetTouchScreenStatesILm16EEEiPNS0_16TouchScreenStateIXT_EEEi'][0](hz, r); self.assertEqual(r[0], 0)
++
++
++class Report(unittest.TestCase):
++    def test_the_report_says_what_the_game_was_given(self):
++        i, hz, clock = make(); i.event(('pad_added', 3, 0, 0)); i.event(('key_down', ord('x'), 0, 0)); i.event(('pad_axis', 0, 100, 0)); i.sample()
++        out = i.report()
++        for needle in ('1 reads by the game', '1 presses', '1 key', '1 gamepad axis', 'gamepad 3'): self.assertIn(needle, out)
++        self.assertIn('none seen', make()[0].report())
++
++    def test_the_run_prints_it(self):
++        src = (Path(__file__).resolve().parent.parent / 'horizon_run.py').read_text(); self.assertIn('hz.nvn.input.report()', src)
++
++
++class Events(unittest.TestCase):
++    def test_both_event_tables_name_the_mouse_events_like_the_c_side(self):
++        import horizon_display, horizon_gpu
++        for table in (horizon_display.EVENTS, horizon_gpu.EVENTS): self.assertEqual({k: table[k] for k in (9, 10, 11, 12)}, {9: 'pad_axis', 10: 'mouse_down', 11: 'mouse_up', 12: 'mouse_move'})
++
+ 
+-if __name__ == '__main__':
+-    unittest.main()
++if __name__ == '__main__': unittest.main()

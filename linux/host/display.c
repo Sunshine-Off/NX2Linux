@@ -79,17 +79,14 @@ int nx2_display_present(const uint8_t *rgba, uint32_t width, uint32_t height, ui
     return -1;
 }
 
-/* Next input event as {type, key, window_width, window_height}; 0 when none is waiting, 1 otherwise */
+/* Next input event as four numbers (nx2linux_event_pack in sdl_host.h says what they are for each type); 0 when none is waiting, 1 otherwise */
 int nx2_display_poll(int32_t out[4])
 {
     Nx2LinuxInputEvent event;
     if (!g_open || nx2linux_host_poll_event(&g_host, &event) != 1) {
         return 0;
     }
-    out[0] = event.type;
-    out[1] = event.key;
-    out[2] = (int32_t)event.window_width;
-    out[3] = (int32_t)event.window_height;
+    nx2linux_event_pack(&event, out);
     return 1;
 }
 
