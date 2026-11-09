@@ -840,12 +840,12 @@ out:
     return r;
 }
 
-/* The next input event as {type, key, window width, window height}; 0 when none is waiting */
+/* The next input event as four numbers (nx2linux_event_pack in sdl_host.h says what they are for each type); 0 when none is waiting */
 int nx2gpu_window_poll(int32_t out[4])
 {
     Nx2LinuxInputEvent ev;
     if (!W.open || nx2linux_host_poll_event(&W.host, &ev) != 1) return 0;
-    out[0] = ev.type; out[1] = ev.key; out[2] = (int32_t)ev.window_width; out[3] = (int32_t)ev.window_height;
+    nx2linux_event_pack(&ev, out);
     return 1;
 }
 
