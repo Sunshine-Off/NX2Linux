@@ -1,0 +1,317 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 9 Nov 2026 19:55:31 +0100
+Subject: [PATCH] Linux host: record which not ported SDK functions a run
+ calls, in a file (#20)
+
+A stubbed override answered 0 and counted its calls in memory, which was
+printed as a list of names without counts at the end of the run and lost if the
+run was killed. Now the first call also keeps where it came from (module and
+offset) and when, and NX2LINUX_STUB_AUDIT=FILE writes the stubs this build
+exports, the calls, their counts and first sites, atomically every 30 s and at
+the end of the report. The report says how many of the exported stubs were
+called, most called first. A lock keeps two threads from losing a count.
+tools/stub_audit.py merges the files of several runs.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: Which not ported SDK functions a long play calls, how often and from where, so that ports are chosen by use
+Issue: Sunshine-Off/NX2Linux#20
+
+---
+ dm/tools/horizon_overrides.py        |  19 +++-
+ dm/tools/horizon_run.py              |   6 +-
+ dm/tools/horizon_stubs.py            |  80 ++++++++++++++++
+ dm/tools/tests/test_horizon_stubs.py | 132 +++++++++++++++++++++++++++
+ 4 files changed, 235 insertions(+), 2 deletions(-)
+ create mode 100644 dm/tools/horizon_stubs.py
+ create mode 100644 dm/tools/tests/test_horizon_stubs.py
+
+diff --git a/dm/tools/horizon_overrides.py b/dm/tools/horizon_overrides.py
+index 0a577b0c..5459a266 100644
+--- a/dm/tools/horizon_overrides.py
++++ b/dm/tools/horizon_overrides.py
+@@ -1,6 +1,8 @@
+ """SDK functions the host replaces (NX2Linux S7bis): the Python side of the Mach host's HLE_FORCE table (engine/dm/host/hle_*.c). The recompiled game calls the SDK's own code except where a name is listed here:
+ that function is not lifted and its calls run `fn(hz, regs)`, which reads x0.. and writes x0 (the result). Each entry says why, as HLE_FORCE does. The list grows with what a game's boot needs, not in bulk."""
+ 
++import threading, time
++
+ OK = 0
+ TABLE = {}   # symbol -> (fn(hz, r), why)
+ ORIGIN = {}  # symbol -> 'handwritten' | 'trivial' | 'stubbed': where the entry comes from (the survey counts them apart)
+@@ -33,9 +35,24 @@ noop('_ZN2nn4pctl10InitializeEv', 'connect to the pctl parental controls service
+ noop('_ZN2nn4diag34InitializeApplicationAbortObserverEv', "register with the system's abort observer; the host prints crashes itself")
+ 
+ 
++_STUB_LOCK = threading.Lock()   # two guest threads calling the same stub at once must not lose a count
++
++
++def call_site(hz, addr):
++    """Where in the game a call came from, as `module+offset` and never a name"""
++    for m in hz.ms.modules:
++        if m.base <= addr < m.base + m.size: return f'{m.name}+{addr - m.base:#x}'
++    return f'{addr:#x}'
++
++
+ def _stub(symbol):
+     def f(hz, r):
+-        n = hz.stub_calls[symbol] = hz.stub_calls.get(symbol, 0) + 1
++        with _STUB_LOCK:
++            n = hz.stub_calls[symbol] = hz.stub_calls.get(symbol, 0) + 1
++            if n == 1:
++                sites = getattr(hz, 'stub_sites', None)
++                if sites is None: sites = hz.stub_sites = {}
++                sites[symbol] = (call_site(hz, r[30]), round(time.monotonic() - getattr(hz, 'start', time.monotonic()), 1))   # issue 20: the first caller and when, kept for the audit
+         if n == 1: hz.log(f'[stub] {symbol} is not ported, answers 0 (x0={r[0]:#x} x1={r[1]:#x})')
+         r[0] = 0
+     return f
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index b43758e1..76ea0f06 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -89,6 +89,8 @@ def main():
+         hz.display_factory = lambda gpu=None: horizon_gpu.GpuWindow(gpu, a.title, 1280, 720, hidden=a.hidden) if gpu else horizon_display.Display(a.title, 1280, 720, hidden=a.hidden)
+     # the boot runs on this thread; the game's own threads do the rest. A timer ends the run.
+     import threading
++    import horizon_stubs
++    audit = horizon_stubs.from_env(hz, a.title)   # issue 20: which not ported functions the game calls, kept in a file
+     def report():
+         if hz.native: hz.native.pull_stats()   # the calls made in C join the counts of hz.stats
+         print('sync detail:', hz.sync_detail_total(), flush=True)
+@@ -103,7 +105,9 @@ def main():
+         if hasattr(hz, 'nvn'): print('clear colors (on a window texture?, rgba): count:', sorted(hz.nvn.clear_colors.items(), key=lambda kv: -kv[1])[:12])
+         if hasattr(hz, 'audio'): print(hz.audio.report())
+         print(hz.fs.report()); import horizon_movie; print(horizon_movie.report(hz))
+-        print('stubbed overrides called:', sorted(hz.stub_calls)); print('where the guest threads are:\n' + hz.thread_report()); print(hz.ring_report(1)); print('threads that stopped:', hz.thread_faults, flush=True)
++        stubs = dict(hz.stub_calls); print(f'stubbed overrides called: {len(stubs)} of {len(horizon_stubs.stubbed_exported(hz))} exported, most called first:', [f'{sym} x{n}' for sym, n in sorted(stubs.items(), key=lambda kv: -kv[1])])
++        if audit: audit.write()
++        print('where the guest threads are:\n' + hz.thread_report()); print(hz.ring_report(1)); print('threads that stopped:', hz.thread_faults, flush=True)
+         print('calls that make memory executable (SetMemoryPermission with X, code memory):', hz.code_summary()['counts'] or 'none', flush=True)
+         import aot_report
+         write_report(aot_report.runtime_counters(hz.aot), time.time() - started)
+diff --git a/dm/tools/horizon_stubs.py b/dm/tools/horizon_stubs.py
+new file mode 100644
+index 00000000..ac6f69f4
+--- /dev/null
++++ b/dm/tools/horizon_stubs.py
+@@ -0,0 +1,80 @@
++"""The stub audit of the Linux host (issue 20).
++Some SDK functions are not ported: the host answers 0 and logs the first call (horizon_overrides._stub, the entries `stubbed`). The question after a long play is which of them the game really calls, how often, and from where, so that the next ports are chosen by use and not by guess.
++NX2LINUX_STUB_AUDIT=FILE writes a JSON file about the stubs this build exports (`stubbed_exported`) and the ones the run called (`calls`: how many times, where the first call came from as module+offset, and when in the run). It is rewritten every NX2LINUX_STUB_AUDIT_INTERVAL seconds (30 by default, 1 at least) and when the run ends, atomically, so a run that is killed leaves the last copy. tools/stub_audit.py merges the files of several runs and ranks them.
++The file holds SDK symbol names from this repository, counts and offsets into the game's modules. No name of a game function, no memory, no path. Off unless the variable is set."""
++import json, os, tempfile, threading, time
++
++SCHEMA = 1
++
++
++def stubbed_exported(hz):
++    """The stubbed overrides this build exports, which is the list the audit is about"""
++    import horizon_overrides
++    exported = set().union(*(m.exports for m in hz.ms.modules)) if hz.ms.modules else set()
++    return sorted(s for s, o in horizon_overrides.ORIGIN.items() if o == 'stubbed' and s in exported)
++
++
++class Audit:
++    def __init__(self, hz, path, title, interval=30.0, say=print, clock=time.monotonic, stubbed=None):
++        self.hz, self.path, self.title, self.interval, self.say, self.clock = hz, path, title, max(interval, 1.0), say, clock
++        self.stubbed = stubbed_exported(hz) if stubbed is None else sorted(stubbed)
++        self.t0, self.lock, self.stop_ev, self.thread, self.failed = clock(), threading.Lock(), threading.Event(), None, False
++
++    def build(self):
++        counts = dict(self.hz.stub_calls); sites = dict(getattr(self.hz, 'stub_sites', {}))   # copies: guest threads go on counting
++        calls = {}
++        for sym, n in counts.items():
++            site, when = sites.get(sym, (None, None))
++            calls[sym] = {'count': n, 'first_site': site, 'first_s': when}
++        return {'schema': SCHEMA, 'title': self.title, 'seconds': round(self.clock() - self.t0, 1), 'frames': getattr(self.hz, 'frames_presented', 0),
++                'stubbed_exported': self.stubbed, 'calls': calls}
++
++    def write(self):
++        """Replaces the file with the state now. A file that cannot be written is said once and the run goes on"""
++        with self.lock:
++            doc = self.build()
++            try:
++                d = os.path.dirname(os.path.abspath(self.path))
++                fd, tmp = tempfile.mkstemp(prefix='.stub-audit-', dir=d)
++                try:
++                    with os.fdopen(fd, 'w') as f: json.dump(doc, f, indent=1, sort_keys=True); f.write('\n')
++                    os.replace(tmp, self.path)
++                except BaseException:
++                    try: os.unlink(tmp)
++                    except OSError: pass
++                    raise
++            except OSError as e:
++                if not self.failed: self.say(f'[stub-audit] cannot write {os.path.basename(self.path)}: {e}', flush=True)
++                self.failed = True
++                return False
++            self.failed = False
++        return True
++
++    def loop(self):
++        while not self.stop_ev.wait(self.interval):
++            try: self.write()
++            except Exception as e: self.say(f'[stub-audit] error: {type(e).__name__}: {e}', flush=True)
++
++    def start(self):
++        self.thread = threading.Thread(target=self.loop, name='stub-audit', daemon=True); self.thread.start()
++        return self
++
++    def stop(self):
++        self.stop_ev.set()
++        if self.thread is not None and self.thread is not threading.current_thread(): self.thread.join(5)
++
++
++def from_env(hz, title, environ=None, say=print):
++    """A started Audit when NX2LINUX_STUB_AUDIT names a file, else None"""
++    environ = os.environ if environ is None else environ
++    path = environ.get('NX2LINUX_STUB_AUDIT', '').strip()
++    if not path: return None
++    interval = 30.0
++    raw = environ.get('NX2LINUX_STUB_AUDIT_INTERVAL', '').strip()
++    if raw:
++        try: interval = float(raw)
++        except ValueError: say(f'[stub-audit] NX2LINUX_STUB_AUDIT_INTERVAL={raw!r} is not a number: using 30', flush=True)
++    a = Audit(hz, path, title, interval=interval, say=say)
++    say(f'[stub-audit] {len(a.stubbed)} stubbed functions exported by this build, file {os.path.basename(path)} every {a.interval:g} s', flush=True)
++    a.write()
++    return a.start()
+diff --git a/dm/tools/tests/test_horizon_stubs.py b/dm/tools/tests/test_horizon_stubs.py
+new file mode 100644
+index 00000000..e18a9955
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_stubs.py
+@@ -0,0 +1,132 @@
++"""The stub audit (horizon_stubs.py and the stubs of horizon_overrides.py, issue 20). No game: a fake Horizon with two modules."""
++import json, os, sys, tempfile, threading, time, types, unittest
++from pathlib import Path
++
++TOOLS = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(TOOLS))
++import horizon_overrides as ho
++import horizon_stubs as hs
++
++
++def fake_hz(exports=()):
++    mods = [types.SimpleNamespace(name='main', base=0x8000000, size=0x100000, exports={s: 0x8000000 + i * 16 for i, s in enumerate(exports)}),
++            types.SimpleNamespace(name='subsdk0', base=0x9000000, size=0x20000, exports={})]
++    logs = []
++    return types.SimpleNamespace(ms=types.SimpleNamespace(modules=mods), stub_calls={}, start=time.monotonic(), log=logs.append, frames_presented=0, logs=logs)
++
++
++def regs(lr=0, x0=0):
++    r = [0] * 31; r[0], r[30] = x0, lr; return r
++
++
++class Stub(unittest.TestCase):
++    def test_the_first_call_keeps_where_it_came_from_and_when(self):
++        hz = fake_hz(); f = ho._stub('_ZN2nn3hid5FooEv')
++        f(hz, regs(lr=0x8000123)); f(hz, regs(lr=0x9000040))
++        self.assertEqual(hz.stub_calls, {'_ZN2nn3hid5FooEv': 2})
++        site, when = hz.stub_sites['_ZN2nn3hid5FooEv']
++        self.assertEqual(site, 'main+0x123'); self.assertGreaterEqual(when, 0.0); self.assertLess(when, 5.0)   # the second caller, in subsdk0, is not the first
++        self.assertEqual(len(hz.logs), 1)   # still one log line for the first call
++
++    def test_a_caller_outside_every_module_is_an_address(self):
++        hz = fake_hz(); ho._stub('s')(hz, regs(lr=0x1234)); self.assertEqual(hz.stub_sites['s'][0], '0x1234')
++
++    def test_the_stub_answers_zero(self):
++        hz = fake_hz(); r = regs(lr=0x8000000, x0=7); ho._stub('s')(hz, r); self.assertEqual(r[0], 0)
++
++    def test_threads_calling_at_once_lose_no_count(self):
++        hz = fake_hz(); f = ho._stub('s')
++        def work():
++            for _ in range(2000): f(hz, regs(lr=0x8000000))
++        ts = [threading.Thread(target=work) for _ in range(8)]
++        for t in ts: t.start()
++        for t in ts: t.join()
++        self.assertEqual(hz.stub_calls['s'], 16000)
++
++
++class Audit(unittest.TestCase):
++    def audit(self, tmp, **kw):
++        hz = fake_hz(); lines = []
++        a = hs.Audit(hz, os.path.join(tmp, 'audit.json'), '0100e95004038000', say=lambda t, flush=False: lines.append(t), stubbed=kw.pop('stubbed', ['a', 'b', 'c']), **kw)
++        return a, hz, lines
++
++    def test_the_file_lists_the_stubs_and_the_calls(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            a, hz, _ = self.audit(tmp); ho._stub('a')(hz, regs(lr=0x8000100)); ho._stub('a')(hz, regs(lr=0x8000100)); hz.frames_presented = 99
++            self.assertTrue(a.write())
++            doc = json.loads(Path(a.path).read_text())
++        self.assertEqual(doc['schema'], 1); self.assertEqual(doc['title'], '0100e95004038000'); self.assertEqual(doc['stubbed_exported'], ['a', 'b', 'c']); self.assertEqual(doc['frames'], 99)
++        self.assertEqual(doc['calls']['a']['count'], 2); self.assertEqual(doc['calls']['a']['first_site'], 'main+0x100'); self.assertIn('first_s', doc['calls']['a'])
++        self.assertNotIn('b', doc['calls'])
++
++    def test_a_call_counted_without_a_site_is_still_listed(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            a, hz, _ = self.audit(tmp); hz.stub_calls['b'] = 3; a.write()
++            doc = json.loads(Path(a.path).read_text())
++        self.assertEqual(doc['calls']['b'], {'count': 3, 'first_site': None, 'first_s': None})
++
++    def test_the_file_is_replaced_whole_and_no_temporary_file_is_left(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            a, hz, _ = self.audit(tmp); a.write(); hz.stub_calls['a'] = 5; a.write()
++            self.assertEqual(json.loads(Path(a.path).read_text())['calls']['a']['count'], 5)
++            self.assertEqual(sorted(os.listdir(tmp)), ['audit.json'])
++
++    def test_a_folder_that_does_not_exist_is_said_once_and_the_run_goes_on(self):
++        lines = []; a = hs.Audit(fake_hz(), '/nonexistent-dir/audit.json', 't', say=lambda t, flush=False: lines.append(t), stubbed=[])
++        self.assertFalse(a.write()); self.assertFalse(a.write()); self.assertEqual(len([l for l in lines if 'cannot write' in l]), 1)
++
++    def test_the_file_has_no_path_and_no_game_name(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            a, hz, _ = self.audit(tmp); ho._stub('a')(hz, regs(lr=0x8000100)); a.write()
++            text = Path(a.path).read_text()
++        self.assertNotIn(tmp, text); self.assertNotIn(str(Path.home()), text)
++
++    def test_the_stubbed_exported_are_the_stubbed_origin_that_the_modules_export(self):
++        hz = fake_hz(exports=['x_exported_stub', 'x_exported_hand'])
++        saved = dict(ho.ORIGIN)
++        try:
++            ho.ORIGIN.update({'x_exported_stub': 'stubbed', 'x_exported_hand': 'handwritten', 'x_not_exported_stub': 'stubbed'})
++            self.assertEqual([s for s in hs.stubbed_exported(hz) if s.startswith('x_')], ['x_exported_stub'])
++        finally: ho.ORIGIN.clear(); ho.ORIGIN.update(saved)
++
++    def test_the_generated_list_of_stubs_is_the_one_the_audit_is_about(self):
++        import horizon_trivial
++        self.assertGreater(len(horizon_trivial.STUBBED), 100); self.assertTrue(all(isinstance(sym, str) and sym for sym, why, src in horizon_trivial.STUBBED))
++
++
++class Env(unittest.TestCase):
++    def test_nothing_set_nothing_starts(self):
++        self.assertIsNone(hs.from_env(fake_hz(), 't', {}))
++
++    def test_a_file_starts_an_audit_that_is_written_at_once_and_stops(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            lines = []; path = os.path.join(tmp, 'a.json')
++            a = hs.from_env(fake_hz(['s']), 't', {'NX2LINUX_STUB_AUDIT': path, 'NX2LINUX_STUB_AUDIT_INTERVAL': '1'}, say=lambda t, flush=False: lines.append(t))
++            self.assertTrue(Path(path).is_file()); a.stop(); self.assertFalse(a.thread.is_alive())
++            self.assertIn('a.json', lines[0]); self.assertNotIn(tmp, lines[0])
++
++    def test_the_writer_thread_rewrites_the_file(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, 'a.json'); hz = fake_hz(['s'])
++            a = hs.from_env(hz, 't', {'NX2LINUX_STUB_AUDIT': path, 'NX2LINUX_STUB_AUDIT_INTERVAL': '1'}, say=lambda t, flush=False: None)
++            a.interval = 0.05   # the floor is 1 s for a run, a test may go faster
++            hz.stub_calls['s'] = 4
++            end = time.monotonic() + 10
++            while time.monotonic() < end and json.loads(Path(path).read_text())['calls'].get('s', {}).get('count') != 4: time.sleep(0.05)
++            a.stop()
++            self.assertEqual(json.loads(Path(path).read_text())['calls']['s']['count'], 4)
++
++    def test_a_bad_interval_falls_back(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            lines = []; a = hs.from_env(fake_hz(), 't', {'NX2LINUX_STUB_AUDIT': os.path.join(tmp, 'a.json'), 'NX2LINUX_STUB_AUDIT_INTERVAL': 'often'}, say=lambda t, flush=False: lines.append(t)); a.stop()
++        self.assertEqual(a.interval, 30.0); self.assertTrue(any('is not a number' in l for l in lines))
++
++
++class Wiring(unittest.TestCase):
++    def test_the_run_builds_the_audit_before_the_report_and_writes_it_there(self):
++        src = (TOOLS / 'horizon_run.py').read_text()
++        self.assertIn('horizon_stubs.from_env(hz, a.title)', src); self.assertIn('if audit: audit.write()', src)
++        self.assertLess(src.index('horizon_stubs.from_env'), src.index('    def report():'))
++
++
++if __name__ == '__main__': unittest.main()
