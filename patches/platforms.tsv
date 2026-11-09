@@ -114,3 +114,4 @@ file	class	note
 0133-linux-host-nx2linux-frame-marks-prints-the-frame.patch	linux	Measurement aid, nothing changes without NX2LINUX_FRAME_MARKS
 0134-linux-host-count-what-the-mutex-and-key-calls-di.patch	linux	Counters in the report, nothing else changes
 0135-linux-host-the-library-tests-skip-a-libnx2linux.patch	linux	Test-only change
+0139-linux-host-record-which-not-ported-sdk-functions.patch	linux	Stub audit file of the Linux host, off unless asked
