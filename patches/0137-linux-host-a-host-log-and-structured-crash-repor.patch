@@ -1,0 +1,845 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 8 Nov 2026 12:26:05 +0100
+Subject: [PATCH] Linux host: a host log and structured crash reports under XDG
+ state (#23)
+
+horizon_run.py now keeps host-<title>-<time>-<pid>.log and writes
+crash-<title>-<time>-<pid>.json under $XDG_STATE_HOME/nx2linux/logs, the
+folder the Qt front end already uses. A report is made for a guest thread
+fault, a boot fault, svcBreak and any uncaught Python exception, with the
+fault, the call chain as module+offset, each thread's last 16 kernel calls
+and the run's counters. A process that dies of a signal leaves a faulthandler
+dump that the next run turns into a report. Reports hold no home path, user
+name, key or package name, no game memory, no registers and no function name
+of the game unless asked for. docs/linux/logs-and-crashes.md describes it.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: The Linux host had no log file and no crash report: add them under XDG state, with no personal path or game data
+Issue: Sunshine-Off/NX2Linux#23
+
+---
+ dm/tools/horizon_crash.py            | 319 +++++++++++++++++++++++++++
+ dm/tools/horizon_hle.py              |   9 +-
+ dm/tools/horizon_run.py              |  24 +-
+ dm/tools/tests/test_aot_report.py    |   3 +-
+ dm/tools/tests/test_horizon_crash.py | 279 +++++++++++++++++++++++
+ docs/linux/logs-and-crashes.md       |  65 ++++++
+ 6 files changed, 694 insertions(+), 5 deletions(-)
+ create mode 100644 dm/tools/horizon_crash.py
+ create mode 100644 dm/tools/tests/test_horizon_crash.py
+ create mode 100644 docs/linux/logs-and-crashes.md
+
+diff --git a/dm/tools/horizon_crash.py b/dm/tools/horizon_crash.py
+new file mode 100644
+index 00000000..80f63cb3
+--- /dev/null
++++ b/dm/tools/horizon_crash.py
+@@ -0,0 +1,319 @@
++"""Host logs and crash reports of the Linux host (NX2Linux Phase 3, issue #23).
++
++A run of horizon_run.py writes under $XDG_STATE_HOME/nx2linux/logs (else ~/.local/state/nx2linux/logs), the folder the Qt front end already uses:
++  host-<title>-<UTC time>-<pid>.log    a copy of everything the run prints, with the home folder shortened to ~. It is the raw local log: it can hold strings the game itself prints
++  crash-<title>-<UTC time>-<pid>.json  one report per crash (at most MAX_REPORTS a run), meant to be attached to an issue: it holds no path of yours, no user name, no key, no game file name
++                                        and no memory of the game. Guest addresses are written as module+offset, never as the name of a function of the game (NX2LINUX_CRASH_SYMBOLS=1 adds them)
++  crash-<title>-<UTC time>-<pid>.raw   what faulthandler wrote when the process died of a signal (SEGV, BUS, ILL, ABRT, FPE). A dying process cannot clean its own text, so the next run turns this
++                                        file into a crash-*.json report (convert_raw_dumps) and removes it
++The kinds of report: guest-fault (a guest thread stopped on a fault), boot-fault (the boot sequence faulted), guest-break (the game called svcBreak), python-exception (the host raised, in any thread)
++and fatal-signal. NX2LINUX_HOST_LOG=0 turns the log and the reports off, NX2LINUX_LOG_KEEP=<n> is how many host logs are kept (20), NX2LINUX_CRASH_REGS=1 adds x0..x30 to a report.
++Known gap: the AOT runtime installs its own SIGSEGV handler when a guest thread first runs, and for a fault that is not a guest access it restores the default action. A SEGV in a host library
++after that point ends the process with no raw dump. The other fatal signals are caught."""
++import faulthandler
++import getpass
++import json
++import os
++import platform
++import re
++import struct
++import sys
++import threading
++import time
++import traceback
++from datetime import datetime, timezone
++from pathlib import Path
++
++SCHEMA = 1
++MAX_REPORTS = 5          # a run writes at most this many reports: one crash tends to bring several
++KEEP_LOGS = 20           # host logs kept (NX2LINUX_LOG_KEEP)
++KEEP_REPORTS = 50
++RECENT_SVCS = 16         # the last kernel calls kept per guest thread
++MAX_THREADS = 64
++MAX_TEXT = 4000
++NAME = r'[0-9A-Za-z]{1,32}'
++LOG_RE = re.compile(rf'^host-{NAME}-\d{{8}}T\d{{6}}Z-\d+\.log$')
++REPORT_RE = re.compile(rf'^crash-{NAME}-\d{{8}}T\d{{6}}Z-\d+\.json$')
++RAW_RE = re.compile(rf'^crash-({NAME})-(\d{{8}}T\d{{6}}Z)-(\d+)\.raw$')
++SIGNALS = {'Segmentation fault': 'SIGSEGV', 'Bus error': 'SIGBUS', 'Illegal instruction': 'SIGILL', 'Aborted': 'SIGABRT', 'Floating point exception': 'SIGFPE'}
++
++
++def state_dir(environ=None):
++    """$XDG_STATE_HOME/nx2linux when that is an absolute path, else ~/.local/state/nx2linux: the rule of the Qt front end and of linux/cli/nx2linux.py"""
++    env = (os.environ if environ is None else environ).get('XDG_STATE_HOME')
++    if env and Path(env).is_absolute(): return Path(env) / 'nx2linux'
++    return Path.home() / '.local' / 'state' / 'nx2linux'
++
++
++def logs_dir(environ=None): return state_dir(environ) / 'logs'
++
++
++def enabled(environ=None): return (os.environ if environ is None else environ).get('NX2LINUX_HOST_LOG', '1') != '0'
++
++
++def _stamp(t=None): return datetime.fromtimestamp(time.time() if t is None else t, timezone.utc).strftime('%Y%m%dT%H%M%SZ')
++def _title(t): return re.sub(r'[^0-9A-Za-z]', '', str(t))[:32] or 'unknown'
++
++
++class Redactor:
++    """Takes what is personal out of a text: the home folder (to ~), the folders of the run (to <modules>, <romfs>, <cache>), the user name, any other /home/<name>, key files and game packages.
++    paths: [(path, token)], the longest path is replaced first so that <modules> wins over ~/..."""
++    OTHER_HOME = re.compile(r"/home/[^/\s'\"]+")
++    KEYS = re.compile(r"\S*\.keys\S*")
++    PACKAGE = re.compile(r"\S+\.(?:nsp|xci|nsz|xcz)\b", re.I)
++
++    def __init__(self, paths=(), environ=None):
++        env = os.environ if environ is None else environ
++        pairs = {(str(p).rstrip('/'), t) for p, t in paths if p}
++        home = {env.get('HOME'), str(Path.home())}
++        home |= {os.path.realpath(h) for h in list(home) if h}
++        pairs |= {(h.rstrip('/'), '~') for h in home if h}
++        pairs = [(p, t) for p, t in pairs if p and p != '/']
++        self.paths = [(re.compile(re.escape(p) + r'(?![\w.-])'), t) for p, t in sorted(pairs, key=lambda x: (-len(x[0]), x[0]))]
++        try: user = getpass.getuser()
++        except Exception: user = ''
++        user = env.get('USER') or env.get('LOGNAME') or user
++        self.user = re.compile(r'(?<![\w.-])' + re.escape(user) + r'(?![\w.-])') if user and len(user) >= 3 and user != 'root' else None
++
++    def __call__(self, text):
++        s = str(text)
++        for rx, token in self.paths: s = rx.sub(token, s)
++        s = self.OTHER_HOME.sub('~', s)
++        s = self.KEYS.sub('<keys>', s)
++        s = self.PACKAGE.sub('<package>', s)
++        if self.user: s = self.user.sub('<user>', s)
++        return s
++
++
++class Tee:
++    """A text stream that goes on writing to the console and also copies to the log (redacted). A failing log never reaches the run"""
++    def __init__(self, console, log, redact):
++        self.console, self.log, self.redact, self.lock = console, log, redact, threading.Lock()
++    def write(self, s):
++        n = self.console.write(s)
++        with self.lock:
++            if self.log:
++                try: self.log.write(self.redact(s))
++                except Exception: self.log = None
++        return n
++    def flush(self):
++        self.console.flush()
++        with self.lock:
++            if self.log:
++                try: self.log.flush()
++                except Exception: self.log = None
++    def __getattr__(self, name): return getattr(self.console, name)   # fileno, isatty, encoding...
++
++
++def _private_dir(path):
++    path.mkdir(parents=True, exist_ok=True)
++    try: os.chmod(path, 0o700)
++    except OSError: pass
++    return path
++
++
++def _rotate(folder, rx, keep):
++    """Keep the `keep` newest files of folder whose name matches rx. Nothing else in the folder is looked at"""
++    try:
++        files = sorted((p for p in folder.iterdir() if rx.match(p.name)), key=lambda p: p.stat().st_mtime, reverse=True)
++        for p in files[keep:]:
++            try: p.unlink()
++            except OSError: pass
++    except OSError: pass
++
++
++class Crash:
++    def __init__(self, title='0000000000000000', paths=(), environ=None, console=None):
++        self.environ = os.environ if environ is None else environ
++        self.title, self.pid, self.started = _title(title), os.getpid(), time.monotonic()
++        self.stamp = _stamp()
++        self.dir = logs_dir(self.environ)
++        self.redact = Redactor(paths, self.environ)
++        self.hz, self.count, self.lock = None, 0, threading.Lock()
++        self.log_path = self.raw_path = None
++        self._log = self._raw = None
++        self._streams = None
++        self.engine_dir = str(Path(__file__).resolve().parents[2])
++        self.redact.paths.insert(0, (re.compile(re.escape(self.engine_dir) + r'(?![\w.-])'), '<engine>'))
++        self.console = console or sys.__stderr__
++
++    # ---- setup ----
++    def attach(self, hz):
++        self.hz = hz; hz.crash = self
++        return self
++
++    def start_log(self):
++        """Copy stdout and stderr to host-<title>-<time>-<pid>.log (and keep the newest NX2LINUX_LOG_KEEP of those)"""
++        _private_dir(self.dir)
++        self.log_path = self.dir / f'host-{self.title}-{self.stamp}-{self.pid}.log'
++        fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
++        self._log = os.fdopen(fd, 'w', encoding='utf-8', errors='replace')
++        self._streams = (sys.stdout, sys.stderr)
++        sys.stdout, sys.stderr = Tee(sys.stdout, self._log, self.redact), Tee(sys.stderr, self._log, self.redact)
++        try: keep = int(self.environ.get('NX2LINUX_LOG_KEEP', KEEP_LOGS))
++        except ValueError: keep = KEEP_LOGS
++        _rotate(self.dir, LOG_RE, max(1, keep))
++        _rotate(self.dir, REPORT_RE, KEEP_REPORTS)
++        return self.log_path
++
++    def enable_faulthandler(self):
++        """A fatal signal writes the Python stacks of every thread into crash-*.raw. Opened now because a dying process cannot open files safely"""
++        if self.environ.get('NX2LINUX_CRASH_FAULTHANDLER', '1') == '0': return None
++        _private_dir(self.dir)
++        self.raw_path = self.dir / f'crash-{self.title}-{self.stamp}-{self.pid}.raw'
++        fd = os.open(self.raw_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++        self._raw = os.fdopen(fd, 'w')
++        faulthandler.enable(file=self._raw, all_threads=True)
++        return self.raw_path
++
++    def install_hooks(self):
++        """An exception nobody caught, in the main thread or in any other, becomes a report"""
++        prev, prev_thread = sys.excepthook, threading.excepthook
++        def hook(t, v, tb):
++            self.report('python-exception', exc_info=(t, v, tb)); prev(t, v, tb)
++        def thread_hook(args):
++            self.report('python-exception', exc_info=(args.exc_type, args.exc_value, args.exc_traceback), thread_name=getattr(args.thread, 'name', None)); prev_thread(args)
++        sys.excepthook, threading.excepthook = hook, thread_hook
++
++    def finish(self):
++        """The run ends on purpose: no raw dump is left, the console streams are back"""
++        try:
++            if self._raw:
++                faulthandler.disable()
++                size = os.fstat(self._raw.fileno()).st_size
++                self._raw.close(); self._raw = None
++                if not size and self.raw_path:
++                    try: self.raw_path.unlink()
++                    except OSError: pass
++            if self._streams:
++                for s in (sys.stdout, sys.stderr):
++                    if isinstance(s, Tee):
++                        with s.lock:
++                            if s.log: s.log.flush()
++                sys.stdout, sys.stderr = self._streams; self._streams = None
++            if self._log:
++                self._log.close(); self._log = None
++        except Exception: pass
++
++    # ---- the report ----
++    def loc(self, a):
++        """A guest address as module+offset (hex if no module holds it)"""
++        a = int(a)
++        for mod in getattr(getattr(self.hz, 'ms', None), 'modules', ()) or ():
++            if mod.base <= a < mod.base + mod.size: return f'{mod.name}+{a - mod.base:#x}'
++        return f'{a:#x}'
++
++    def symbol(self, a):
++        """The name of the nearest exported function: game data, asked for with NX2LINUX_CRASH_SYMBOLS=1 only"""
++        try: return self.hz.where([0] * 29 + [0, int(a)], 0)
++        except Exception: return None
++
++    def chain(self, regs, depth=24):
++        """x30 and the return addresses along the x29 frame chain, as module+offset"""
++        out, fp = [], regs[29] if len(regs) > 29 else 0
++        if len(regs) > 30 and regs[30]: out.append(regs[30])
++        for _ in range(depth):
++            try: fp, lr = struct.unpack('<QQ', self.hz.rd(fp, 16))
++            except Exception: break
++            if not lr: break
++            out.append(lr)
++        return [self.loc(a) for a in out]
++
++    def threads(self, limit=MAX_THREADS):
++        hz, now, out = self.hz, time.monotonic(), []
++        seen = [hz.main_thread_obj] + [o for o in list(hz.handles.values()) if hasattr(o, 'recent') and o is not hz.main_thread_obj]
++        for t in seen[:limit]:
++            calls = list(t.recent)
++            if not calls and t is not hz.main_thread_obj: continue
++            out.append({'tid': t.tid, 'done': bool(getattr(t, 'done', False)),
++                        'last_svcs': [{'name': n, 'at': self.loc(o), 'seconds_ago': round(now - at, 3)} for n, o, at in calls]})
++        return out
++
++    def environment(self):
++        keep = {k: self.redact(v)[:200] for k, v in sorted(self.environ.items()) if k.startswith(('NX2LINUX_', 'AOT_'))}
++        keep.pop('NX2LINUX_NICK', None)   # a name the player chose
++        return keep
++
++    def host(self):
++        info = {'python': platform.python_version(), 'system': platform.system(), 'kernel': platform.release(), 'machine': platform.machine(), 'cpus': os.cpu_count()}
++        try:
++            names = (Path(self.engine_dir) / 'dm' / 'fork_patches.txt').read_text().split()
++            info['engine_patches'] = len(names)
++        except OSError: pass
++        return info
++
++    def build(self, kind, thread=None, fault=None, regs=None, exc_info=None, detail=None, thread_name=None):
++        hz = self.hz
++        rep = {'schema': SCHEMA, 'kind': kind, 'time_utc': _stamp(), 'pid': self.pid, 'title': self.title, 'seconds_since_start': round(time.monotonic() - self.started, 3), 'host': self.host()}
++        if thread is not None: rep['thread'] = {'tid': getattr(thread, 'tid', None)}
++        elif thread_name: rep['thread'] = {'name': self.redact(thread_name)}
++        if fault is not None: rep['fault'] = self.redact(str(fault))[:MAX_TEXT]
++        if detail: rep['detail'] = {k: (self.redact(v) if isinstance(v, str) else v) for k, v in detail.items()}
++        if exc_info is not None and exc_info[0] is not None:
++            rep['exception'] = {'type': exc_info[0].__name__, 'traceback': self.redact(''.join(traceback.format_exception(*exc_info)))[-MAX_TEXT:]}
++        if hz is not None:
++            if regs is not None:
++                guest = {'pc_or_lr': self.loc(regs[30]) if len(regs) > 30 else None, 'call_chain': self.chain(regs)}
++                if self.environ.get('NX2LINUX_CRASH_SYMBOLS') == '1' and len(regs) > 30: guest['symbol'] = self.symbol(regs[30])
++                if self.environ.get('NX2LINUX_CRASH_REGS') == '1': guest['registers'] = {f'x{i}': f'{regs[i]:#x}' for i in range(min(31, len(regs)))}
++                rep['guest'] = guest
++            rep['run'] = {'frames_presented': getattr(hz, 'frames_presented', 0), 'svc_calls': dict(hz.stats), 'unhandled_svcs': dict(hz.unhandled), 'thread_faults': [[tid, self.redact(f)] for tid, f in hz.thread_faults],
++                          'stop_reason': hz.stop_reason}
++            try: rep['run']['gpu'] = self.redact(hz.nvn.gpu.gpu.name)
++            except Exception: pass
++            rep['threads'] = self.threads()
++        rep['environment'] = self.environment()
++        return rep
++
++    def report(self, kind, **kw):
++        """Write one crash report. Returns its path, or None when the run is over its limit or the folder cannot be written. Never raises: a crash report must not crash"""
++        try:
++            if not enabled(self.environ): return None
++            with self.lock:
++                if self.count >= MAX_REPORTS: return None
++                self.count += 1; n = self.count
++            rep = self.build(kind, **kw)
++            _private_dir(self.dir)
++            path = self.dir / f'crash-{self.title}-{self.stamp}-{self.pid}.json' if n == 1 else self.dir / f'crash-{self.title}-{self.stamp}-{self.pid}-{n}.json'
++            return _write_json(path, rep, say=lambda s: print(s, file=sys.stderr, flush=True))
++        except Exception as e:
++            try: print(f'[crash] could not write the report: {type(e).__name__}', file=self.console, flush=True)
++            except Exception: pass
++            return None
++
++
++def _write_json(path, rep, say=None):
++    tmp = path.with_name(path.name + '.tmp')
++    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++    with os.fdopen(fd, 'w', encoding='utf-8') as f: json.dump(rep, f, indent=2, sort_keys=True); f.write('\n')
++    os.replace(tmp, path)
++    if say: say(f'[crash] {rep["kind"]} report: {path}')
++    return path
++
++
++def convert_raw_dumps(folder=None, environ=None, redact=None):
++    """Turn every crash-*.raw a dead run left into a crash-*.json report and remove the raw file. A raw file that is still empty belongs to a run that is going: it is left alone.
++    Returns the reports written"""
++    env = os.environ if environ is None else environ
++    folder = folder or logs_dir(env)
++    redact = redact or Redactor(environ=env)
++    out = []
++    try: names = sorted(os.listdir(folder))
++    except OSError: return out
++    for name in names:
++        m = RAW_RE.match(name)
++        if not m: continue
++        raw = Path(folder) / name
++        try:
++            if raw.stat().st_size == 0: continue
++            text = raw.read_text(errors='replace')
++        except OSError: continue
++        title, stamp, pid = m.groups()
++        first = text.strip().splitlines()[0] if text.strip() else ''
++        sig = next((v for k, v in SIGNALS.items() if k.lower() in first.lower()), None)
++        rep = {'schema': SCHEMA, 'kind': 'fatal-signal', 'time_utc': stamp, 'pid': int(pid), 'title': title, 'signal': sig, 'native': {'summary': redact(first)[:200], 'python_stacks': redact(text)[-MAX_TEXT * 2:]}}
++        try:
++            out.append(_write_json(Path(folder) / f'crash-{title}-{stamp}-{pid}.json', rep))
++            raw.unlink()
++        except OSError: pass
++    return out
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index aa170881..1f370d0f 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -2,7 +2,7 @@
+ signal are reported instead of hanging. The memory is the AOT runtime's regions (aot_lift.Aot: peek / poke / try_map); handles live in a table; a service is a Python object whose `command(id, request)`
+ returns a Response. Everything not implemented is logged as `unhandled ...` and answered with an error, never faked as a success (the boot stops where the game needs it, and the log says where).
+ Usage: h = Horizon(module_set); h.attach(); module_set.call(entry, ...)."""
+-import os, struct, sys, threading, time
++import collections, os, struct, sys, threading, time
+ 
+ M64 = (1 << 64) - 1
+ PAGE = 0x1000
+@@ -65,6 +65,7 @@ class KThread(Obj):
+         self.tid, self.handle = next(self._ids), 0
+         self.done, self.started, self.granted, self.signaled, self.tag, self.result = False, False, False, False, 0, None
+         self.wake, self.waiters = threading.Event(), []   # wake: set by whoever hands this thread what it waits for; waiters: the threads in a WaitSynchronization on this one
++        self.recent = collections.deque(maxlen=16)   # (call, address of the svc, time) of its last kernel calls: what a crash report shows (horizon_crash.py)
+ 
+     def start(self):
+         if self.started: return
+@@ -81,6 +82,7 @@ class KThread(Obj):
+                 regs = [0] * 31; regs[29], regs[30] = self.result.get('x29', 0), self.result.get('x30', 0)
+                 hz.log(f'guest thread {self.tid} stopped: {self.result["fault"]} (call chain: {hz.where(regs)})')
+                 hz.thread_faults.append((self.tid, self.result['fault']))
++                if hz.crash: hz.crash.report('guest-fault', thread=self, fault=self.result['fault'], regs=[self.result.get(f'x{i}', 0) for i in range(31)])
+         finally:
+             with hz.cv:
+                 self.done = True; hz.wake_all(self.waiters)
+@@ -134,6 +136,7 @@ class Horizon:
+         self.verbose_nvn = bool(os.environ.get('NX2LINUX_NVN_LOG'))
+         self.display_factory = None   # () -> horizon_display.Display, called when the game first presents a frame
+         self.thread_faults = []
++        self.crash = None   # horizon_crash.Crash when the run keeps a log and writes crash reports
+         self.stub_calls = {}
+         self.thread_state = {}
+         import collections
+@@ -271,7 +274,8 @@ class Horizon:
+             return
+         before = list(r[:4])
+         if self.ring is not None and name in ('WaitProcessWideKeyAtomic', 'SignalProcessWideKey', 'ArbitrateLock', 'ArbitrateUnlock'): self.ring.append((time.monotonic(), self.current().tid if self.current() else 1, name, before[0], before[1], before[2], before[3]))
+-        t = self.current(); self.thread_state[t.tid if t else 1] = (name, orig, r[29], r[30], time.monotonic())   # where each guest thread last entered the kernel: the report shows who waits on what
++        t = self.current(); now = time.monotonic(); self.thread_state[t.tid if t else 1] = (name, orig, r[29], r[30], now)   # where each guest thread last entered the kernel: the report shows who waits on what
++        (t or self.main_thread_obj).recent.append((name, orig, now))
+         t0 = time.monotonic() if self.svc_prof is not None else 0.0
+         try: f(r)
+         except AssertionError as e:   # a guest address the kernel cannot read or write: the call fails, as it does on the device, instead of raising inside the guest's thread
+@@ -404,6 +408,7 @@ class Horizon:
+         reason, info, size = r[0], r[1], r[2]
+         self.log(f'Break reason {reason:#x} info {info:#x} size {size:#x} at ' + self.where(r))
+         self.stop_reason = f'svcBreak({reason:#x})'
++        if self.crash: self.crash.report('guest-break', thread=self.current() or self.main_thread_obj, regs=list(r[:31]), detail={'reason': hex(reason), 'info': hex(info), 'size': hex(size)})
+         self.on_break(reason, info, size)
+ 
+     def on_break(self, reason, info, size):
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index 4e20a20c..142bf5a2 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -9,7 +9,21 @@ from pathlib import Path
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
+ import aot_lift
+ import elf_module as em
+-import horizon_hle, horizon_overrides
++import horizon_crash, horizon_hle, horizon_overrides
++
++
++def start_log(a):
++    """The host log and the crash reports of this run. A state folder that cannot be written costs the log, never the run"""
++    if not horizon_crash.enabled(): return None
++    try:
++        crash = horizon_crash.Crash(a.title, paths=[(a.modules, '<modules>'), (a.romfs, '<romfs>'), (a.cache, '<cache>')])
++        for report in horizon_crash.convert_raw_dumps(crash.dir, redact=crash.redact): print(f'[crash] a run that died of a signal left a report: {report}', flush=True)
++        log = crash.start_log(); crash.enable_faulthandler(); crash.install_hooks()
++        print(f'[host] log: {log}', flush=True)
++        return crash
++    except OSError as e:
++        print(f'[host] no log or crash report this run: {e}', file=sys.stderr, flush=True)
++        return None
+ 
+ 
+ def main():
+@@ -37,7 +51,9 @@ def main():
+         if missing: raise em.ModuleError('module manifest not found: ' + ', '.join(missing))
+         ms = em.ModuleSet(mods, {})
+     except em.ModuleError as e: sys.exit(f'[RED] {e}')
++    crash = start_log(a)   # from here on the run keeps a log and writes crash reports under $XDG_STATE_HOME/nx2linux/logs (horizon_crash.py)
+     hz = horizon_hle.Horizon(ms, verbose=a.verbose, romfs=a.romfs, title_id=a.title, game=game)
++    if crash: crash.attach(hz)
+     ovr = horizon_overrides.install(hz)
+     origin = {s: horizon_overrides.ORIGIN.get(s, 'handwritten') for s in ovr}   # for the report: who replaced each function
+     if not a.no_profile:
+@@ -65,7 +81,9 @@ def main():
+                                                           extra=run_extra() if runtime is not None else None))
+         print(f'[report] {a.report_json}', flush=True)
+     if a.build_only:
+-        write_report(); hz.aot.close(); print('[build] recompiled: the cache is ready', flush=True); return
++        write_report(); hz.aot.close(); print('[build] recompiled: the cache is ready', flush=True)
++        if crash: crash.finish()
++        return
+     hz.attach()
+     if a.display:
+         import horizon_display
+@@ -93,10 +111,12 @@ def main():
+     def stop():
+         print(f'[run] {a.seconds:.0f} s elapsed: stopping', flush=True); report()
+         if hasattr(hz, 'audio') and hz.audio.mixer: hz.audio.mixer.close()   # a WAV file gets its final header
++        if crash: crash.finish()   # no raw dump is left behind by a run that ends on purpose
+         os._exit(0)
+     started = time.time()
+     threading.Timer(a.seconds, stop).start()
+     r = hz.boot()
++    if 'fault' in r and crash: crash.report('boot-fault', thread=hz.main_thread_obj, fault=r['fault'], regs=[r.get(f'x{i}', 0) for i in range(31)], detail={'step': r.get('step')})
+     print('result', {k: (hex(v) if isinstance(v, int) else v) for k, v in r.items() if k in ('fault', 'x0', 'step')})
+     report()   # the boot thread ended (nnMain returned or faulted); the other guest threads go on until the timer
+ 
+diff --git a/dm/tools/tests/test_aot_report.py b/dm/tools/tests/test_aot_report.py
+index 73949137..c2d82dc4 100644
+--- a/dm/tools/tests/test_aot_report.py
++++ b/dm/tools/tests/test_aot_report.py
+@@ -121,7 +121,8 @@ class FixtureRun(unittest.TestCase):
+         out = Path(self.tmp.name) / 'build.json'
+         cache = Path(self.tmp.name) / 'cache'
+         r = subprocess.run([sys.executable, '-I', str(TOOLS / 'horizon_run.py'), '--modules', self.tmp.name, '--order', 'c', '--title', '0000000000000000', '--jit', '--build-only',
+-                            '--cache', str(cache), '--report-json', str(out)], capture_output=True, text=True, timeout=600)
++                            '--cache', str(cache), '--report-json', str(out)], capture_output=True, text=True, timeout=600,
++                           env=dict(os.environ, XDG_STATE_HOME=self.tmp.name))   # the run writes its log there, not in the state folder of whoever runs the tests
+         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+         rep = ar.load(out)
+         self.assertEqual((rep['jit'], rep['static']['jit_fallback'], rep['static']['functions']), (True, 1, 2)); self.assertNotIn('runtime', rep)
+diff --git a/dm/tools/tests/test_horizon_crash.py b/dm/tools/tests/test_horizon_crash.py
+new file mode 100644
+index 00000000..decf06f8
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_crash.py
+@@ -0,0 +1,279 @@
++"""Host logs and crash reports (horizon_crash.py, NX2Linux issue #23). No game, no Remill, no GPU: a Horizon on a fake guest memory, a fake home folder and a state folder in a temporary directory.
++The point of the reports is that someone can attach one to an issue: the tests look for the fake home folder, the fake user name, the folders of the run, a key file and a package name in every byte written."""
++import io, json, os, subprocess, sys, tempfile, threading, types, unittest, unittest.mock
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE.parent)); sys.path.insert(0, str(HERE))
++import horizon_crash as hc
++import horizon_hle as hh
++from test_horizon_hle import FakeAot
++
++FAKE_USER = 'fakeperson'
++FAKE_HOME = f'/home/{FAKE_USER}'
++MODULES, ROMFS = f'{FAKE_HOME}/games/xc2/modules', f'{FAKE_HOME}/games/xc2/RomFS.img'
++SECRETS = (FAKE_HOME, FAKE_USER, 'games/xc2', 'prod.keys', 'secret-game.nsp', 'RomFS.img')
++
++
++class RunningAot(FakeAot):
++    """A guest that faults as soon as it runs, after making two kernel calls from inside the thread, as a recompiled thread would"""
++    def __init__(self, hz_ref, fault):
++        super().__init__(); self.hz_ref, self.fault = hz_ref, fault
++    def run(self, entry, regs=None, nzcv=0, sp=0, tpidr_el0=0, tpidrro_el0=0, **kw):
++        hz = self.hz_ref[0]
++        for n in range(20): hz.svc(0x1e, [0] * 31, 0x1000 + 4 * n)   # GetSystemTick, 20 times: only the last 16 are kept
++        hz.svc(0x0b, [0] * 31, 0x2000)                                # SleepThread(0)
++        return {'fault': self.fault, 'x29': 0, 'x30': 0x1234}
++
++
++def horizon(fault='guest access at 0xffec90 is outside every mapped region'):
++    ref = []
++    aot = RunningAot(ref, fault)
++    ms = types.SimpleNamespace(aot=aot, modules=[types.SimpleNamespace(name='main', base=0x800000, size=0x400000, exports={})], TLS=0x1000, STOP=0xFFFF0000)
++    hz = hh.Horizon(ms, out=io.StringIO()); ref.append(hz)
++    return hz
++
++
++class Base(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
++        self.state = Path(self.tmp.name) / 'state'; self.out = self.state / 'nx2linux' / 'logs'   # XDG_STATE_HOME and the folder the reports go to
++        self.env = {'HOME': FAKE_HOME, 'USER': FAKE_USER, 'XDG_STATE_HOME': str(self.state), 'NX2LINUX_GPU': '1', 'NX2LINUX_DUMP_FRAME': f'{FAKE_HOME}/frames', 'NX2LINUX_NICK': 'Somebody'}
++        self.saved = (sys.stdout, sys.stderr, sys.excepthook, threading.excepthook)
++        self.addCleanup(self.restore)
++        # Path.home() reads HOME on POSIX: the redactor must see the fake one
++        self.old_home = os.environ.get('HOME'); os.environ['HOME'] = FAKE_HOME; self.addCleanup(self.reset_home)
++
++    def reset_home(self):
++        if self.old_home is None: os.environ.pop('HOME', None)
++        else: os.environ['HOME'] = self.old_home
++
++    def restore(self): sys.stdout, sys.stderr, sys.excepthook, threading.excepthook = self.saved
++
++    def crash(self, **kw):
++        return hc.Crash('0100E95004038000', paths=[(MODULES, '<modules>'), (ROMFS, '<romfs>')], environ=self.env, **kw)
++
++    def assertClean(self, text):
++        for s in SECRETS: self.assertNotIn(s, text)
++
++    def logs(self): return sorted(p.name for p in self.out.iterdir()) if self.out.is_dir() else []
++
++
++class Folders(Base):
++    def test_an_absolute_xdg_state_home_is_used(self):
++        self.assertEqual(hc.logs_dir({'XDG_STATE_HOME': '/var/lib/me'}), Path('/var/lib/me/nx2linux/logs'))
++
++    def test_a_relative_one_is_ignored_like_the_front_end_does(self):
++        self.assertEqual(hc.state_dir({'XDG_STATE_HOME': 'relative/dir'}), Path.home() / '.local/state/nx2linux')
++
++    def test_without_it_the_default_is_under_home(self):
++        self.assertEqual(hc.state_dir({}), Path(FAKE_HOME) / '.local/state/nx2linux')
++
++
++class Redaction(Base):
++    def test_every_personal_thing_goes(self):
++        r = hc.Redactor([(MODULES, '<modules>'), (ROMFS, '<romfs>')], self.env)
++        text = f'{MODULES}/main.manifest.json {ROMFS} {FAKE_HOME}/.cache/nx2linux/aot-cache user {FAKE_USER} /home/someoneelse/x /mnt/disk/secret-game.nsp --keys {FAKE_HOME}/.switch/prod.keys'
++        out = r(text)
++        self.assertClean(out); self.assertNotIn('someoneelse', out)
++        self.assertIn('<modules>/main.manifest.json', out); self.assertIn('<romfs>', out); self.assertIn('~/.cache/nx2linux/aot-cache', out)
++
++    def test_a_word_that_only_contains_the_user_name_stays(self):
++        r = hc.Redactor([], self.env)
++        self.assertEqual(r('fakepersonal and my-fakeperson-x'), 'fakepersonal and my-fakeperson-x')
++
++    def test_the_longest_folder_wins(self):
++        r = hc.Redactor([(MODULES, '<modules>')], self.env)
++        self.assertEqual(r(f'{MODULES}/sdk.elf'), '<modules>/sdk.elf')
++
++
++class Log(Base):
++    def test_the_log_copies_the_console_and_shortens_the_home(self):
++        c = self.crash(); out, err = io.StringIO(), io.StringIO(); sys.stdout, sys.stderr = out, err
++        path = c.start_log()
++        print(f'[profile] modules in {MODULES}', flush=True); print(f'warning from {ROMFS}', file=sys.stderr, flush=True)
++        c.finish()
++        self.assertIn(MODULES, out.getvalue()); self.assertIn(ROMFS, err.getvalue())   # the console is not changed
++        text = path.read_text()
++        self.assertIn('[profile]', text); self.assertClean(text)
++        self.assertEqual((sys.stdout, sys.stderr), (out, err))   # the streams are back
++        self.assertTrue(path.name.startswith('host-0100E95004038000-') and path.name.endswith(f'-{os.getpid()}.log'))
++        self.assertEqual(oct(path.stat().st_mode & 0o777), '0o600'); self.assertEqual(oct(path.parent.stat().st_mode & 0o777), '0o700')
++
++    def test_a_log_that_cannot_be_written_never_reaches_the_run(self):
++        c = self.crash(); sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
++        c.start_log(); c._log.close()
++        print('still running', flush=True)   # the copy fails, the console does not
++        self.assertIn('still running', sys.stdout.console.getvalue())
++
++    def test_rotation_keeps_the_newest_logs_and_touches_nothing_else(self):
++        logs = self.out; logs.mkdir(parents=True)
++        for i in range(5):
++            p = logs / f'host-0100E95004038000-2026110{i + 1}T120000Z-{100 + i}.log'; p.write_text('old'); os.utime(p, (1000 + i, 1000 + i))
++        other = [logs / 'qt-run-abc.log', logs / 'notes.txt', logs / 'host-bad name.log']
++        for p in other: p.write_text('mine')
++        env = dict(self.env, NX2LINUX_LOG_KEEP='3'); c = hc.Crash('0100E95004038000', environ=env); sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
++        c.start_log(); c.finish()
++        names = self.logs()
++        self.assertEqual(sum(n.startswith('host-0100') for n in names), 3)   # the new one and the two newest old ones
++        self.assertNotIn('host-0100E95004038000-20261101T120000Z-100.log', names)
++        for p in other: self.assertTrue(p.exists(), p.name)
++
++
++class Reports(Base):
++    def run_thread(self, hz, crash):
++        crash.attach(hz)
++        t = hh.KThread(hz, 0x800100, 0, 0x300000, 44, 0x5000); t.handle = hz.new_handle(t)
++        t.start(); t.py.join(10)
++        return t
++
++    def test_a_guest_thread_that_faults_leaves_a_readable_report(self):
++        hz = horizon(f'guest access at 0xffec90 in {MODULES}/main.elf for {FAKE_USER} secret-game.nsp prod.keys'); c = self.crash(); sys.stderr = io.StringIO()
++        t = self.run_thread(hz, c)
++        files = sorted((self.out).glob('crash-*.json'))
++        self.assertEqual(len(files), 1, self.logs())
++        text = files[0].read_text(); rep = json.loads(text)
++        self.assertClean(text)
++        self.assertEqual((rep['schema'], rep['kind'], rep['title']), (1, 'guest-fault', '0100E95004038000'))
++        self.assertEqual(rep['thread']['tid'], t.tid); self.assertIn('0xffec90', rep['fault'])
++        self.assertEqual(rep['guest']['pc_or_lr'], '0x1234'); self.assertNotIn('registers', rep['guest'])   # not inside a module, no registers by default
++        mine = next(x for x in rep['threads'] if x['tid'] == t.tid)
++        self.assertEqual(len(mine['last_svcs']), 16)                      # the last 16 of 21 calls
++        self.assertEqual(mine['last_svcs'][-1]['name'], 'SleepThread'); self.assertEqual(mine['last_svcs'][-1]['at'], '0x2000')
++        self.assertEqual(rep['run']['svc_calls']['GetSystemTick'], 20)
++        self.assertEqual(rep['environment']['NX2LINUX_GPU'], '1'); self.assertNotIn('NX2LINUX_NICK', rep['environment'])   # the nickname is a choice of the player
++        self.assertEqual(rep['environment']['NX2LINUX_DUMP_FRAME'], '~/frames')
++        self.assertEqual(oct(files[0].stat().st_mode & 0o777), '0o600')
++
++    def test_an_address_in_a_module_is_written_as_module_and_offset(self):
++        hz = horizon(); c = self.crash(); c.attach(hz)
++        self.assertEqual(c.loc(0x800123), 'main+0x123'); self.assertEqual(c.loc(0x10), '0x10')
++
++    def test_the_names_of_the_game_are_left_out_unless_asked(self):
++        hz = horizon(); c = self.crash(); c.attach(hz)
++        rep = c.build('guest-fault', regs=[0] * 29 + [0, 0x800123])
++        self.assertNotIn('symbol', rep['guest'])
++        c.environ = dict(self.env, NX2LINUX_CRASH_SYMBOLS='1', NX2LINUX_CRASH_REGS='1')
++        rep = c.build('guest-fault', regs=[0] * 29 + [0, 0x800123])
++        self.assertIn('symbol', rep['guest']); self.assertEqual(rep['guest']['registers']['x30'], '0x800123')
++
++    def test_a_run_writes_at_most_five_reports(self):
++        hz = horizon(); c = self.crash(); c.attach(hz); sys.stderr = io.StringIO()
++        paths = [c.report('guest-fault', fault='x') for _ in range(8)]
++        self.assertEqual(len([p for p in paths if p]), hc.MAX_REPORTS)
++        self.assertEqual(len(list((self.out).glob('crash-*.json'))), hc.MAX_REPORTS)
++
++    def test_a_python_exception_in_any_thread_is_a_report(self):
++        hz = horizon(); c = self.crash(); c.attach(hz); sys.stderr = io.StringIO(); c.install_hooks()
++        def boom():
++            raise ValueError(f'cannot read {ROMFS} for {FAKE_USER}')
++        t = threading.Thread(target=boom, name='worker-1'); t.start(); t.join(10)
++        files = sorted((self.out).glob('crash-*.json'))
++        self.assertEqual(len(files), 1)
++        text = files[0].read_text(); rep = json.loads(text)
++        self.assertClean(text)
++        self.assertEqual((rep['kind'], rep['exception']['type'], rep['thread']['name']), ('python-exception', 'ValueError', 'worker-1'))
++        self.assertIn('ValueError', rep['exception']['traceback']); self.assertIn('<romfs>', rep['exception']['traceback'])
++
++    def test_svc_break_is_a_report_before_the_process_ends(self):
++        hz = horizon(); c = self.crash(); c.attach(hz); sys.stderr = io.StringIO()
++        hz.on_break = lambda *a: None   # the real one is os._exit(3)
++        r = [0] * 31; r[0], r[1], r[2] = 0x80000000, 0x1234, 8
++        hz.svc(0x26, r, 0x800010)
++        rep = json.loads(next((self.out).glob('crash-*.json')).read_text())
++        self.assertEqual((rep['kind'], rep['detail']['reason']), ('guest-break', '0x80000000')); self.assertEqual(rep['run']['stop_reason'], 'svcBreak(0x80000000)')
++
++    def test_the_off_switch(self):
++        self.env['NX2LINUX_HOST_LOG'] = '0'
++        self.assertFalse(hc.enabled(self.env))
++        hz = horizon(); c = self.crash(); c.attach(hz)
++        self.assertIsNone(c.report('guest-fault', fault='x')); self.assertFalse(self.state.exists())
++
++    def test_an_unwritable_state_folder_does_not_raise(self):
++        (Path(self.tmp.name) / 'file').write_text('x'); self.env['XDG_STATE_HOME'] = str(Path(self.tmp.name) / 'file')   # a file where the folder should be
++        hz = horizon(); c = self.crash(console=io.StringIO()); c.attach(hz)
++        self.assertIsNone(c.report('guest-fault', fault='x'))
++
++
++class FatalSignals(Base):
++    CHILD = """
++import sys, os
++sys.path.insert(0, {tools!r})
++import horizon_crash as hc
++c = hc.Crash('0100E95004038000', paths=[({modules!r}, '<modules>')], environ=dict(os.environ))
++c.enable_faulthandler()
++if sys.argv[1] == 'clean': c.finish(); print('clean exit')
++else: os.abort()
++"""
++
++    def child(self, mode):
++        env = {k: v for k, v in os.environ.items() if not k.startswith('NX2LINUX_')}
++        env.update(HOME=FAKE_HOME, USER=FAKE_USER, XDG_STATE_HOME=str(self.state))
++        return subprocess.run([sys.executable, '-I', '-c', self.CHILD.format(tools=str(HERE.parent), modules=MODULES), mode], env=env, capture_output=True, text=True, timeout=60)
++
++    def test_a_process_that_dies_of_a_signal_is_turned_into_a_report_by_the_next_run(self):
++        r = self.child('abort'); self.assertEqual(r.returncode, -6, r.stderr)
++        raws = list((self.out).glob('crash-*.raw'))
++        self.assertEqual(len(raws), 1); self.assertGreater(raws[0].stat().st_size, 0)
++        made = hc.convert_raw_dumps(self.out, environ=self.env, redact=hc.Redactor([(MODULES, '<modules>')], self.env))
++        self.assertEqual(len(made), 1)
++        text = made[0].read_text(); rep = json.loads(text)
++        self.assertClean(text)
++        self.assertEqual((rep['kind'], rep['signal'], rep['title']), ('fatal-signal', 'SIGABRT', '0100E95004038000'))
++        self.assertIn('Fatal Python error', rep['native']['summary'])
++        self.assertEqual(list((self.out).glob('crash-*.raw')), [])   # converted, then removed
++
++    def test_a_run_that_ends_on_purpose_leaves_no_raw_file(self):
++        r = self.child('clean'); self.assertEqual(r.returncode, 0, r.stderr); self.assertIn('clean exit', r.stdout)
++        self.assertEqual(list((self.out).glob('crash-*')), [])
++
++    def test_an_empty_raw_file_belongs_to_a_run_that_is_going(self):
++        logs = self.out; logs.mkdir(parents=True)
++        raw = logs / 'crash-0100E95004038000-20261108T120000Z-4242.raw'; raw.write_text('')
++        self.assertEqual(hc.convert_raw_dumps(logs, environ=self.env), []); self.assertTrue(raw.exists())
++
++    def test_a_name_that_is_not_ours_is_left_alone(self):
++        logs = self.out; logs.mkdir(parents=True)
++        other = logs / 'crash-dump.raw'; other.write_text('Fatal Python error: Segmentation fault'); keep = logs / 'crash-x-1.json'; keep.write_text('{}')
++        self.assertEqual(hc.convert_raw_dumps(logs, environ=self.env), []); self.assertTrue(other.exists() and keep.exists())
++
++
++class RunnerWiring(Base):
++    """horizon_run.start_log: what a run does before the game starts"""
++    def start(self, **env):
++        import horizon_run
++        a = types.SimpleNamespace(title='0100E95004038000', modules=MODULES, romfs=ROMFS, cache=f'{FAKE_HOME}/.cache/nx2linux/aot-cache')
++        patched = {**os.environ, **self.env, **env}
++        with unittest.mock.patch.dict(os.environ, patched, clear=True):
++            return horizon_run.start_log(a)
++
++    def test_the_run_starts_a_log_and_a_signal_handler(self):
++        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
++        c = self.start()
++        try:
++            self.assertIsNotNone(c); self.assertTrue(c.log_path.is_file()); self.assertTrue(c.raw_path.is_file())
++            self.assertIn('[host] log:', sys.stdout.console.getvalue())
++        finally: c.finish()
++        self.assertEqual(list(self.out.glob('crash-*.raw')), [])   # ended on purpose: the empty raw file is gone
++
++    def test_a_dump_left_by_a_dead_run_is_reported_at_the_start_of_the_next(self):
++        self.out.mkdir(parents=True)
++        (self.out / 'crash-0100E95004038000-20261101T100000Z-777.raw').write_text(f'Fatal Python error: Segmentation fault\n\nCurrent thread 0x1 (most recent call first):\n  File "{FAKE_HOME}/x.py", line 3\n')
++        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
++        c = self.start()
++        try: self.assertIn('died of a signal', sys.stdout.console.getvalue())
++        finally: c.finish()
++        rep = json.loads((self.out / 'crash-0100E95004038000-20261101T100000Z-777.json').read_text())
++        self.assertEqual(rep['signal'], 'SIGSEGV'); self.assertClean(json.dumps(rep))
++
++    def test_with_the_off_switch_nothing_is_created(self):
++        c = self.start(NX2LINUX_HOST_LOG='0')
++        self.assertIsNone(c); self.assertFalse(self.state.exists())
++
++    def test_a_state_folder_that_cannot_be_written_costs_the_log_only(self):
++        (Path(self.tmp.name) / 'file').write_text('x'); sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
++        self.assertIsNone(self.start(XDG_STATE_HOME=str(Path(self.tmp.name) / 'file')))
++        self.assertIn('no log or crash report', sys.stderr.getvalue())
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/docs/linux/logs-and-crashes.md b/docs/linux/logs-and-crashes.md
+new file mode 100644
+index 00000000..f3117bea
+--- /dev/null
++++ b/docs/linux/logs-and-crashes.md
+@@ -0,0 +1,65 @@
++# Host logs and crash reports
++
++Issue 23. A run of `horizon_run.py` keeps a log and writes a report when it crashes. Both go to the state folder, the one the Qt front end already uses for its own logs:
++
++```
++$XDG_STATE_HOME/nx2linux/logs        when XDG_STATE_HOME is an absolute path
++~/.local/state/nx2linux/logs         otherwise
++```
++
++The code is `engine/dm/tools/horizon_crash.py`. The folder is created with mode 0700 and the files with mode 0600.
++
++## What is written
++
++| File | What it holds | Safe to attach to an issue |
++|---|---|---|
++| `host-<title>-<UTC time>-<pid>.log` | Everything the run prints, on stdout and stderr. Your home folder is shortened to `~` | No, read it first. It is the raw local log and can hold strings the game prints |
++| `crash-<title>-<UTC time>-<pid>.json` | One report per crash, up to 5 for a run (`-2`, `-3`... after the first) | Yes, it is made for that |
++| `crash-<title>-<UTC time>-<pid>.raw` | What Python's faulthandler wrote when the process died of a signal | No, but the next run turns it into a `.json` report and removes it |
++
++The console does not change. The log is a copy.
++
++## The kinds of report
++
++| `kind` | When |
++|---|---|
++| `guest-fault` | A guest thread stopped on a fault, for example an access to an address no region covers |
++| `boot-fault` | The boot sequence (`nn::init::Start` and `nnMain`) faulted |
++| `guest-break` | The game called `svcBreak`, which is how a failed assertion ends. The host exits right after |
++| `python-exception` | The host itself raised and nobody caught it, in the main thread or in any other |
++| `fatal-signal` | The process died of SIGBUS, SIGILL, SIGABRT or SIGFPE, or of SIGSEGV before the first guest thread ran |
++
++## What a report holds
++
++- The schema version, the kind, the UTC time, the process id, the title id, the seconds since the run started.
++- The host: Python version, system, kernel, machine, CPU count, number of engine patches.
++- The fault text, the guest thread, and the call chain as `module+offset` (for example `main+0x1a2b3c`).
++- For each guest thread, its last 16 kernel calls with the address of the call and how long ago it was, and the count of every kernel call of the run.
++- The `NX2LINUX_*` and `AOT_*` variables in the environment, with the values redacted. `NX2LINUX_NICK` is left out.
++- The GPU name when the GPU renders.
++
++## What a report does not hold
++
++- No path of yours. The home folder becomes `~`, the folders given with `--modules`, `--romfs` and `--cache` become `<modules>`, `<romfs>` and `<cache>`, the engine folder becomes `<engine>`, any other `/home/<name>` becomes `~`.
++- No user name, no key file name (anything ending in `.keys`) and no package name (`.nsp`, `.xci`, `.nsz`, `.xcz`).
++- No memory of the game and no register values, unless you ask.
++- No name of a function of the game. The addresses are `module+offset`.
++
++Three switches add detail when you want it for yourself: `NX2LINUX_CRASH_REGS=1` adds x0 to x30, `NX2LINUX_CRASH_SYMBOLS=1` adds the nearest function name of the game, and `NX2LINUX_CRASH_FAULTHANDLER=0` turns off the signal handler (below). The two first make a report that is no longer free of game data, so read it before you share it.
++
++## Switches
++
++| Variable | Effect |
++|---|---|
++| `NX2LINUX_HOST_LOG=0` | No log and no report |
++| `NX2LINUX_LOG_KEEP=<n>` | How many host logs to keep, 20 by default. Only files named `host-*.log` are ever removed. Crash reports are kept up to 50 |
++| `NX2LINUX_CRASH_REGS=1` | Add the registers to a report |
++| `NX2LINUX_CRASH_SYMBOLS=1` | Add the function name of the game next to the address |
++| `NX2LINUX_CRASH_FAULTHANDLER=0` | Do not install the signal handler |
++
++## Limits
++
++- The AOT runtime installs its own SIGSEGV handler when a guest thread first runs. For a fault that is not a guest access it restores the default action. A SEGV inside a host library after that point ends the process with no raw dump, and the shell reports the exit status 139. The other fatal signals are caught. Chaining the runtime's handler to the previous one would close the gap. It changes `aot_runtime.cpp` and it is not known whether that forces a rebuild of the cache, so it is left out.
++- The report cannot say what the game was doing in its own terms. It gives addresses and the last kernel calls of each thread.
++- A host that is killed by SIGKILL, or that loses power, leaves nothing.
++- The state folder must be writable. If it is not, the run goes on and says so once, with no log.
