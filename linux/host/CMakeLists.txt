@@ -111,6 +111,12 @@ if(BUILD_TESTING)
     target_link_libraries(nx2linux_sync_test PRIVATE nx2linux_sync pthread)
     add_test(NAME nx2linux_sync COMMAND nx2linux_sync_test)
 
+    add_executable(nx2linux_presentmode_test tests/test_presentmode.c)
+    target_compile_features(nx2linux_presentmode_test PRIVATE c_std_11)
+    target_compile_options(nx2linux_presentmode_test PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(nx2linux_presentmode_test PRIVATE nx2linux_gpu)
+    add_test(NAME nx2linux_presentmode COMMAND nx2linux_presentmode_test)
+
     add_executable(nx2linux_vulkan_test tests/test_vulkan_renderer.c)
     target_compile_features(nx2linux_vulkan_test PRIVATE c_std_11)
     target_compile_options(nx2linux_vulkan_test PRIVATE -Wall -Wextra -Wpedantic)

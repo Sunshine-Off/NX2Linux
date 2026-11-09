@@ -71,3 +71,7 @@
 0129-linux-host-aot-group-n-compiles-about-n-lifted-f.patch
 0130-linux-host-the-validator-counts-a-misaligned-exc.patch
 0131-linux-host-a-hook-for-svc-handlers-in-c-and-the.patch
+0132-linux-host-arbitratelock-arbitrateunlock.patch
+0133-linux-host-nx2linux-frame-marks-prints-the-frame.patch
+0134-linux-host-count-what-the-mutex-and-key-calls-di.patch
+0135-linux-host-the-library-tests-skip-a-libnx2linux.patch

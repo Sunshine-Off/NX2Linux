@@ -773,6 +773,21 @@ static void window_drop_swapchain(void)
     if (W.sc) { vkDeviceWaitIdle(G.dev); vkDestroySwapchainKHR(G.dev, W.sc, NULL); W.sc = VK_NULL_HANDLE; }
 }
 
+/* The present mode. FIFO (what the display refresh paces, and the one every driver has) unless NX2LINUX_PRESENT_MODE names another that the surface supports: fifo, relaxed, mailbox or immediate.
+ * It exists to tell whether the display's pacing is what limits the frame rate of a run: a measurement with `immediate` shows what a run does without it. Never the default.
+ * have: the modes the surface reports (VkPresentModeKHR values: immediate 0, mailbox 1, fifo 2, fifo relaxed 3). Returns the mode to use, and in *used the name of what was chosen and why. */
+int nx2gpu_pick_present_mode(const char *want, const int *have, int n, const char **used)
+{
+    static const struct { const char *name; int mode; } known[] = { { "fifo", 2 }, { "relaxed", 3 }, { "mailbox", 1 }, { "immediate", 0 } };
+    if (!want || !*want) { *used = "fifo"; return 2; }
+    for (unsigned k = 0; k < sizeof known / sizeof known[0]; k++) {
+        if (strcmp(want, known[k].name)) continue;
+        for (int i = 0; i < n; i++) if (have[i] == known[k].mode) { *used = known[k].name; return known[k].mode; }
+        *used = "fifo (the surface does not support the mode asked for)"; return 2;
+    }
+    *used = "fifo (NX2LINUX_PRESENT_MODE is not fifo, relaxed, mailbox or immediate)"; return 2;
+}
+
 static int window_make_swapchain(int srgb)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -786,10 +801,17 @@ static int window_make_swapchain(int srgb)
     if (pick.format == VK_FORMAT_UNDEFINED) { snprintf(G.err, sizeof G.err, "the surface has no 8-bit format"); return -1; }
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == 0xFFFFFFFFu) { ext.width = 1280; ext.height = 720; }
+    uint32_t npm = 0; VkPresentModeKHR modes[8]; int have[8];
+    vkGetPhysicalDeviceSurfacePresentModesKHR(G.phys, W.surface, &npm, NULL); if (npm > 8) npm = 8;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(G.phys, W.surface, &npm, modes);
+    for (uint32_t i = 0; i < npm; i++) have[i] = (int)modes[i];
+    const char *mode_used = NULL; const char *asked = getenv("NX2LINUX_PRESENT_MODE");
+    VkPresentModeKHR present_mode = (VkPresentModeKHR)nx2gpu_pick_present_mode(asked, have, (int)npm, &mode_used);
+    if (asked && *asked) fprintf(stderr, "[gpu] present mode: %s\n", mode_used);
     window_drop_swapchain();
     VkSwapchainCreateInfoKHR ci = { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = W.surface, .minImageCount = caps.minImageCount + 1 > 8 ? 8 : caps.minImageCount + 1, .imageFormat = pick.format, .imageColorSpace = pick.colorSpace,
                                     .imageExtent = ext, .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                                    .preTransform = caps.currentTransform, .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE };
+                                    .preTransform = caps.currentTransform, .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode, .clipped = VK_TRUE };
     if (ci.minImageCount > caps.maxImageCount && caps.maxImageCount) ci.minImageCount = caps.maxImageCount;
     VK(vkCreateSwapchainKHR(G.dev, &ci, NULL, &W.sc));
     W.nimg = 8; VK(vkGetSwapchainImagesKHR(G.dev, W.sc, &W.nimg, W.imgs));

@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 8 Nov 2026 14:25:08 +0100
+Subject: [PATCH] Linux host: count what the mutex and key calls did, on the
+ Python path and in C (#19)
+
+lock_queued, lock_returned_at_once, unlock_handed_over, unlock_no_waiter,
+wait_release_handed_over, wait_signalled, wait_timed_out, relock_queued,
+signal_woke, signal_nobody. The report prints them as 'sync detail'. Both
+paths count the same way and the differential tests require equal counts.
+This is to find out why ArbitrateLock and ArbitrateUnlock have a different
+ratio with the native path on Xenoblade 2 (cause unknown).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: Count what the mutex and key kernel calls did on both paths, to explain a different lock/unlock ratio with the native path
+Issue: Sunshine-Off/NX2Linux#19
+
+---
+ dm/tools/horizon_hle.py             | 34 ++++++++++++++++++++++++-----
+ dm/tools/horizon_run.py             |  1 +
+ dm/tools/horizon_sync.py            |  8 ++++++-
+ dm/tools/tests/test_horizon_sync.py | 17 ++++++++++++++-
+ 4 files changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/dm/tools/horizon_hle.py b/dm/tools/horizon_hle.py
+index a1a44305..65baed82 100644
+--- a/dm/tools/horizon_hle.py
++++ b/dm/tools/horizon_hle.py
+@@ -426,7 +426,24 @@ class Horizon:
+     LISTENERS = 0x40000000   # a Horizon mutex word: the owner's handle, plus this bit while threads wait for it
+     THREAD_REGIONS = 0x7_0000_0000
+ 
++    DETAIL = ('lock_queued', 'lock_returned_at_once', 'unlock_handed_over', 'unlock_no_waiter', 'wait_release_handed_over', 'wait_signalled', 'wait_timed_out', 'relock_queued', 'signal_woke', 'signal_nobody')
++
++    def detail(self, name, n=1):
++        """What the four calls on mutex words and keys did, counted the same way here and in the C library (horizon_sync.py): lock_queued / lock_returned_at_once (ArbitrateLock slept, or found the word changed),
++        unlock_handed_over / unlock_no_waiter (ArbitrateUnlock gave the mutex to a waiter, or found none), wait_release_handed_over (the mutex a WaitProcessWideKeyAtomic let go went to a waiter), wait_signalled /
++        wait_timed_out, relock_queued (the mutex was taken when the wait ended, after sleeping for it), signal_woke (waiters woken, in all) / signal_nobody. The report prints them for the run: when the two paths
++        differ in what the game does with them, this says how. Called with the kernel lock held"""
++        self.sync_detail[name] = self.sync_detail.get(name, 0) + n
++
++    def sync_detail_total(self):
++        """The counts of the run: Python's, plus the library's when the calls ran in C (never both for one call)"""
++        out = dict(self.sync_detail)
++        if self.native:
++            for k, v in self.native.detail().items(): out[k] = out.get(k, 0) + v
++        return {k: out[k] for k in self.DETAIL if out.get(k)}
++
+     def _init_kernel(self):
++        self.sync_detail = {}
+         self.cv = KernelLock()
+         self.svc_prof_depth = int(os.environ.get('NX2LINUX_SVC_PROFILE_DEPTH', '5'))
+         self.svc_prof_min = float(os.environ.get('NX2LINUX_SVC_PROFILE_MIN', '0.0005'))   # seconds
+@@ -549,12 +566,14 @@ class Horizon:
+         (a thread setting the listeners bit, another releasing), so every update here is one too: a plain write could undo theirs and leave the mutex held by nobody"""
+         q = self.mutex_waiters.get(addr)
+         t = q.pop(0) if q else None
++        handed = t is not None
+         new = (t.tag | (self.LISTENERS if q else 0)) if t else 0
+         while True:
+             v = self.rd32(addr)
+             if self.cas32(addr, v, new) == v: break
+         if t:
+             t.granted = True; t.wake.set()
++        return handed
+ 
+     def _lock(self, addr, tag, owner=None):
+         """Take the mutex word, or wait until an unlock hands it to this thread (caller holds self.cv)"""
+@@ -569,6 +588,7 @@ class Horizon:
+                 if self.cas32(addr, v, v | self.LISTENERS) != v: continue
+             me.granted, me.tag = False, tag
+             self.mutex_waiters.setdefault(addr, []).append(me)
++            self.detail('relock_queued')
+             while not me.granted: self.park(me)
+             return
+ 
+@@ -576,15 +596,16 @@ class Horizon:
+         owner, addr, tag = r[0] & 0xFFFFFFFF, r[1], r[2] & 0xFFFFFFFF
+         with self.cv:
+             v = self.rd32(addr)
+-            if v != (owner | self.LISTENERS): r[0] = OK; return
++            if v != (owner | self.LISTENERS): self.detail('lock_returned_at_once'); r[0] = OK; return
+             me = self.current() or self.main_thread_obj
+             me.granted, me.tag = False, tag
+             self.mutex_waiters.setdefault(addr, []).append(me)
++            self.detail('lock_queued')
+             while not me.granted: self.park(me)
+         r[0] = OK
+ 
+     def svc_ArbitrateUnlock(self, r):
+-        with self.cv: self._unlock(r[0])
++        with self.cv: self.detail('unlock_handed_over' if self._unlock(r[0]) else 'unlock_no_waiter')
+         r[0] = OK
+ 
+     def svc_WaitProcessWideKeyAtomic(self, r):   # (mutex addr, key addr, tag, timeout): release the mutex, wait for the key, take the mutex again
+@@ -592,15 +613,16 @@ class Horizon:
+         deadline = None if timeout >= (1 << 63) else time.monotonic() + timeout / 1e9
+         me = self.current() or self.main_thread_obj
+         with self.cv:
+-            self._unlock(mutex)
++            if self._unlock(mutex): self.detail('wait_release_handed_over')
+             me.signaled = False
+             self.key_waiters.setdefault(key, []).append(me)
+             result = OK
+             while not me.signaled:
+                 if deadline is not None and time.monotonic() >= deadline:
+                     if me in self.key_waiters.get(key, []): self.key_waiters[key].remove(me)
+-                    result = R_TIMEOUT; break
++                    result = R_TIMEOUT; self.detail('wait_timed_out'); break
+                 self.park(me, None if deadline is None else max(0.0, deadline - time.monotonic()))
++            if result == OK: self.detail('wait_signalled')
+             self._lock(mutex, tag)
+         r[0] = result
+ 
+@@ -609,8 +631,10 @@ class Horizon:
+         if count >= 0x80000000: count = 0
+         with self.cv:
+             q = self.key_waiters.get(key, [])
+-            for t in (q[:] if count == 0 else q[:count]):
++            woken = q[:] if count == 0 else q[:count]
++            for t in woken:
+                 q.remove(t); t.signaled = True; t.wake.set()
++            self.detail('signal_woke', len(woken)) if woken else self.detail('signal_nobody')
+         r[0] = OK
+ 
+     def svc_CreateThread(self, r):   # (entry, arg, stack top, priority, core) -> handle
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index c050e8bd..b43758e1 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -91,6 +91,7 @@ def main():
+     import threading
+     def report():
+         if hz.native: hz.native.pull_stats()   # the calls made in C join the counts of hz.stats
++        print('sync detail:', hz.sync_detail_total(), flush=True)
+         print('frames presented:', getattr(hz, 'frames_presented', 0), '| svc calls:', hz.stats, '| not translated functions called:', hz.aot.stat('unlifted_calls'))
+         if hasattr(hz, 'nvn'): hz.nvn.pull_stats()
+         hz.svc_profile_report()
+diff --git a/dm/tools/horizon_sync.py b/dm/tools/horizon_sync.py
+index d7956993..04ef6951 100644
+--- a/dm/tools/horizon_sync.py
++++ b/dm/tools/horizon_sync.py
+@@ -11,7 +11,7 @@ from pathlib import Path
+ 
+ from horizon_hle import SVC_NAMES
+ 
+-ABI = 2
++ABI = 3
+ CALLS = tuple(range(0x1a, 0x1e))   # the svc numbers the library takes over: ArbitrateLock, ArbitrateUnlock, WaitProcessWideKeyAtomic, SignalProcessWideKey
+ 
+ 
+@@ -40,6 +40,7 @@ class Native:
+         lib.nx2sync_last.argtypes = [C.c_uint32, C.POINTER(Last)]; lib.nx2sync_last.restype = C.c_int
+         lib.nx2sync_recent.argtypes = [C.c_uint32, C.POINTER(Call), C.c_int]; lib.nx2sync_recent.restype = C.c_int
+         lib.nx2sync_waiters.argtypes = [C.c_int, C.c_uint64]; lib.nx2sync_waiters.restype = C.c_int
++        lib.nx2sync_detail.argtypes = [C.c_int]; lib.nx2sync_detail.restype = C.c_uint64
+         lib.nx2sync_bind.argtypes = [C.c_uint32, C.c_uint32]; lib.nx2sync_bind.restype = C.c_int
+         lib.nx2sync_current.argtypes = []; lib.nx2sync_current.restype = C.c_uint32
+         lib.nx2sync_handles.argtypes = [C.c_int]; lib.nx2sync_handles.restype = C.c_int
+@@ -50,6 +51,11 @@ class Native:
+         t = thread or self.hz.main_thread_obj
+         self.lib.nx2sync_bind(t.tid, getattr(t, 'handle', 0) or 0)
+ 
++    def detail(self):
++        """What the calls made in C did, by the names of Horizon.DETAIL: {name: count}, only the non-zero ones"""
++        from horizon_hle import Horizon
++        return {name: n for i, name in enumerate(Horizon.DETAIL) if (n := self.lib.nx2sync_detail(i))}
++
+     def pull_stats(self):
+         """Add the calls made in C since the last time to hz.stats, where Horizon.svc counts the others (the report prints them)"""
+         names = SVC_NAMES
+diff --git a/dm/tools/tests/test_horizon_sync.py b/dm/tools/tests/test_horizon_sync.py
+index 9a9f4863..4e14a190 100644
+--- a/dm/tools/tests/test_horizon_sync.py
++++ b/dm/tools/tests/test_horizon_sync.py
+@@ -159,6 +159,7 @@ class PyImpl:
+         self.hz.svc(num, r, 0x4000 + num)
+         return r[0]
+     def waiters(self, on_key, addr): return len((self.hz.key_waiters if on_key else self.hz.mutex_waiters).get(addr, []))
++    def detail(self): return self.hz.sync_detail_total()
+     def close(self): pass
+ 
+ 
+@@ -175,6 +176,8 @@ class CImpl:
+         self.lib.nx2sync_bind.argtypes = [C.c_uint32, C.c_uint32]
+         self.lib.nx2sync_waiters.argtypes = [C.c_int, C.c_uint64]
+         self.ids = {}
++        self.lib.nx2sync_detail.argtypes = [C.c_int]; self.lib.nx2sync_detail.restype = C.c_uint64
++        self.base = [self.lib.nx2sync_detail(i) for i in range(len(hh.Horizon.DETAIL))]   # the library's counts go on from one test to the next
+     def _peek(self, a, d, n):
+         try: data = self.mem.peek(a, n)
+         except AssertionError: return 1
+@@ -186,6 +189,7 @@ class CImpl:
+         assert self.lib.nx2sync_svc(num, r, 0x4000 + num, None) == 1
+         return r[0]
+     def waiters(self, on_key, addr): return self.lib.nx2sync_waiters(on_key, addr)
++    def detail(self): return {n: d for i, n in enumerate(hh.Horizon.DETAIL) if (d := self.lib.nx2sync_detail(i) - self.base[i])}
+     def close(self): pass
+ 
+ 
+@@ -340,7 +344,7 @@ SCENARIOS = (scenario_no_waiters, scenario_timeouts, scenario_signal_order, scen
+ class Differential(unittest.TestCase):
+     def run_on(self, cls, scenario):
+         impl = cls(Mem())
+-        try: return scenario(impl)
++        try: return scenario(impl) + [('what the calls did', impl.detail())]
+         finally: impl.close()
+ 
+     def test_every_scenario_gives_the_same_answers_and_words_as_python(self):
+@@ -350,6 +354,17 @@ class Differential(unittest.TestCase):
+                 self.assertEqual(c, py)
+                 self.assertTrue(py)
+ 
++    def test_what_the_calls_did_is_counted_alike(self):
++        want = {scenario_no_waiters: {'unlock_no_waiter': 1, 'lock_returned_at_once': 1, 'signal_nobody': 1},
++                scenario_timeouts: {'wait_timed_out': 2},
++                scenario_signal_order: {'wait_signalled': 4, 'signal_woke': 4},
++                scenario_handoff: {'lock_queued': 2, 'unlock_handed_over': 2, 'unlock_no_waiter': 1}}
++        for sc, expected in want.items():
++            for cls in (PyImpl, CImpl):
++                with self.subTest(sc.__name__, impl=cls.name):
++                    label, got = self.run_on(cls, sc)[-1]; self.assertEqual(label, 'what the calls did')
++                    for k, v in expected.items(): self.assertEqual(got.get(k), v, f'{k}: {got}')
++
+     def test_the_scenarios_are_not_empty_promises(self):
+         r = self.run_on(CImpl, scenario_no_waiters)
+         self.assertIn(('unlock invalid', 0xCC01), r); self.assertIn(('wait invalid', 0xCC01), r)
