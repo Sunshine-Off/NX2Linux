@@ -1,0 +1,678 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Mon, 9 Nov 2026 19:47:50 +0100
+Subject: [PATCH] Linux host: a clean shutdown on SIGINT and SIGTERM, a soak
+ log and a stall report (#22)
+
+The run ended with os._exit(0) after a timer and a signal killed it with no
+report. Now the end of the run, SIGINT and SIGTERM run the same ordered steps
+(drain the GPU queue, report, close the mixer, last soak line), each with a time
+limit, and leave with 0 or 128 plus the signal. The signal reaches a thread of
+its own through a wake up descriptor, because the main thread is inside game
+code most of the time. A second signal leaves at once.
+
+NX2LINUX_SOAK_LOG=FILE writes the resident memory, threads, open files, frames
+and the rate every 10 s. NX2LINUX_STALL_SECONDS=N reports once, with where the
+guest threads are, when no frame was presented for N s after the first one. Both
+are off unless set. tools/soak_summary.py reads the file.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: A run stops with a report on SIGINT and SIGTERM, and a long run leaves a log of its memory, threads and frames
+Issue: Sunshine-Off/NX2Linux#22
+
+---
+ dm/tools/horizon_run.py                     |  12 +-
+ dm/tools/horizon_shutdown.py                |  96 +++++++++++
+ dm/tools/horizon_soak.py                    | 111 +++++++++++++
+ dm/tools/tests/test_horizon_run_shutdown.py |  24 +++
+ dm/tools/tests/test_horizon_shutdown.py     | 170 ++++++++++++++++++++
+ dm/tools/tests/test_horizon_soak.py         | 169 +++++++++++++++++++
+ 6 files changed, 578 insertions(+), 4 deletions(-)
+ create mode 100644 dm/tools/horizon_shutdown.py
+ create mode 100644 dm/tools/horizon_soak.py
+ create mode 100644 dm/tools/tests/test_horizon_run_shutdown.py
+ create mode 100644 dm/tools/tests/test_horizon_shutdown.py
+ create mode 100644 dm/tools/tests/test_horizon_soak.py
+
+diff --git a/dm/tools/horizon_run.py b/dm/tools/horizon_run.py
+index b43758e1..9c146b17 100644
+--- a/dm/tools/horizon_run.py
++++ b/dm/tools/horizon_run.py
+@@ -3,6 +3,7 @@
+ Usage: horizon_run.py [--jit] [--report-json FILE] --modules <dir with <name>.manifest.json> --romfs <RomFS.img> --title <id> [--display|--hidden] [--seconds N] [--order a,b,c] [--cache DIR]
+ The game's constants and workarounds come from its profile folder (dm/games/<id>/, see horizon_game.py); a title with none runs on generic defaults and the run says so.
+ NX2LINUX_FRAME_MARKS=30,110 prints the frames presented so far at those seconds of the run (tools/ab_bench.py reads them).
++The end of the run, SIGINT and SIGTERM stop it the same way: the report, then exit code 0 or 128 plus the signal (horizon_shutdown.py). NX2LINUX_SOAK_LOG=FILE and NX2LINUX_STALL_SECONDS=N watch a long run (horizon_soak.py).
+ Needs REMILL_BUILD (the lifter) for functions not in the cache, and DYNARMIC_DIR with --jit (both: tools/setup_toolchain.sh writes an env.sh). The window needs linux/host built (libnx2linux_display.so, see horizon_display.py)."""
+ import argparse, os, sys, threading, time
+ from pathlib import Path
+@@ -10,7 +11,7 @@ from pathlib import Path
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
+ import aot_lift
+ import elf_module as em
+-import horizon_hle, horizon_overrides
++import horizon_hle, horizon_overrides, horizon_shutdown, horizon_soak
+ 
+ 
+ def parse_marks(text):
+@@ -107,12 +108,15 @@ def main():
+         print('calls that make memory executable (SetMemoryPermission with X, code memory):', hz.code_summary()['counts'] or 'none', flush=True)
+         import aot_report
+         write_report(aot_report.runtime_counters(hz.aot), time.time() - started)
++    sd = horizon_shutdown.Shutdown()   # the end of the run and SIGINT and SIGTERM stop the same way (issue 22)
++    horizon_shutdown.standard_steps(sd, hz, report)
++    soak = horizon_soak.from_env(hz)
++    if soak: sd.add('soak log', soak.final_row, 2.0)
+     def stop():
+-        print(f'[run] {a.seconds:.0f} s elapsed: stopping', flush=True); report()
+-        if hasattr(hz, 'audio') and hz.audio.mixer: hz.audio.mixer.close()   # a WAV file gets its final header
+-        os._exit(0)
++        print(f'[run] {a.seconds:.0f} s elapsed: stopping', flush=True); sd.run('end of the run', 0)
+     started = time.time()
+     threading.Timer(a.seconds, stop).start()
++    horizon_shutdown.Signals(sd).install()
+     schedule_frame_marks(hz, parse_marks(os.environ.get('NX2LINUX_FRAME_MARKS', '')))
+     r = hz.boot()
+     print('result', {k: (hex(v) if isinstance(v, int) else v) for k, v in r.items() if k in ('fault', 'x0', 'step')})
+diff --git a/dm/tools/horizon_shutdown.py b/dm/tools/horizon_shutdown.py
+new file mode 100644
+index 00000000..768a1147
+--- /dev/null
++++ b/dm/tools/horizon_shutdown.py
+@@ -0,0 +1,96 @@
++"""Clean shutdown of a run on Linux (issue 22): the end of the run, SIGINT and SIGTERM all stop the same way.
++Until now the run ended with os._exit(0) after a timer and a signal killed it without a report. Now every way out runs the same ordered steps, each with its own time limit: drain the GPU queue, print the report, close the audio mixer. A step that blocks or fails does not stop the others, and the run says which one did.
++The exit code is 0 at the end of the run and 128 plus the signal number after a signal (130 for Ctrl-C, 143 for SIGTERM). A second signal while the shutdown runs leaves at once.
++A signal reaches the main thread only between two Python instructions, and the main thread of a run is inside recompiled game code most of the time. So the C handler writes the signal number to a pipe (signal.set_wakeup_fd) and a thread reads it: the shutdown does not wait for the main thread."""
++import os, signal, threading, time
++
++SIGNALS = tuple(s for s in (getattr(signal, 'SIGINT', None), getattr(signal, 'SIGTERM', None)) if s is not None)
++
++
++class Shutdown:
++    """Ordered steps, run once. `exit_fn` ends the process (os._exit, a fake in the tests)"""
++
++    def __init__(self, say=print, exit_fn=os._exit, clock=time.monotonic):
++        self.steps, self.say, self.exit_fn, self.clock = [], say, exit_fn, clock
++        self.lock, self.began, self.results = threading.Lock(), None, []
++
++    def add(self, name, fn, timeout=5.0):
++        """A step. Steps run in the order they were added, each in its own thread, and one that is not back after `timeout` seconds is left behind"""
++        self.steps.append((name, fn, timeout))
++
++    def running(self):
++        return self.began is not None
++
++    def run(self, reason, code=0):
++        """Runs the steps, then ends the process with `code`. Returns False without doing anything if a shutdown is already running"""
++        with self.lock:
++            if self.began is not None: return False
++            self.began = self.clock()
++        self.say(f'[shutdown] {reason}: stopping', flush=True)
++        for name, fn, timeout in self.steps:
++            outcome = self.step(fn, timeout); self.results.append((name, outcome))
++            self.say(f'[shutdown] {name}: {outcome}', flush=True)
++        self.say(f'[shutdown] done in {self.clock() - self.began:.1f} s, exit code {code}', flush=True)
++        self.exit_fn(code)
++        return True
++
++    def step(self, fn, timeout):
++        box = {}
++        def target():
++            try: fn(); box['r'] = 'ok'
++            except BaseException as e: box['r'] = f'failed: {type(e).__name__}: {e}'
++        t = threading.Thread(target=target, name='shutdown-step', daemon=True); t.start(); t.join(timeout)
++        return box.get('r') or f'still running after {timeout:g} s, left behind'
++
++    def force(self, code):
++        self.say('[shutdown] second signal: leaving now', flush=True)
++        self.exit_fn(code)
++
++
++class Signals:
++    """SIGINT and SIGTERM start the shutdown with the code 128 plus the signal number, from a thread of our own"""
++
++    def __init__(self, sd, sigs=SIGNALS):
++        self.sd, self.sigs, self.old, self.old_fd, self.rfd, self.wfd, self.thread = sd, sigs, {}, -1, -1, -1, None
++
++    def install(self):
++        """Needs the main thread (Python allows signal handlers nowhere else). Returns False and changes nothing from another thread"""
++        if threading.current_thread() is not threading.main_thread(): return False
++        self.rfd, self.wfd = os.pipe(); os.set_blocking(self.wfd, False)
++        self.old_fd = signal.set_wakeup_fd(self.wfd, warn_on_full_buffer=False)
++        for s in self.sigs: self.old[s] = signal.signal(s, lambda *a: None)   # the C handler is what writes to the pipe, this Python one has nothing to do
++        self.thread = threading.Thread(target=self.watch, name='shutdown-signals', daemon=True); self.thread.start()
++        return True
++
++    def watch(self):
++        while True:
++            try: data = os.read(self.rfd, 16)
++            except OSError: return
++            if not data: return
++            for b in data:
++                if b in self.sigs: self.deliver(b)
++
++    def deliver(self, signum):
++        code = 128 + signum
++        if self.sd.running(): self.sd.force(code)
++        else: threading.Thread(target=self.sd.run, args=(f'signal {signal.Signals(signum).name}', code), name='shutdown', daemon=True).start()
++
++    def uninstall(self):
++        for s, h in self.old.items(): signal.signal(s, h)
++        if self.wfd >= 0:
++            signal.set_wakeup_fd(self.old_fd)
++            os.close(self.wfd)   # the end of the pipe ends watch()
++            if self.thread is not None: self.thread.join(2)
++            os.close(self.rfd); self.rfd = self.wfd = -1
++        self.old = {}
++
++
++def standard_steps(sd, hz, report, mixer_timeout=5.0):
++    """What a run of the host stops, in this order: the GPU queue drains so that the report counts the last frames, the report, then the mixer (a WAV file gets its final header)"""
++    def drain():
++        nvn = getattr(hz, 'nvn', None)
++        if nvn is not None and getattr(nvn, 'jobs', None) is not None: nvn.drain()
++    def close_mixer():
++        audio = getattr(hz, 'audio', None)
++        if audio is not None and getattr(audio, 'mixer', None): audio.mixer.close()
++    sd.add('gpu queue drain', drain, 5.0); sd.add('report', report, 30.0); sd.add('audio mixer', close_mixer, mixer_timeout)
+diff --git a/dm/tools/horizon_soak.py b/dm/tools/horizon_soak.py
+new file mode 100644
+index 00000000..9e638b41
+--- /dev/null
++++ b/dm/tools/horizon_soak.py
+@@ -0,0 +1,111 @@
++"""Long run sampler and stall detector for the Linux host (issue 22).
++NX2LINUX_SOAK_LOG=FILE appends one line to FILE every NX2LINUX_SOAK_INTERVAL seconds (10 by default, at least 1): the time into the run, the resident memory, the threads and open files of the process, the frames presented, the frame rate since the last line, the seconds since the last new frame, the guest threads that stopped and whether a stall is on. The file is written as it goes and flushed, so a run that dies (killed, out of memory) leaves everything up to its last line. tools/soak_summary.py reads it.
++NX2LINUX_STALL_SECONDS=N reports a stall when no new frame was presented for N seconds, once the first frame exists (loading before it is never a stall): one `[stall]` message with where the guest threads are (Horizon.thread_report), once per stall, again after the frames resumed and stopped again. It reports and does not stop the run. 0 or unset turns it off.
++Off unless one of the two is set. A frame is seen when the sampler wakes up, once per second, so a stall is noticed up to a second late."""
++import os, threading, time
++
++COLUMNS = ('t_s', 'rss_kb', 'threads', 'fds', 'frames', 'fps', 'idle_s', 'thread_faults', 'stall')
++
++
++def read_proc(root='/proc/self'):
++    """(resident kB, threads, open files) of this process, None for what /proc does not say (no /proc: all None)"""
++    rss = threads = fds = None
++    try:
++        with open(f'{root}/status') as f:
++            for line in f:
++                if line.startswith('VmRSS:'): rss = int(line.split()[1])
++                elif line.startswith('Threads:'): threads = int(line.split()[1])
++    except (OSError, ValueError, IndexError): pass
++    try: fds = len(os.listdir(f'{root}/fd'))
++    except OSError: pass
++    return rss, threads, fds
++
++
++class Soak:
++    def __init__(self, hz, path=None, interval=10.0, stall_after=0.0, tick=1.0, clock=time.monotonic, proc=read_proc, say=print):
++        self.hz, self.path, self.interval, self.stall_after, self.tick = hz, path, max(interval, 0.0), stall_after, tick
++        self.clock, self.proc, self.say = clock, proc, say
++        self.t0 = clock(); self.last_frames, self.last_change = -1, self.t0
++        self.row_t, self.row_frames = None, 0
++        self.stalled, self.stalls, self.file, self.stop_ev, self.thread = False, 0, None, threading.Event(), None
++        if path: self.open()
++
++    def open(self):
++        try:
++            fresh = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
++            self.file = open(self.path, 'a')
++            if fresh: self.file.write(','.join(COLUMNS) + '\n'); self.file.flush()
++        except OSError as e:
++            self.say(f'[soak] cannot write {self.path}: {e}: no soak log', flush=True); self.file = None
++
++    def frames(self): return getattr(self.hz, 'frames_presented', 0)
++
++    def step(self, now=None):
++        """One wake up: look for a stall, write a line when one is due"""
++        now = self.clock() if now is None else now
++        frames = self.frames()
++        if frames != self.last_frames:
++            if self.stalled: self.say(f'[stall] frames again after {now - self.last_change:.0f} s without one (now {frames})', flush=True)
++            self.last_frames, self.last_change, self.stalled = frames, now, False
++        idle = now - self.last_change
++        began = False
++        if self.stall_after > 0 and frames > 0 and idle >= self.stall_after and not self.stalled:
++            self.stalled, began = True, True; self.stalls += 1
++            self.say(f'[stall] no frame presented for {idle:.0f} s (frames so far {frames}). Guest threads:\n{self.where()}', flush=True)
++        if self.file and (began or self.row_t is None or now - self.row_t >= self.interval): self.row(now, frames, idle)
++
++    def where(self):
++        try: return self.hz.thread_report()
++        except Exception as e: return f'  (no thread report: {type(e).__name__}: {e})'
++
++    def row(self, now, frames, idle):
++        rss, threads, fds = self.proc()
++        dt = now - self.row_t if self.row_t is not None else 0
++        fps = (frames - self.row_frames) / dt if dt > 0 else 0.0
++        faults = len(getattr(self.hz, 'thread_faults', []))
++        cells = (f'{now - self.t0:.1f}', *('' if v is None else v for v in (rss, threads, fds)), frames, f'{fps:.2f}', f'{idle:.0f}', faults, int(self.stalled))
++        try: self.file.write(','.join(str(c) for c in cells) + '\n'); self.file.flush()
++        except (OSError, ValueError): self.file = None
++        self.row_t, self.row_frames = now, frames
++
++    def final_row(self):
++        """The line of the end of the run, so that the file ends at the end and not up to ten seconds before it"""
++        if self.file: self.row(self.clock(), self.frames(), self.clock() - self.last_change)
++
++    def loop(self):
++        while not self.stop_ev.is_set():
++            try: self.step()
++            except Exception as e: self.say(f'[soak] sampler error: {type(e).__name__}: {e}', flush=True)
++            self.stop_ev.wait(self.tick)
++
++    def start(self):
++        self.thread = threading.Thread(target=self.loop, name='soak', daemon=True); self.thread.start()
++        return self
++
++    def stop(self):
++        """Ends the sampler thread and closes the file"""
++        self.stop_ev.set()
++        if self.thread is not None and self.thread is not threading.current_thread(): self.thread.join(5)
++        f, self.file = self.file, None
++        if f:
++            try: f.close()
++            except OSError: pass
++
++
++def number(environ, name, default, say, low=0.0):
++    raw = environ.get(name, '').strip()
++    if not raw: return default
++    try: v = float(raw)
++    except ValueError: say(f'[soak] {name}={raw!r} is not a number: using {default:g}', flush=True); return default
++    return max(v, low)
++
++
++def from_env(hz, environ=None, say=print):
++    """A started Soak when NX2LINUX_SOAK_LOG or NX2LINUX_STALL_SECONDS is set, else None"""
++    environ = os.environ if environ is None else environ
++    path = environ.get('NX2LINUX_SOAK_LOG', '').strip() or None
++    stall = number(environ, 'NX2LINUX_STALL_SECONDS', 0.0, say)
++    if not path and stall <= 0: return None
++    s = Soak(hz, path, interval=number(environ, 'NX2LINUX_SOAK_INTERVAL', 10.0, say, low=1.0), stall_after=stall, say=say)
++    say(f'[soak] sampling every {s.interval:g} s' + (f' into {os.path.basename(path)}' if s.file else ' (no file)') + (f', a stall is {stall:g} s without a frame' if stall > 0 else ''), flush=True)
++    return s.start()
+diff --git a/dm/tools/tests/test_horizon_run_shutdown.py b/dm/tools/tests/test_horizon_run_shutdown.py
+new file mode 100644
+index 00000000..7bb9f6c4
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_run_shutdown.py
+@@ -0,0 +1,24 @@
++"""horizon_run.py wires the clean shutdown and the soak sampler (issue 22). The run itself needs a game, so this reads the source: the end of the run no longer calls os._exit by itself, it goes through the Shutdown steps."""
++import sys, unittest
++from pathlib import Path
++
++TOOLS = Path(__file__).resolve().parents[1]
++SRC = (TOOLS / 'horizon_run.py').read_text()
++
++
++class Wiring(unittest.TestCase):
++    def test_the_end_of_the_run_goes_through_the_shutdown(self):
++        stop = SRC[SRC.index('    def stop():'):SRC.index('    started = time.time()')]
++        self.assertIn("sd.run('end of the run', 0)", stop); self.assertNotIn('os._exit', stop)
++
++    def test_the_steps_the_signals_and_the_sampler_are_set_up_before_the_timer_starts(self):
++        for needle in ('horizon_shutdown.standard_steps(sd, hz, report)', 'horizon_soak.from_env(hz)', "sd.add('soak log', soak.final_row"):
++            self.assertIn(needle, SRC)
++        self.assertLess(SRC.index('horizon_shutdown.standard_steps'), SRC.index('threading.Timer(a.seconds, stop).start()'))
++        self.assertLess(SRC.index('threading.Timer(a.seconds, stop).start()'), SRC.index('horizon_shutdown.Signals(sd).install()'))
++
++    def test_the_modules_are_imported(self):
++        self.assertIn('import horizon_hle, horizon_overrides, horizon_shutdown, horizon_soak', SRC)
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_horizon_shutdown.py b/dm/tools/tests/test_horizon_shutdown.py
+new file mode 100644
+index 00000000..7ca05bab
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_shutdown.py
+@@ -0,0 +1,170 @@
++"""Clean shutdown (horizon_shutdown.py, issue 22): ordered steps with a time limit each, one run, exit codes 128 plus the signal. No game: fake steps, and a child process that gets real SIGINT and SIGTERM."""
++import os, signal, subprocess, sys, textwrap, threading, time, types, unittest
++from pathlib import Path
++
++TOOLS = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(TOOLS))
++import horizon_shutdown as hs
++
++
++def make():
++    lines, codes = [], []
++    def say(text, flush=False): lines.append(text)
++    return hs.Shutdown(say=say, exit_fn=codes.append), lines, codes
++
++
++class Steps(unittest.TestCase):
++    def test_steps_run_in_the_order_they_were_added_then_the_process_ends(self):
++        sd, lines, codes = make(); order = []
++        sd.add('a', lambda: order.append('a')); sd.add('b', lambda: order.append('b')); sd.add('c', lambda: order.append('c'))
++        self.assertTrue(sd.run('test', 0))
++        self.assertEqual(order, ['a', 'b', 'c']); self.assertEqual(codes, [0])
++        self.assertEqual([r for r in sd.results], [('a', 'ok'), ('b', 'ok'), ('c', 'ok')])
++        self.assertEqual(lines[0], '[shutdown] test: stopping'); self.assertIn('exit code 0', lines[-1])
++
++    def test_a_step_that_fails_does_not_stop_the_others(self):
++        sd, lines, codes = make(); order = []
++        def bad(): raise RuntimeError('disk gone')
++        sd.add('bad', bad); sd.add('after', lambda: order.append('after'))
++        sd.run('test', 0)
++        self.assertEqual(order, ['after']); self.assertEqual(sd.results[0], ('bad', 'failed: RuntimeError: disk gone'))
++        self.assertEqual(codes, [0])
++
++    def test_a_step_that_blocks_is_left_behind_after_its_limit(self):
++        sd, lines, codes = make(); order = []; release = threading.Event()
++        sd.add('stuck', lambda: release.wait(30), timeout=0.2); sd.add('after', lambda: order.append('after'))
++        t0 = time.monotonic(); sd.run('test', 0); took = time.monotonic() - t0
++        release.set()
++        self.assertLess(took, 5); self.assertEqual(order, ['after'])
++        self.assertIn('still running after 0.2 s', sd.results[0][1]); self.assertEqual(codes, [0])
++
++    def test_a_system_exit_in_a_step_is_only_a_failed_step(self):
++        sd, lines, codes = make()
++        def leave(): raise SystemExit(3)
++        sd.add('leave', leave); sd.run('test', 0)
++        self.assertTrue(sd.results[0][1].startswith('failed: SystemExit')); self.assertEqual(codes, [0])
++
++    def test_only_the_first_call_runs(self):
++        sd, lines, codes = make(); count = []
++        sd.add('a', lambda: count.append(1))
++        self.assertTrue(sd.run('one', 0)); self.assertFalse(sd.run('two', 5))
++        self.assertEqual(count, [1]); self.assertEqual(codes, [0])
++
++    def test_two_calls_at_once_run_the_steps_once(self):
++        sd, lines, codes = make(); count = []; gate = threading.Event()
++        sd.add('slow', lambda: (gate.wait(5), count.append(1)))
++        t = threading.Thread(target=sd.run, args=('one', 0)); t.start()
++        while not sd.running(): time.sleep(0.001)
++        self.assertFalse(sd.run('two', 9)); gate.set(); t.join(5)
++        self.assertEqual(count, [1]); self.assertEqual(codes, [0])
++
++
++class Standard(unittest.TestCase):
++    def test_the_queue_drains_then_the_report_then_the_mixer(self):
++        order = []
++        nvn = types.SimpleNamespace(jobs=object(), drain=lambda: order.append('drain'))
++        audio = types.SimpleNamespace(mixer=types.SimpleNamespace(close=lambda: order.append('mixer')))
++        sd, lines, codes = make(); hs.standard_steps(sd, types.SimpleNamespace(nvn=nvn, audio=audio), lambda: order.append('report'))
++        sd.run('test', 0)
++        self.assertEqual(order, ['drain', 'report', 'mixer']); self.assertEqual([n for n, _ in sd.results], ['gpu queue drain', 'report', 'audio mixer'])
++
++    def test_a_run_without_gpu_queue_or_audio_still_reports(self):
++        order = []
++        sd, lines, codes = make(); hs.standard_steps(sd, types.SimpleNamespace(), lambda: order.append('report'))
++        sd.run('test', 0)
++        self.assertEqual(order, ['report']); self.assertTrue(all(r == 'ok' for _, r in sd.results))
++
++    def test_a_queue_that_never_started_is_not_drained(self):
++        called = []
++        nvn = types.SimpleNamespace(jobs=None, drain=lambda: called.append(1))
++        sd, lines, codes = make(); hs.standard_steps(sd, types.SimpleNamespace(nvn=nvn), lambda: None); sd.run('test', 0)
++        self.assertEqual(called, [])
++
++    def test_the_audio_without_a_mixer_is_skipped(self):
++        sd, lines, codes = make(); hs.standard_steps(sd, types.SimpleNamespace(audio=types.SimpleNamespace(mixer=None)), lambda: None); sd.run('test', 0)
++        self.assertEqual(sd.results[-1], ('audio mixer', 'ok'))
++
++
++@unittest.skipUnless(hasattr(signal, 'set_wakeup_fd'), 'no signal wake up descriptor on this platform')
++class InProcess(unittest.TestCase):
++    def test_a_signal_runs_the_steps_and_the_code_is_128_plus_it(self):
++        sd, lines, codes = make(); done = threading.Event(); sd.exit_fn = lambda c: (codes.append(c), done.set())
++        ran = []; sd.add('a', lambda: ran.append('a'))
++        sg = hs.Signals(sd, sigs=(signal.SIGUSR1,))
++        self.assertTrue(sg.install())
++        try:
++            os.kill(os.getpid(), signal.SIGUSR1)
++            self.assertTrue(done.wait(5), lines)
++        finally: sg.uninstall()
++        self.assertEqual(codes, [128 + signal.SIGUSR1]); self.assertEqual(ran, ['a']); self.assertIn('[shutdown] signal SIGUSR1: stopping', lines)
++
++    def test_a_second_signal_while_the_steps_run_leaves_at_once(self):
++        sd, lines, codes = make(); first = threading.Event(); gate = threading.Event()
++        sd.exit_fn = lambda c: (codes.append(c), first.set() if len(codes) == 1 else None)
++        sd.add('slow', lambda: gate.wait(10), timeout=10)
++        sg = hs.Signals(sd, sigs=(signal.SIGUSR1,)); sg.install()
++        try:
++            os.kill(os.getpid(), signal.SIGUSR1)
++            while not sd.running(): time.sleep(0.001)
++            os.kill(os.getpid(), signal.SIGUSR1)
++            self.assertTrue(first.wait(5), lines)
++            self.assertEqual(codes, [128 + signal.SIGUSR1]); self.assertIn('[shutdown] second signal: leaving now', lines)
++            self.assertEqual(sd.results, [])   # the slow step had not finished: nothing was waited for
++        finally: gate.set(); sg.uninstall()
++
++    def test_uninstall_gives_the_handler_back(self):
++        sd, _, _ = make(); before = signal.getsignal(signal.SIGUSR1)
++        sg = hs.Signals(sd, sigs=(signal.SIGUSR1,)); sg.install(); self.assertNotEqual(signal.getsignal(signal.SIGUSR1), before)
++        sg.uninstall(); self.assertEqual(signal.getsignal(signal.SIGUSR1), before)
++
++    def test_from_a_thread_nothing_is_installed(self):
++        sd, _, _ = make(); got = []
++        t = threading.Thread(target=lambda: got.append(hs.Signals(sd, sigs=(signal.SIGUSR1,)).install())); t.start(); t.join(5)
++        self.assertEqual(got, [False])
++
++
++CHILD = textwrap.dedent('''
++    import sys, time, threading
++    sys.path.insert(0, %(tools)r)
++    import horizon_shutdown as hs
++    sd = hs.Shutdown()
++    sd.add('report', lambda: print('report printed', flush=True), 5)
++    if %(slow)r: sd.add('slow', lambda: time.sleep(60), 60)
++    hs.Signals(sd).install()
++    print('ready', flush=True)
++    time.sleep(60)   # the main thread is not available to a handler for long: the shutdown has its own thread
++''')
++
++
++@unittest.skipUnless(sys.platform.startswith('linux'), 'real signals, Linux only')
++class Child(unittest.TestCase):
++    def run_child(self, sig, slow=False, second=False):
++        p = subprocess.Popen([sys.executable, '-I', '-c', CHILD % {'tools': str(TOOLS), 'slow': slow}], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++        try:
++            self.assertEqual(p.stdout.readline().strip(), 'ready')
++            p.send_signal(sig)
++            if second:
++                while True:
++                    line = p.stdout.readline()
++                    if 'report: ok' in line or not line: break   # the next step, `slow`, is now running
++                p.send_signal(sig)
++            out, _ = p.communicate(timeout=20)
++        finally:
++            if p.poll() is None: p.kill()
++        return p.returncode, out
++
++    def test_ctrl_c_prints_the_report_and_exits_130(self):
++        code, out = self.run_child(signal.SIGINT)
++        self.assertEqual(code, 130, out); self.assertIn('report printed', out); self.assertIn('[shutdown] signal SIGINT: stopping', out)
++        self.assertIn('[shutdown] report: ok', out)
++
++    def test_sigterm_exits_143(self):
++        code, out = self.run_child(signal.SIGTERM)
++        self.assertEqual(code, 143, out); self.assertIn('report printed', out)
++
++    def test_a_second_ctrl_c_leaves_a_blocked_shutdown_at_once(self):
++        t0 = time.monotonic(); code, out = self.run_child(signal.SIGINT, slow=True, second=True)
++        self.assertEqual(code, 130, out); self.assertIn('second signal: leaving now', out); self.assertLess(time.monotonic() - t0, 20)
++
++
++if __name__ == '__main__': unittest.main()
+diff --git a/dm/tools/tests/test_horizon_soak.py b/dm/tools/tests/test_horizon_soak.py
+new file mode 100644
+index 00000000..6b0674e7
+--- /dev/null
++++ b/dm/tools/tests/test_horizon_soak.py
+@@ -0,0 +1,169 @@
++"""Long run sampler and stall detector (horizon_soak.py, issue 22). No game: a fake Horizon, a fake clock and a fake /proc reader."""
++import os, sys, tempfile, types, unittest
++from pathlib import Path
++
++TOOLS = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(TOOLS))
++import horizon_soak as hk
++
++
++OPEN = []   # every Soak a test made, closed after it
++
++
++class Clock:
++    def __init__(self): self.t = 1000.0
++    def __call__(self): return self.t
++
++
++def make(tmp=None, **kw):
++    hz = types.SimpleNamespace(frames_presented=0, thread_faults=[], thread_report=lambda: '  thread 1: nnMain 0.0 s ago: sub_1')
++    clock, lines = Clock(), []
++    path = os.path.join(tmp, 'soak.csv') if tmp else None
++    s = hk.Soak(hz, path, clock=clock, proc=lambda: (2048, 12, 30), say=lambda text, flush=False: lines.append(text), **kw)
++    OPEN.append(s)
++    return s, hz, clock, lines
++
++
++def advance(s, clock, hz, seconds, frames_per_s=0, tick=1.0):
++    """Moves the clock second by second, the game presenting `frames_per_s` frames each second"""
++    n = int(seconds / tick)
++    for _ in range(n):
++        clock.t += tick; hz.frames_presented += int(frames_per_s * tick); s.step()
++
++
++class Rows(unittest.TestCase):
++    def tearDown(self):
++        while OPEN: OPEN.pop().stop()
++
++    def test_the_file_has_a_header_then_a_line_every_interval(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s, hz, clock, _ = make(tmp, interval=10)
++            s.step(); advance(s, clock, hz, 25, frames_per_s=18)
++            rows = Path(s.path).read_text().splitlines()
++        self.assertEqual(rows[0], ','.join(hk.COLUMNS))
++        self.assertEqual(len(rows), 1 + 3)   # t=0, t=10, t=20
++        first, second = rows[1].split(','), rows[2].split(',')
++        self.assertEqual(first[0], '0.0'); self.assertEqual(second[0], '10.0')
++        self.assertEqual(dict(zip(hk.COLUMNS, second))['rss_kb'], '2048'); self.assertEqual(dict(zip(hk.COLUMNS, second))['threads'], '12'); self.assertEqual(dict(zip(hk.COLUMNS, second))['fds'], '30')
++        self.assertEqual(dict(zip(hk.COLUMNS, second))['frames'], '180'); self.assertEqual(dict(zip(hk.COLUMNS, second))['fps'], '18.00')
++
++    def test_an_existing_file_is_appended_to_without_a_second_header(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s, hz, clock, _ = make(tmp, interval=10); s.step(); s.file.close()
++            s2, hz2, clock2, _ = make(tmp, interval=10); s2.step()
++            lines = Path(s.path).read_text().splitlines()
++        self.assertEqual(sum(1 for l in lines if l.startswith('t_s')), 1); self.assertEqual(len(lines), 3)
++
++    def test_the_final_line_is_written_on_demand(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s, hz, clock, _ = make(tmp, interval=10); s.step(); advance(s, clock, hz, 4, frames_per_s=10); s.final_row()
++            rows = Path(s.path).read_text().splitlines()
++        self.assertEqual(len(rows), 3); self.assertEqual(rows[-1].split(',')[0], '4.0'); self.assertEqual(rows[-1].split(',')[4], '40')
++
++    def test_a_proc_that_says_nothing_leaves_empty_cells(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s, hz, clock, _ = make(tmp); s.proc = lambda: (None, None, None); s.step()
++            row = Path(s.path).read_text().splitlines()[1].split(',')
++        self.assertEqual(row[1:4], ['', '', ''])
++
++    def test_stopped_guest_threads_are_counted(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s, hz, clock, _ = make(tmp); hz.thread_faults = [1, 2]; s.step()
++            self.assertEqual(dict(zip(hk.COLUMNS, Path(s.path).read_text().splitlines()[1].split(',')))['thread_faults'], '2')
++
++    def test_a_file_that_cannot_be_opened_says_so_and_the_run_goes_on(self):
++        s, hz, clock, lines = make(); s2 = hk.Soak(hz, '/nonexistent-dir/x.csv', clock=clock, proc=lambda: (1, 1, 1), say=lambda t, flush=False: lines.append(t))
++        s2.step(); self.assertTrue(any('cannot write' in l for l in lines)); self.assertIsNone(s2.file)
++
++
++class Stall(unittest.TestCase):
++    def tearDown(self):
++        while OPEN: OPEN.pop().stop()
++
++    def test_off_by_default(self):
++        s, hz, clock, lines = make(); s.step(); hz.frames_presented = 5; advance(s, clock, hz, 600)
++        self.assertEqual(lines, []); self.assertEqual(s.stalls, 0)
++
++    def test_no_stall_before_the_first_frame(self):
++        s, hz, clock, lines = make(stall_after=30); advance(s, clock, hz, 300)
++        self.assertEqual(s.stalls, 0); self.assertEqual(lines, [])
++
++    def test_a_stall_is_reported_once_with_where_the_threads_are(self):
++        s, hz, clock, lines = make(stall_after=30); s.step(); advance(s, clock, hz, 20, frames_per_s=18)
++        advance(s, clock, hz, 100, frames_per_s=0)
++        self.assertEqual(s.stalls, 1)
++        self.assertEqual(len([l for l in lines if l.startswith('[stall] no frame')]), 1)
++        msg = [l for l in lines if l.startswith('[stall] no frame')][0]
++        self.assertIn('no frame presented for 30 s', msg); self.assertIn('frames so far 360', msg); self.assertIn('thread 1: nnMain', msg)
++
++    def test_it_re_arms_after_the_frames_resume(self):
++        s, hz, clock, lines = make(stall_after=10); s.step(); advance(s, clock, hz, 5, frames_per_s=10)
++        advance(s, clock, hz, 15)                      # first stall
++        advance(s, clock, hz, 3, frames_per_s=10)      # frames again
++        advance(s, clock, hz, 15)                      # second stall
++        self.assertEqual(s.stalls, 2); self.assertEqual(len([l for l in lines if l.startswith('[stall] frames again')]), 1)
++
++    def test_the_stall_flag_and_idle_seconds_are_in_the_file(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s, hz, clock, _ = make(tmp, interval=1000, stall_after=5); s.step(); advance(s, clock, hz, 3, frames_per_s=10)
++            advance(s, clock, hz, 6)
++            rows = [dict(zip(hk.COLUMNS, l.split(','))) for l in Path(s.path).read_text().splitlines()[1:]]
++        self.assertEqual(rows[-1]['stall'], '1'); self.assertEqual(rows[-1]['idle_s'], '5'); self.assertEqual(rows[0]['stall'], '0')
++
++    def test_a_thread_report_that_fails_does_not_stop_the_detector(self):
++        s, hz, clock, lines = make(stall_after=5)
++        def boom(): raise RuntimeError('guest memory gone')
++        hz.thread_report = boom; s.step(); advance(s, clock, hz, 2, frames_per_s=10); advance(s, clock, hz, 8)
++        self.assertEqual(s.stalls, 1); self.assertTrue(any('no thread report: RuntimeError' in l for l in lines))
++
++
++class Env(unittest.TestCase):
++    def test_nothing_set_nothing_starts(self):
++        self.assertIsNone(hk.from_env(types.SimpleNamespace(), {}))
++
++    def test_a_log_starts_a_sampler_that_stops_cleanly(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            lines = []
++            s = hk.from_env(types.SimpleNamespace(frames_presented=3), {'NX2LINUX_SOAK_LOG': os.path.join(tmp, 'a.csv'), 'NX2LINUX_SOAK_INTERVAL': '0.2'}, say=lambda t, flush=False: lines.append(t))
++            self.assertIsNotNone(s); s.stop()
++            self.assertFalse(s.thread.is_alive()); self.assertTrue(Path(tmp, 'a.csv').read_text().startswith('t_s,'))
++            self.assertIn('into a.csv', lines[0]); self.assertNotIn(tmp, lines[0])   # the log names the file, not where it is
++
++    def test_the_interval_has_a_floor_and_a_bad_number_falls_back(self):
++        lines = []
++        with tempfile.TemporaryDirectory() as tmp:
++            s = hk.from_env(types.SimpleNamespace(), {'NX2LINUX_SOAK_LOG': os.path.join(tmp, 'a.csv'), 'NX2LINUX_SOAK_INTERVAL': '0.01'}, say=lambda t, flush=False: lines.append(t)); s.stop()
++            self.assertEqual(s.interval, 1.0)
++            s = hk.from_env(types.SimpleNamespace(), {'NX2LINUX_STALL_SECONDS': 'soon'}, say=lambda t, flush=False: lines.append(t))
++        self.assertIsNone(s); self.assertTrue(any('is not a number' in l for l in lines))
++
++    def test_the_stall_alone_starts_without_a_file(self):
++        lines = []; s = hk.from_env(types.SimpleNamespace(), {'NX2LINUX_STALL_SECONDS': '60'}, say=lambda t, flush=False: lines.append(t)); s.stop()
++        self.assertIsNone(s.file); self.assertEqual(s.stall_after, 60.0); self.assertIn('no file', lines[0])
++
++
++class Reader(unittest.TestCase):
++    def test_tools_soak_summary_reads_what_the_sampler_writes(self):
++        root_tools = TOOLS.parents[2] / 'tools'
++        if not (root_tools / 'soak_summary.py').is_file(): self.skipTest('tools/soak_summary.py is not next to the engine (it belongs to the NX2Linux repository)')
++        sys.path.insert(0, str(root_tools))
++        import soak_summary
++        self.assertEqual(soak_summary.COLUMNS, hk.COLUMNS)
++        with tempfile.TemporaryDirectory() as tmp:
++            s, hz, clock, _ = make(tmp, interval=10, stall_after=30); s.step(); advance(s, clock, hz, 100, frames_per_s=18); advance(s, clock, hz, 60); s.final_row(); s.stop()
++            rows, bad = soak_summary.read(s.path)
++        summary = soak_summary.summarize(rows)
++        self.assertEqual(bad, 0); self.assertEqual(summary['stalls'], 1); self.assertEqual(summary['frames'], 1800); self.assertGreater(summary['longest_idle_s'], 29)
++
++
++@unittest.skipUnless(os.path.isdir('/proc/self/fd'), 'no /proc')
++class Proc(unittest.TestCase):
++    def test_this_process_has_memory_threads_and_files(self):
++        rss, threads, fds = hk.read_proc()
++        self.assertGreater(rss, 1000); self.assertGreaterEqual(threads, 1); self.assertGreaterEqual(fds, 3)
++
++    def test_a_folder_without_the_files_gives_nothing(self):
++        with tempfile.TemporaryDirectory() as tmp: self.assertEqual(hk.read_proc(tmp), (None, None, None))
++
++
++if __name__ == '__main__': unittest.main()
