@@ -15,16 +15,15 @@ Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 Upstream-Status: fork-only
 Reason: Record why the host stays Python with C libraries, and when to reopen it
 Issue: Sunshine-Off/NX2Linux#24
-
 ---
- docs/linux/architecture.md | 47 ++++++++++++++++++++++++++++++++++++++
- 1 file changed, 47 insertions(+)
+ docs/linux/architecture.md | 49 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
 
 diff --git a/docs/linux/architecture.md b/docs/linux/architecture.md
-index deb4d466..251d82d9 100644
+index 14495f0d..9866fcb0 100644
 --- a/docs/linux/architecture.md
 +++ b/docs/linux/architecture.md
-@@ -44,6 +44,53 @@ These were taken by the team on 2026-11-04.
+@@ -45,6 +45,55 @@ These were taken by the team on 2026-11-04.
  5. **Language.** Issues and new documents are in English.
  6. **No Apple rewriter.** The Linux chain does not run `patch_nso.py` and does not apply `sdk_patches.py` or `games/<id>/patches.py` (decided 2026-11-05, issue #8). The rewriter exists because Apple's kernel owns `x18`, `tpidr_el0`, `tpidrro_el0` and the system call and timer instructions. On Linux the lifter and runtime handle them (`svc` as a hyper call, the thread registers in the guest state, `cntpct_el0` read by `__nx2_read_cntpct`). The patches fit Apple's address space limits. What replaces the rewriter is a deterministic NSO to ELF and manifest conversion (`test_linux_no_rewriter.py`), and a Linux workaround goes in the profile's `linux_profile.py`. Not proven: acquire ordering of lock loops on x86, the cost of busy waits, and games with larger address needs than the fixed Linux layout. A second game or `module_validate.py` on Xenoblade 2 settles them.
  
@@ -73,7 +72,9 @@ index deb4d466..251d82d9 100644
 +
 +### What moves next
 +
-+The kernel calls on the hot path, in the order of issue 19: `WaitProcessWideKeyAtomic`, `SignalProcessWideKey`, `ArbitrateLock`, `ArbitrateUnlock` and `WaitSynchronization`. About 200 of them go through Python for each frame of Xenoblade 2. This is a deduction from the call counts, the gain in frames per second is unknown until it is measured.
++Done: the four kernel calls on mutex words and condition keys are in C (`libnx2linux_sync.so`), behind `NX2LINUX_SVC_NATIVE`, off by default. In an A B B A series on Xenoblade 2 they gave 17.88 frames per second against 16.29, a gain of 9.8 percent, and the target is 30. The first half of criterion 1 holds, the game is under 25 frames per second. The second half is not established, no profile after the change has been compared with the 30 percent figure. Inline memory accesses and the present mode were measured and ruled out as the limit. What sets the rate is unknown, issue 79 tracks it.
++
++Next: `WaitSynchronization` and the events, which are 2.7 percent of the calls and are not expected to move the rate. Whatever issue 79 finds comes before them.
 +
  ## Where things live
  
