@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shikosu <teovidal01@gmail.com>
+Date: Sun, 8 Nov 2026 12:16:59 +0100
+Subject: [PATCH] Linux host: record the decision to keep the Python host with
+ C libraries (#24)
+
+The first plan was a POSIX host in C under dm/host/linux/. The code is a
+Python host with C libraries and the team decided on 2026-11-04 to keep
+it and move the hot paths to C one at a time. docs/linux/architecture.md
+now says why (what was measured, what is deduced), when the decision is
+reopened, what stays in Python, what is already in C and what moves next.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+Upstream-Status: fork-only
+Reason: Record why the host stays Python with C libraries, and when to reopen it
+Issue: Sunshine-Off/NX2Linux#24
+---
+ docs/linux/architecture.md | 49 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+diff --git a/docs/linux/architecture.md b/docs/linux/architecture.md
+index 14495f0d..9866fcb0 100644
+--- a/docs/linux/architecture.md
++++ b/docs/linux/architecture.md
+@@ -45,6 +45,55 @@ These were taken by the team on 2026-11-04.
+ 5. **Language.** Issues and new documents are in English.
+ 6. **No Apple rewriter.** The Linux chain does not run `patch_nso.py` and does not apply `sdk_patches.py` or `games/<id>/patches.py` (decided 2026-11-05, issue #8). The rewriter exists because Apple's kernel owns `x18`, `tpidr_el0`, `tpidrro_el0` and the system call and timer instructions. On Linux the lifter and runtime handle them (`svc` as a hyper call, the thread registers in the guest state, `cntpct_el0` read by `__nx2_read_cntpct`). The patches fit Apple's address space limits. What replaces the rewriter is a deterministic NSO to ELF and manifest conversion (`test_linux_no_rewriter.py`), and a Linux workaround goes in the profile's `linux_profile.py`. Not proven: acquire ordering of lock loops on x86, the cost of busy waits, and games with larger address needs than the fixed Linux layout. A second game or `module_validate.py` on Xenoblade 2 settles them.
+ 
++## Host architecture decision
++
++Issue 24. The first plan was a POSIX host written in C under `dm/host/linux/`. The code that exists is a Python host with C libraries, and `engine/dm/host/` has no `linux/` folder. The team decided on 2026-11-04 to keep it that way. This section is the record of that decision, so that it is not reopened by habit.
++
++### Decision
++
++Keep the Python host (`engine/dm/tools/horizon_*.py`, `nvn_*.py`) with the C libraries built from `linux/host/`. Move the hot paths to C one at a time, each behind a switch that brings back the Python path. Do not write `dm/host/linux/` in C.
++
++### Reasons
++
++What was measured (Xenoblade Chronicles 2, one scenario, a few runs each, not the A B B A protocol, see `fork en cours/S8-recompilation-efficace.md`):
++
++- Performance. The recompiled code is not what is slow. In 686 stack samples 95 percent of the threads were waiting. Among the threads that run, Python and the ctypes bridge took 16 samples on the render thread against 2 in recompiled code. Every guest thread competes for the GIL at each host call. The bottleneck is the bridge, not the language as a whole.
++- The move to C already pays where it was done. NVN command recording in C gave 637 frames against 517 in 150 s. Replaying the draws in C gave 446 and 455 frames against 357 and 364 in 100 s. Waking only the threads concerned by a signal, still in Python, gave 1407 frames against 339 in 110 s.
++
++What is deduced and not measured:
++
++- Distribution. The recompiler (`elf_module.py`, `aot_lift.py`, `jump_tables.py`) is Python and is needed to build a game. A C host would not remove Python from the chain, it would only remove it from the run. The workers already run isolated (`-I`) in a venv that holds capstone, unicorn and lz4.
++- Tests. The engine has 120 test files and the queue has 110 patches, and the Xenoblade 2 results rest on this host. A rewrite would restart that evidence from zero, with no measured reason to expect more than the same C paths added one by one.
++
++### Criteria to reopen it
++
++The decision is revisited if one of these holds. The numbers are the team's starting values and change here when the team changes them.
++
++1. After the synchronisation calls are in C (issue 19) and measured on Xenoblade 2 with the A B B A protocol (at least 6 runs of each variant, an idle machine), the game stays under 25 frames per second and the Python bridge still holds more than 30 percent of the samples of the threads that run.
++2. The packaging work (Phase 7) cannot ship the interpreter and its environment on a target distribution, or the result is too fragile to support.
++3. A second game needs most of its host services in C because their rate of calls rules out Python, so that more than half of the host code would end up in C anyway.
++4. A licence or security requirement rules out an embedded Python.
++
++Each criterion has a measurement. The first is a frame rate and a profile, the second is a build of the package on a clean machine, the third is a count of calls per second by service, and the fourth is a written requirement.
++
++### What stays in Python
++
++- The kernel and OS services: threads, fibres, mutexes and events (`horizon_hle.py`, `horizon_fiber.py`), IPC services (`horizon_services.py`, `horizon_account.py`, `horizon_oe.py`, `horizon_vi.py`, `horizon_time.py`), file system and saves (`horizon_fs.py`), HID and input (`horizon_hid.py`, `horizon_input.py`), game profiles and overrides (`horizon_game.py`, `horizon_overrides.py`, `horizon_trivial.py`), the run and its report (`horizon_run.py`).
++- The NVN object model and its shader chain: `horizon_nvn.py`, `nvn_state.py`, `nvn_layout.py`, and `nvn_spirv.py`, which drives the .NET shader translator.
++- The fallback paths of draw replay: programs with storage images, indirect draws and `DrawTexture`, in `nvn_gpu.py` and `nvn_replay.py`.
++- The thin bindings to the C libraries (`horizon_display.py`, `horizon_gpu.py`, `horizon_mix.py`, `horizon_audio.py`, `horizon_movie.py`).
++
++### What is already in C
++
++- The AOT runtime (`aot_runtime.cpp`, `aot_jit.cpp`), with the inline memory accesses behind `AOT_INLINE_MEM`.
++- NVN command recording and draw replay (`linux/host/nvnrec.c`, `nvnreplay.inc`), the Vulkan renderer (`gpu.c`), the window (`display.c`), audio mixing (`audio.c`) and movie decoding (`movie.c`).
++
++### What moves next
++
++Done: the four kernel calls on mutex words and condition keys are in C (`libnx2linux_sync.so`), behind `NX2LINUX_SVC_NATIVE`, off by default. In an A B B A series on Xenoblade 2 they gave 17.88 frames per second against 16.29, a gain of 9.8 percent, and the target is 30. The first half of criterion 1 holds, the game is under 25 frames per second. The second half is not established, no profile after the change has been compared with the 30 percent figure. Inline memory accesses and the present mode were measured and ruled out as the limit. What sets the rate is unknown, issue 79 tracks it.
++
++Next: `WaitSynchronization` and the events, which are 2.7 percent of the calls and are not expected to move the rate. Whatever issue 79 finds comes before them.
++
+ ## Where things live
+ 
+ | Path | Content |
